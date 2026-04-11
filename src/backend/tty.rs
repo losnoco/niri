@@ -22,7 +22,9 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
+use smithay::backend::drm::compositor::{
+    DrmCompositor, FrameError, FrameFlags, PrimaryPlaneElement,
+};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{
     Colorspace, ConnectorColorState, CtaCoordinate, DrmDevice, DrmDeviceFd, DrmEvent,
@@ -35,10 +37,13 @@ use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer};
-use smithay::backend::renderer::{DebugFlags, ImportDma, ImportEgl, RendererSuper};
+use smithay::backend::renderer::{
+    DebugFlags, ImportDma, ImportEgl, PresentationMode, RendererSuper,
+};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
+use smithay::backend::SwapBuffersError;
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode, Output, OutputModeSource, PhysicalProperties};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -440,6 +445,7 @@ struct Surface {
 pub struct SurfaceDmabufFeedback {
     pub render: DmabufFeedback,
     pub scanout: DmabufFeedback,
+    pub r#async: DmabufFeedback,
 }
 
 /// HDR capabilities of the connected sink, parsed from its EDID (CTA HDR static metadata and
@@ -1600,6 +1606,7 @@ impl Tty {
                             &no_elements,
                             [0.; 4],
                             FrameFlags::empty(),
+                            PresentationMode::VSync,
                         ) {
                             Ok(_) => true,
                             Err(err) => {
@@ -1748,6 +1755,7 @@ impl Tty {
                         &no_elements,
                         [0.; 4],
                         FrameFlags::empty(),
+                        PresentationMode::VSync,
                     ) {
                         Ok(_) => true,
                         Err(err) => {
@@ -2025,17 +2033,23 @@ impl Tty {
             presentation_time
         };
 
-        if output_state
-            .vblank_throttle
-            .throttle(refresh_interval, time, move |state| {
-                let meta = DrmEventMetadata {
-                    sequence: meta.sequence,
-                    time: DrmEventTime::Monotonic(Duration::ZERO),
-                };
+        let presentation_mode = surface
+            .compositor
+            .pending_frame()
+            .map(|frame| frame.presentation_mode);
 
-                let tty = state.backend.tty();
-                tty.on_vblank(&mut state.niri, node, crtc, meta);
-            })
+        if presentation_mode != Some(PresentationMode::Async)
+            && output_state
+                .vblank_throttle
+                .throttle(refresh_interval, time, move |state| {
+                    let meta = DrmEventMetadata {
+                        sequence: meta.sequence,
+                        time: DrmEventTime::Monotonic(Duration::ZERO),
+                    };
+
+                    let tty = state.backend.tty();
+                    tty.on_vblank(&mut state.niri, node, crtc, meta);
+                })
         {
             // Throttled.
             return;
@@ -2062,7 +2076,7 @@ impl Tty {
 
         // Mark the last frame as submitted.
         match surface.compositor.frame_submitted() {
-            Ok(Some((mut feedback, target_presentation_time))) => {
+            Ok((mut feedback, target_presentation_time)) => {
                 let refresh = match refresh_interval {
                     Some(refresh) => {
                         if output_state.frame_clock.vrr() {
@@ -2076,8 +2090,11 @@ impl Tty {
 
                 // FIXME: ideally should be monotonically increasing for a surface.
                 let seq = meta.sequence as u64;
-                let mut flags = wp_presentation_feedback::Kind::Vsync
-                    | wp_presentation_feedback::Kind::HwCompletion;
+                let mut flags = wp_presentation_feedback::Kind::HwCompletion;
+
+                if presentation_mode != Some(PresentationMode::Async) {
+                    flags.insert(wp_presentation_feedback::Kind::Vsync);
+                }
 
                 if !presentation_time.is_zero() {
                     flags.insert(wp_presentation_feedback::Kind::HwClock);
@@ -2094,9 +2111,10 @@ impl Tty {
                     );
                 }
             }
-            Ok(None) => (),
+            Err(FrameError::EmptyFrame) => (),
             Err(err) => {
-                warn!("error marking frame as submitted: {err}");
+                let err: SwapBuffersError = err.into();
+                warn!("error marking frame as submitted: {err:?}");
             }
         }
 
@@ -2317,7 +2335,7 @@ impl Tty {
 
         // Overlay planes are disabled by default as they cause weird performance issues on my
         // system.
-        let flags = {
+        let (flags, presentation_mode) = {
             let debug = &self.config.borrow().debug;
 
             let primary_scanout_flag = if debug.restrict_primary_scanout_to_matching_format {
@@ -2326,6 +2344,12 @@ impl Tty {
                 FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
             };
             let mut flags = primary_scanout_flag | FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+
+            let presentation_mode = if debug.force_tearing {
+                PresentationMode::Async
+            } else {
+                PresentationMode::VSync
+            };
 
             if debug.enable_overlay_planes {
                 flags.insert(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
@@ -2356,14 +2380,19 @@ impl Tty {
                 }
             }
 
-            flags
+            (flags, presentation_mode)
         };
 
         // Hand them over to the DRM.
         set_frame_blend(renderer.as_gles_renderer(), blend);
         let drm_compositor = &mut surface.compositor;
-        let render_frame_result =
-            drm_compositor.render_frame::<_, _>(&mut renderer, &elements, [0.; 4], flags);
+        let render_frame_result = drm_compositor.render_frame::<_, _>(
+            &mut renderer,
+            &elements,
+            [0.; 4],
+            flags,
+            presentation_mode,
+        );
         set_frame_blend(renderer.as_gles_renderer(), None);
         match render_frame_result {
             Ok(res) => {
@@ -3244,6 +3273,21 @@ fn surface_dmabuf_feedback(
         .chain(planes.overlay.iter().flat_map(|p| p.formats.iter()))
         .copied()
         .collect::<FormatSet>();
+    let primary_async_formats = surface
+        .plane_info()
+        .formats_async
+        .clone()
+        .unwrap_or_else(|| primary_plane_formats.clone());
+    let primary_or_overlay_async_formats = primary_async_formats
+        .iter()
+        .chain(
+            planes
+                .overlay
+                .iter()
+                .flat_map(|p| p.formats_async.as_ref().unwrap_or(&p.formats).iter()),
+        )
+        .copied()
+        .collect::<FormatSet>();
 
     // We limit the scan-out trache to formats we can also render from so that there is always a
     // fallback render path available in case the supplied buffer can not be scanned out directly.
@@ -3252,6 +3296,14 @@ fn surface_dmabuf_feedback(
         .copied()
         .collect::<Vec<_>>();
     let mut primary_or_overlay_scanout_formats = primary_or_overlay_plane_formats
+        .intersection(&primary_formats)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut primary_scanout_async_formats = primary_async_formats
+        .intersection(&primary_formats)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut primary_or_overlay_scanout_async_formats = primary_or_overlay_async_formats
         .intersection(&primary_formats)
         .copied()
         .collect::<Vec<_>>();
@@ -3264,6 +3316,8 @@ fn surface_dmabuf_feedback(
     if surface_render_node != Some(primary_render_node) {
         primary_scanout_formats.retain(|f| f.modifier == Modifier::Linear);
         primary_or_overlay_scanout_formats.retain(|f| f.modifier == Modifier::Linear);
+        primary_scanout_async_formats.retain(|f| f.modifier == Modifier::Linear);
+        primary_or_overlay_scanout_async_formats.retain(|f| f.modifier == Modifier::Linear);
     }
 
     let builder = DmabufFeedbackBuilder::new(primary_render_node.dev_id(), primary_formats);
@@ -3290,6 +3344,19 @@ fn surface_dmabuf_feedback(
             primary_or_overlay_scanout_formats,
         )
         .build()?;
+    let r#async = builder
+        .clone()
+        .add_preference_tranche(
+            surface_scanout_node.dev_id(),
+            Some(TrancheFlags::Scanout),
+            primary_scanout_async_formats,
+        )
+        .add_preference_tranche(
+            surface_scanout_node.dev_id(),
+            Some(TrancheFlags::Scanout),
+            primary_or_overlay_scanout_async_formats,
+        )
+        .build()?;
 
     // If this is the primary node surface, send scanout formats in both tranches to avoid
     // duplication.
@@ -3299,7 +3366,11 @@ fn surface_dmabuf_feedback(
         builder.build()?
     };
 
-    Ok(SurfaceDmabufFeedback { render, scanout })
+    Ok(SurfaceDmabufFeedback {
+        render,
+        scanout,
+        r#async,
+    })
 }
 
 fn find_drm_property(
