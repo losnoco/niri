@@ -33,6 +33,7 @@ debug {
     honor-xdg-activation-with-invalid-serial
     skip-cursor-only-updates-during-vrr
     deactivate-unfocused-windows
+    force-tearing
 }
 
 binds {
@@ -321,6 +322,16 @@ It will cause niri to drop the Activated state for all unfocused windows.
 ```kdl
 debug {
     deactivate-unfocused-windows
+}
+```
+
+### `force-tearing`
+
+Enables screen tearing unconditionally, overriding any [`allow-tearing`](./Configuration:-Window-Rules.md#allow-tearing) window rules.
+
+```kdl
+debug {
+    force-tearing
 }
 ```
 
