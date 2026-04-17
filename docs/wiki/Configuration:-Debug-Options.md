@@ -35,6 +35,7 @@ debug {
     skip-cursor-only-updates-during-vrr
     deactivate-unfocused-windows
     disable-10bit-output
+    force-tearing
 }
 
 binds {
@@ -352,9 +353,22 @@ However, this can currently cause problems on some Intel + NVIDIA mixed-GPU setu
 
 Until this is fixed in Smithay, you can disable 10-bit color formats by setting this debug flag.
 
+In this tree, 10-bit formats are only attempted on outputs with HDR enabled; SDR outputs always use 8-bit.
+On HDR outputs, this flag keeps an 8-bit framebuffer while still sending the HDR signalling.
+
 ```kdl
 debug {
     disable-10bit-output
+}
+```
+
+### `force-tearing`
+
+Enables screen tearing unconditionally, overriding any [`allow-tearing`](./Configuration:-Window-Rules.md#allow-tearing) window rules.
+
+```kdl
+debug {
+    force-tearing
 }
 ```
 
