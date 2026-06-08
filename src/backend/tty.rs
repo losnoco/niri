@@ -981,7 +981,9 @@ impl Tty {
                 match event {
                     DrmEvent::VBlank(crtc) => {
                         let meta = meta.expect("VBlank events must have metadata");
-                        tty.on_vblank(&mut state.niri, node, crtc, meta);
+                        if let Some(output) = tty.on_vblank(&mut state.niri, node, crtc, meta) {
+                            state.signal_fifo(&output);
+                        }
                     }
                     DrmEvent::Error(error) => warn!("DRM error: {error}"),
                 };
@@ -1951,7 +1953,7 @@ impl Tty {
         node: DrmNode,
         crtc: crtc::Handle,
         meta: DrmEventMetadata,
-    ) {
+    ) -> Option<Output> {
         let span = tracy_client::span!("Tty::on_vblank");
 
         let now = get_monotonic_time();
@@ -1959,12 +1961,12 @@ impl Tty {
         let Some(device) = self.devices.get_mut(&node) else {
             // I've seen it happen.
             error!("missing device in vblank callback for crtc {crtc:?}");
-            return;
+            return None;
         };
 
         let Some(surface) = device.surfaces.get_mut(&crtc) else {
             error!("missing surface in vblank callback for crtc {crtc:?}");
-            return;
+            return None;
         };
 
         // Finish the Tracy frame, if any.
@@ -2020,12 +2022,12 @@ impl Tty {
             .cloned()
         else {
             error!("missing output in global space for {name}");
-            return;
+            return None;
         };
 
         let Some(output_state) = niri.output_state.get_mut(&output) else {
             error!("missing output state for {name}");
-            return;
+            return None;
         };
 
         let refresh_interval = output_state.frame_clock.refresh_interval();
@@ -2050,12 +2052,18 @@ impl Tty {
                         time: DrmEventTime::Monotonic(Duration::ZERO),
                     };
 
-                    let tty = state.backend.tty();
-                    tty.on_vblank(&mut state.niri, node, crtc, meta);
+                    if let Some(output) =
+                        state
+                            .backend
+                            .tty()
+                            .on_vblank(&mut state.niri, node, crtc, meta)
+                    {
+                        state.signal_fifo(&output);
+                    }
                 })
         {
             // Throttled.
-            return;
+            return None;
         }
 
         let redraw_needed = match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
@@ -2141,9 +2149,11 @@ impl Tty {
         } else {
             niri.send_frame_callbacks(&output);
         }
+
+        Some(output)
     }
 
-    fn on_estimated_vblank_timer(&self, niri: &mut Niri, output: Output) {
+    fn on_estimated_vblank_timer(&self, niri: &mut Niri, output: Output) -> Output {
         let span = tracy_client::span!("Tty::on_estimated_vblank_timer");
 
         let name = output.name();
@@ -2151,7 +2161,7 @@ impl Tty {
 
         let Some(output_state) = niri.output_state.get_mut(&output) else {
             error!("missing output state for {name}");
-            return;
+            return output;
         };
 
         // We waited for the timer, now we can send frame callbacks again.
@@ -2165,7 +2175,7 @@ impl Tty {
             // The timer fired just in front of a redraw.
             RedrawState::WaitingForEstimatedVBlankAndQueued(_) => {
                 output_state.redraw_state = RedrawState::Queued;
-                return;
+                return output;
             }
         }
 
@@ -2174,6 +2184,8 @@ impl Tty {
         } else {
             niri.send_frame_callbacks(&output);
         }
+
+        output
     }
 
     pub fn seat_name(&self) -> String {
@@ -3492,9 +3504,11 @@ fn queue_estimated_vblank_timer(
     let token = niri
         .event_loop
         .insert_source(timer, move |_, _, data| {
-            data.backend
+            let output = data
+                .backend
                 .tty()
                 .on_estimated_vblank_timer(&mut data.niri, output.clone());
+            data.signal_fifo(&output);
             TimeoutAction::Drop
         })
         .unwrap();

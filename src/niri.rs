@@ -80,6 +80,7 @@ use smithay::wayland::compositor::{
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::DmabufState;
 use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
+use smithay::wayland::fifo::{FifoBarrierCachedState, FifoManagerState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
 use smithay::wayland::idle_notify::IdleNotifierState;
@@ -325,6 +326,7 @@ pub struct Niri {
     pub color_management_state: ColorManagementState,
     pub activation_state: XdgActivationState,
     pub mutter_x11_interop_state: MutterX11InteropManagerState,
+    pub fifo_manager_state: FifoManagerState,
 
     // This will not work as is outside of tests, so it is gated with #[cfg(test)] for now. In
     // particular, shaders will need to learn about the single pixel buffer. Also, it must be
@@ -780,7 +782,16 @@ impl State {
         // build up (the 1 second frame callback timer will call this line).
         self.niri.advance_animations();
 
-        self.niri.redraw_queued_outputs(&mut self.backend);
+        for output in self.niri.queued_outputs() {
+            if self.niri.is_queued(&output) {
+                self.niri.redraw(&mut self.backend, &output);
+
+                let state = self.niri.output_state.get(&output).unwrap();
+                if matches!(state.redraw_state, RedrawState::Idle) {
+                    self.signal_fifo(&output);
+                }
+            }
+        }
 
         {
             let _span = tracy_client::span!("flush_clients");
@@ -860,6 +871,53 @@ impl State {
             trace!("calling blocker_cleared");
             self.client_compositor_state(&client)
                 .blocker_cleared(self, &dh);
+        }
+    }
+
+    pub fn signal_fifo(&mut self, output: &Output) {
+        #[allow(clippy::mutable_key_type)]
+        let mut clients = HashMap::new();
+
+        self.niri
+            .for_each_output_surface(output, |surface, states| {
+                let primary_scanout_output = surface_primary_scanout_output(surface, states);
+                if primary_scanout_output.as_ref().is_some_and(|o| o != output) {
+                    return;
+                }
+
+                Self::signal_fifo_surface(surface, states, &mut clients);
+            });
+
+        for unmapped in self.niri.unmapped_windows.values() {
+            unmapped.window.with_surfaces(|surface, states| {
+                Self::signal_fifo_surface(surface, states, &mut clients);
+            });
+        }
+
+        let display_handle = self.niri.display_handle.clone();
+        for client in clients.into_values() {
+            self.client_compositor_state(&client)
+                .blocker_cleared(self, &display_handle);
+        }
+    }
+
+    fn signal_fifo_surface(
+        surface: &WlSurface,
+        states: &SurfaceData,
+        clients: &mut HashMap<ClientId, Client>,
+    ) {
+        let fifo_barrier = states
+            .cached_state
+            .get::<FifoBarrierCachedState>()
+            .current()
+            .barrier
+            .take();
+
+        if let Some(fifo_barrier) = fifo_barrier {
+            fifo_barrier.signal();
+            if let Some(client) = surface.client() {
+                clients.insert(client.id(), client);
+            }
         }
     }
 
@@ -2619,6 +2677,7 @@ impl Niri {
 
         let mutter_x11_interop_state =
             MutterX11InteropManagerState::new::<State, _>(&display_handle, move |_| true);
+        let fifo_manager_state = FifoManagerState::new::<State>(&display_handle);
 
         #[cfg(test)]
         let single_pixel_buffer_state = SinglePixelBufferState::new::<State>(&display_handle);
@@ -2817,6 +2876,7 @@ impl Niri {
             color_management_state,
             activation_state,
             mutter_x11_interop_state,
+            fifo_manager_state,
             #[cfg(test)]
             single_pixel_buffer_state,
 
@@ -3904,6 +3964,40 @@ impl Niri {
         self.layout.outputs().find(has_layer_surface)
     }
 
+    pub fn for_each_output_surface(
+        &self,
+        output: &Output,
+        mut f: impl FnMut(&WlSurface, &SurfaceData),
+    ) {
+        let Some(output_state) = self.output_state.get(output) else {
+            return;
+        };
+
+        for mapped in self.layout.windows_for_output(output) {
+            mapped
+                .window
+                .with_surfaces(|surface, states| f(surface, states));
+        }
+
+        for surface in layer_map_for_output(output).layers() {
+            surface.with_surfaces(|surface, states| f(surface, states));
+        }
+
+        if let Some(surface) = &output_state.lock_surface {
+            with_surfaces_surface_tree(surface.wl_surface(), |surface, states| {
+                f(surface, states);
+            });
+        }
+
+        if let Some(surface) = self.dnd_icon.as_ref().map(|icon| &icon.surface) {
+            with_surfaces_surface_tree(surface, |surface, states| f(surface, states));
+        }
+
+        if let CursorImageStatus::Surface(surface) = self.cursor_manager.cursor_image() {
+            with_surfaces_surface_tree(surface, |surface, states| f(surface, states));
+        }
+    }
+
     pub fn lock_surface_focus(&self) -> Option<WlSurface> {
         let output_under_cursor = self.output_under_cursor();
         let output = output_under_cursor
@@ -3928,19 +4022,16 @@ impl Niri {
         state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
     }
 
-    pub fn redraw_queued_outputs(&mut self, backend: &mut Backend) {
-        let _span = tracy_client::span!("Niri::redraw_queued_outputs");
+    pub fn queued_outputs(&self) -> Vec<Output> {
+        self.output_state.keys().cloned().collect()
+    }
 
-        while let Some((output, _)) = self.output_state.iter().find(|(_, state)| {
-            matches!(
-                state.redraw_state,
-                RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
-            )
-        }) {
-            trace!("redrawing output");
-            let output = output.clone();
-            self.redraw(backend, &output);
-        }
+    pub fn is_queued(&self, output: &Output) -> bool {
+        let state = self.output_state.get(output).unwrap();
+        matches!(
+            state.redraw_state,
+            RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
+        )
     }
 
     pub fn render_pointer<R: NiriRenderer>(
