@@ -1,0 +1,31 @@
+// Throwaway niri config for testing HDR signalling on eDP-1.
+// Run from a spare VT:  ./target/debug/niri -c test-hdr.kdl
+// Quit with Mod(Super)+Shift+E. Open a terminal with Mod+Return.
+
+spawn-at-startup "alacritty"
+
+// A bright background makes the HDR mode switch easy to see by eye.
+layout {
+    background-color "#c0c0c0"
+}
+
+output "eDP-1" {
+    // The `hdr` node ALLOWS HDR on this output. niri now only actually signals HDR
+    // (Colorspace=BT2020_RGB + PQ HDR_OUTPUT_METADATA) when a fullscreen client tags its
+    // surface as HDR via wp-color-management-v1 — e.g. mpv --vo=gpu-next on an HDR file.
+    // So the desktop stays normal SDR until such a client goes fullscreen.
+    // max-bpc 10 is implied by `hdr`; set explicitly here for clarity.
+    max-bpc 10
+    hdr {
+        reference-luminance 203
+    }
+}
+
+binds {
+    Mod+Shift+E { quit skip-confirmation=true; }
+    Mod+Return { spawn "alacritty"; }
+    Mod+Q { close-window; }
+    // Toggle fullscreen on the focused window. HDR signalling only engages while the HDR client is
+    // fullscreen, so use this on the mpv window.
+    Mod+F { fullscreen-window; }
+}

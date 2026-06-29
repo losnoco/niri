@@ -5,6 +5,7 @@ mod fixture;
 mod server;
 
 mod animations;
+mod color_management;
 mod floating;
 mod fullscreen;
 mod layer_shell;

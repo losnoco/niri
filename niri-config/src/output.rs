@@ -62,6 +62,8 @@ pub struct Output {
     #[knuffel(child, unwrap(argument))]
     pub max_bpc: Option<MaxBpc>,
     #[knuffel(child)]
+    pub hdr: Option<Hdr>,
+    #[knuffel(child)]
     pub mode: Option<Mode>,
     #[knuffel(child)]
     pub modeline: Option<Modeline>,
@@ -104,6 +106,7 @@ impl Default for Output {
             transform: Transform::Normal,
             position: None,
             max_bpc: None,
+            hdr: None,
             mode: None,
             modeline: None,
             variable_refresh_rate: None,
@@ -138,6 +141,20 @@ pub struct MaxBpc(pub niri_ipc::MaxBpc);
 pub struct Vrr {
     #[knuffel(property, default = false)]
     pub on_demand: bool,
+}
+
+/// HDR (high dynamic range) output configuration.
+///
+/// Presence of the `hdr` node enables HDR signalling on the output: niri will request a 10-bit (or
+/// wider) scanout buffer, set the connector `Colorspace` to BT.2020 RGB, and attach an
+/// `HDR_OUTPUT_METADATA` infoframe advertising the PQ (SMPTE ST 2084) transfer function. This is
+/// only acted upon for outputs whose driver exposes the corresponding DRM connector properties.
+#[derive(knuffel::Decode, Debug, Clone, PartialEq, Default)]
+pub struct Hdr {
+    /// Luminance, in cd/m² (nits), that SDR white (the value 1.0) is mapped to while the output is
+    /// in HDR mode. Defaults to 203 cd/m² (the BT.2408 reference white) when unset.
+    #[knuffel(child, unwrap(argument))]
+    pub reference_luminance: Option<FloatOrInt<0, 10000>>,
 }
 
 impl FromIterator<Output> for Outputs {

@@ -16,6 +16,7 @@ output "eDP-1" {
     focus-at-startup
     backdrop-color "#001100"
     // max-bpc 8
+    // hdr
 
     hot-corners {
         // off
@@ -298,6 +299,38 @@ Valid values are `6`, `8`, `10`, `12`, `14`, `16`.
 // Set 8 max-bpc on HDMI-A-1 to lower the bandwidth.
 output "HDMI-A-1" {
     max-bpc 8
+}
+```
+
+### `hdr`
+
+<sup>Since: next release</sup>
+
+> [!CAUTION]
+> HDR support is experimental and currently limited to a **single fullscreen application**.
+> There is no color-managed compositing yet, so HDR will only look correct when one HDR
+> application is fullscreen and alone on the output.
+
+Opts this output into HDR. When present, niri:
+
+- advertises the `wp-color-management-v1` protocol to clients (so an HDR app, e.g. `mpv --vo=gpu-next`
+  or gamescope, can tell niri its content is HDR);
+- requests a 10-bit (or wider) scanout buffer, and at least 10 `max-bpc`;
+- while a fullscreen application is showing HDR (PQ / BT.2020) content, switches the output into HDR
+  mode (sets the connector to BT.2020 and attaches a PQ `HDR_OUTPUT_METADATA` infoframe), and reverts
+  to SDR when it stops.
+
+With no `hdr` node on any output, color management is not advertised at all and behavior is unchanged.
+HDR signalling only works on the TTY backend, and requires a GPU/display that exposes the HDR
+connector properties (amdgpu and recent Intel do).
+
+The optional `reference-luminance` child (in cd/m²) is reserved for the upcoming color-managed
+compositing and currently has no effect.
+
+```kdl
+// Enable HDR on the internal display.
+output "eDP-1" {
+    hdr
 }
 ```
 
