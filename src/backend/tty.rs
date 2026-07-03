@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::iter::zip;
 use std::num::NonZeroU64;
+use std::ops::RangeInclusive;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::rc::Rc;
@@ -14,7 +15,7 @@ use anyhow::{anyhow, bail, ensure, Context};
 use bytemuck::cast_slice_mut;
 use drm_ffi::drm_mode_modeinfo;
 use libc::dev_t;
-use niri_config::output::{MaxBpc, Modeline};
+use niri_config::output::Modeline;
 use niri_config::{Config, OutputName};
 use niri_ipc::{HSyncPolarity, VSyncPolarity};
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -24,7 +25,8 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{
-    DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, NodeType, VrrSupport,
+    Colorspace, ConnectorColorState, DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata,
+    DrmEventTime, DrmNode, HdrOutputMetadata, NodeType, VrrSupport,
 };
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
@@ -52,6 +54,7 @@ use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{DeviceFd, Transform};
+use smithay::wayland::color::management::ImageDescription;
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::drm_lease::{
     DrmLease, DrmLeaseBuilder, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
@@ -65,7 +68,6 @@ use super::{IpcOutputMap, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, RedrawState, State};
-use crate::protocols::color_management::ImageDescription;
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
@@ -387,12 +389,17 @@ struct Surface {
     name: OutputName,
     compositor: GbmDrmCompositor,
     connector: connector::Handle,
-    /// The HDR signalling currently applied to this connector by the render loop (`None` = SDR).
-    /// Tracked so we only re-commit connector properties when the desired state actually changes.
-    current_hdr: Option<HdrMetadata>,
-    /// Id of the `HDR_OUTPUT_METADATA` blob currently set on the connector, owned by us. Destroyed
-    /// when the HDR state changes (the previous blob becomes unreferenced).
-    current_hdr_blob: Option<u64>,
+    /// Whether the driver and sink can do HDR on this connector: the connector exposes the
+    /// `Colorspace` (with BT2020_RGB) and `HDR_OUTPUT_METADATA` properties, and the sink's EDID
+    /// advertises the PQ EOTF.
+    hdr_supported: bool,
+    /// HDR capabilities parsed from the sink's EDID.
+    edid_hdr: EdidHdrInfo,
+    /// Valid range of the connector's `max bpc` property, if it has one.
+    max_bpc_range: Option<RangeInclusive<u32>>,
+    /// The last color state we tried to stage and the driver rejected. Tracked so a rejected
+    /// state isn't re-tested every frame (each test is an atomic TEST_ONLY commit).
+    failed_color_state: Option<ConnectorColorState>,
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     gamma_props: Option<GammaProps>,
     /// Gamma change to apply upon session resume.
@@ -413,6 +420,38 @@ pub struct SurfaceDmabufFeedback {
     pub scanout: DmabufFeedback,
 }
 
+/// HDR capabilities of the connected sink, parsed from its EDID (CTA HDR static metadata and
+/// colorimetry blocks).
+#[derive(Debug, Clone, Copy, Default)]
+struct EdidHdrInfo {
+    /// The sink accepts the SMPTE ST 2084 (PQ) EOTF.
+    pq: bool,
+    /// The sink supports BT.2020 RGB signal colorimetry.
+    bt2020_rgb: bool,
+    /// Desired content max luminance in cd/m² (0 = not provided).
+    max_luminance: u16,
+    /// Desired content min luminance in 0.0001 cd/m² units (0 = not provided).
+    min_luminance: u16,
+    /// Desired content max frame-average luminance in cd/m² (0 = not provided).
+    max_frame_avg_luminance: u16,
+}
+
+impl EdidHdrInfo {
+    fn from_edid(info: &libdisplay_info::info::Info) -> Self {
+        let hdr = info.hdr_static_metadata();
+        let colorimetry = info.supported_signal_colorimetry();
+        let lum_u16 = |v: f32| v.clamp(0.0, u16::MAX as f32).round() as u16;
+        Self {
+            pq: hdr.pq,
+            bt2020_rgb: colorimetry.bt2020_rgb,
+            max_luminance: lum_u16(hdr.desired_content_max_luminance),
+            // EDID reports cd/m²; the infoframe field is in 0.0001 cd/m² units.
+            min_luminance: lum_u16(hdr.desired_content_min_luminance * 10000.),
+            max_frame_avg_luminance: lum_u16(hdr.desired_content_max_frame_avg_luminance),
+        }
+    }
+}
+
 struct GammaProps {
     crtc: crtc::Handle,
     gamma_lut: property::Handle,
@@ -420,12 +459,9 @@ struct GammaProps {
     previous_blob: Option<NonZeroU64>,
 }
 
-struct ConnectorProperties<'a> {
-    device: &'a DrmDevice,
-    connector: connector::Handle,
+/// Read-only snapshot of a connector's DRM properties.
+struct ConnectorProperties {
     properties: Vec<(property::Info, property::RawValue)>,
-    has_change: bool,
-    requests: AtomicModeReq,
 }
 
 impl Tty {
@@ -697,22 +733,10 @@ impl Tty {
                     // Apply pending gamma changes and restore our existing gamma.
                     let device = self.devices.get_mut(&node).unwrap();
                     for (crtc, surface) in device.surfaces.iter_mut() {
-                        if let Ok(mut props) =
-                            ConnectorProperties::try_new(&device.drm, surface.connector)
-                        {
-                            let max_bpc = self
-                                .config
-                                .borrow()
-                                .outputs
-                                .find(&surface.name)
-                                .and_then(effective_max_bpc);
-                            set_connector_properties(&mut props, max_bpc, true);
-                            // The connector's HDR state was just reset to SDR; keep the render
-                            // loop's view in sync so it re-applies HDR if content still needs it.
-                            surface.current_hdr = None;
-                        } else {
-                            warn!("failed to get connector properties");
-                        }
+                        // The connector color state (max bpc, HDR signalling) re-asserts itself
+                        // via the compositor's pending state on the next commit; give a rejected
+                        // state another chance after resume.
+                        surface.failed_color_state = None;
 
                         if let Some(ramp) = surface.pending_gamma_change.take() {
                             let ramp = ramp.as_deref();
@@ -1329,9 +1353,7 @@ impl Tty {
         debug!("picking mode: {mode:?}");
 
         let mut orientation = None;
-        if let Ok(mut props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
-            set_connector_properties(&mut props, effective_max_bpc(&config), true);
-
+        if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
             match props.get_panel_orientation() {
                 Ok(x) => orientation = Some(x),
                 Err(err) => {
@@ -1359,6 +1381,42 @@ impl Tty {
         let surface = device
             .drm
             .create_surface(crtc, mode, &[connector.handle()])?;
+
+        // Probe the connector's color/HDR capabilities: HDR signalling needs the Colorspace
+        // (with BT2020_RGB) and HDR_OUTPUT_METADATA properties from the driver, plus a sink
+        // that accepts the PQ EOTF per its EDID.
+        let max_bpc_range = surface
+            .max_bpc_range(connector.handle())
+            .map_err(|err| warn!("error querying max bpc range: {err:?}"))
+            .ok()
+            .flatten();
+        let supports_bt2020 = surface
+            .supported_colorspaces(connector.handle())
+            .map_err(|err| warn!("error querying supported colorspaces: {err:?}"))
+            .is_ok_and(|cs| cs.contains(&Colorspace::Bt2020Rgb));
+        let supports_hdr_metadata = surface
+            .hdr_metadata_supported(connector.handle())
+            .unwrap_or(false);
+        let edid_hdr = get_edid_info(&device.drm, connector.handle())
+            .map(|info| EdidHdrInfo::from_edid(&info))
+            .unwrap_or_default();
+        let hdr_supported = supports_bt2020 && supports_hdr_metadata && edid_hdr.pq;
+        debug!(
+            supports_bt2020,
+            supports_hdr_metadata,
+            edid_pq = edid_hdr.pq,
+            edid_bt2020_rgb = edid_hdr.bt2020_rgb,
+            ?max_bpc_range,
+            "connector color capabilities"
+        );
+        if config.hdr.is_some() && !hdr_supported {
+            warn!(
+                "output {connector_name}: hdr is enabled in the config, but the driver or \
+                 display does not support it (Colorspace BT2020_RGB: {supports_bt2020}, \
+                 HDR_OUTPUT_METADATA: {supports_hdr_metadata}, EDID PQ: {})",
+                edid_hdr.pq,
+            );
+        }
 
         // Try to enable VRR if requested.
         match surface.vrr_supported(connector.handle()) {
@@ -1458,9 +1516,9 @@ impl Tty {
             })
             .collect::<FormatSet>();
 
-        // Only offer 10-bit scanout formats on outputs that opted into HDR. Requesting a 10-bit
-        // framebuffer unconditionally hangs the initial modeset on some drivers (notably nvidia),
-        // so SDR outputs stay 8-bit exactly as upstream.
+        // Only offer 10-bit scanout formats on outputs that opted into HDR (and can do it).
+        // Requesting a 10-bit framebuffer unconditionally hangs the initial modeset on some
+        // drivers (notably nvidia), so SDR outputs stay 8-bit exactly as upstream.
         //
         // Diagnostic escape hatch: NIRI_HDR_FORCE_8BIT (or the disable-10bit-output debug flag)
         // keeps an 8-bit framebuffer even on HDR outputs, while still emitting the HDR
@@ -1469,7 +1527,7 @@ impl Tty {
         // hangs). Remove once HDR on nvidia is understood.
         let force_8bit = std::env::var_os("NIRI_HDR_FORCE_8BIT").is_some()
             || self.config.borrow().debug.disable_10bit_output;
-        let color_formats: &[Fourcc] = if config.hdr.is_some() && !force_8bit {
+        let mut color_formats: &[Fourcc] = if config.hdr.is_some() && hdr_supported && !force_8bit {
             &HDR_COLOR_FORMATS
         } else {
             &SDR_COLOR_FORMATS
@@ -1482,7 +1540,7 @@ impl Tty {
             hdr = config.hdr.is_some(),
             "creating DRM compositor"
         );
-        let res = DrmCompositor::new(
+        let mut res = DrmCompositor::new(
             OutputModeSource::Auto(output.downgrade()),
             surface,
             None,
@@ -1495,6 +1553,31 @@ impl Tty {
             device.drm.cursor_size(),
             Some(device.gbm.clone()),
         );
+
+        // If 10-bit formats didn't work out, fall back to plain 8-bit before trying anything
+        // else. HDR signalling still works on an 8-bit framebuffer, just with banding.
+        if res.is_err() && std::ptr::eq(color_formats, &HDR_COLOR_FORMATS as &[_]) {
+            let err = res.as_ref().err().unwrap();
+            warn!("error creating DRM compositor with 10-bit formats, retrying 8-bit: {err:?}");
+            color_formats = &SDR_COLOR_FORMATS;
+
+            // DrmCompositor::new() consumed the surface...
+            let surface = device
+                .drm
+                .create_surface(crtc, mode, &[connector.handle()])?;
+
+            res = DrmCompositor::new(
+                OutputModeSource::Auto(output.downgrade()),
+                surface,
+                None,
+                device.allocator.clone(),
+                GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
+                color_formats.iter().copied(),
+                render_formats.clone(),
+                device.drm.cursor_size(),
+                Some(device.gbm.clone()),
+            );
+        }
 
         let mut compositor = match res {
             Ok(x) => x,
@@ -1527,6 +1610,17 @@ impl Tty {
             }
         };
         debug!("DRM compositor created");
+
+        // Stage the initial connector color state (SDR, with the configured max bpc) so it
+        // rides the initial modeset as part of the same atomic commit.
+        let max_bpc = effective_max_bpc(&config, &max_bpc_range);
+        if let Err(err) = compositor.use_color_state(ConnectorColorState {
+            colorspace: Colorspace::Default,
+            hdr_metadata: None,
+            max_bpc,
+        }) {
+            warn!("error staging initial connector color state: {err:?}");
+        }
 
         if self.debug_tint {
             compositor.set_debug_flags(DebugFlags::TINT);
@@ -1576,8 +1670,10 @@ impl Tty {
         let surface = Surface {
             name: output_name,
             connector: connector.handle(),
-            current_hdr: None,
-            current_hdr_blob: None,
+            hdr_supported,
+            edid_hdr,
+            max_bpc_range,
+            failed_color_state: None,
             compositor,
             dmabuf_feedback,
             gamma_props,
@@ -1928,39 +2024,50 @@ impl Tty {
         }
 
         // Reconcile HDR signalling with the content about to be shown. HDR must be enabled for the
-        // output in the config, and the output must be showing a fullscreen surface tagged as HDR
-        // (Phase 1 passthrough). We only re-commit the connector properties when the desired state
-        // actually changes, since that is a modeset.
+        // output in the config, supported by driver and sink, and the output must be showing a
+        // fullscreen surface tagged as HDR (Phase 1 passthrough). The desired state is only
+        // *staged* here; smithay applies it inside its own commit as a single atomic modeset
+        // together with mode, CRTC and plane state (committing connector color properties
+        // standalone hangs some drivers, notably nvidia).
         {
-            let hdr_allowed = self
-                .config
-                .borrow()
-                .outputs
-                .find(&surface.name)
-                .is_some_and(|o| o.hdr.is_some());
-            let desired_hdr = hdr_allowed
-                .then(|| niri.output_hdr_image_description(output))
-                .flatten()
-                .map(|desc| HdrMetadata::from_image_description(&desc));
+            let config = self.config.borrow();
+            let output_config = config.outputs.find(&surface.name);
+            let hdr_allowed =
+                output_config.is_some_and(|o| o.hdr.is_some()) && surface.hdr_supported;
+            let max_bpc = output_config
+                .map(|o| effective_max_bpc(o, &surface.max_bpc_range))
+                .unwrap_or(None);
+            drop(config);
 
-            if desired_hdr != surface.current_hdr {
-                match apply_connector_hdr(&device.drm, surface.connector, desired_hdr.as_ref()) {
-                    Ok(new_blob) => {
-                        // The previously-set blob (if any) is now unreferenced; free it.
-                        if let Some(old) = surface.current_hdr_blob.take() {
-                            if let Err(err) = device.drm.destroy_property_blob(old) {
-                                warn!("failed to destroy old HDR metadata blob: {err}");
-                            }
-                        }
-                        surface.current_hdr_blob = new_blob;
+            let hdr_desc = hdr_allowed
+                .then(|| niri.output_hdr_image_description(output))
+                .flatten();
+            let desired = ConnectorColorState {
+                colorspace: if hdr_desc.is_some() {
+                    Colorspace::Bt2020Rgb
+                } else {
+                    Colorspace::Default
+                },
+                hdr_metadata: hdr_desc.map(|desc| build_hdr_metadata(&desc, &surface.edid_hdr)),
+                max_bpc,
+            };
+
+            if surface.compositor.pending_color_state() != desired
+                && surface.failed_color_state != Some(desired)
+            {
+                match surface.compositor.use_color_state(desired) {
+                    Ok(()) => {
+                        surface.failed_color_state = None;
                         info!(
                             connector = surface.name.connector,
-                            hdr = desired_hdr.is_some(),
+                            hdr = desired.hdr_metadata.is_some(),
                             "updated HDR signalling to match content"
                         );
-                        surface.current_hdr = desired_hdr;
                     }
-                    Err(err) => warn!("failed to update HDR signalling: {err}"),
+                    Err(err) => {
+                        surface.failed_color_state = Some(desired);
+                        warn!("failed to update HDR signalling: {err:?}");
+                    }
                 }
             }
         }
@@ -2530,12 +2637,10 @@ impl Tty {
                     },
                 };
 
-                if let Ok(mut props) = ConnectorProperties::try_new(&device.drm, surface.connector)
-                {
-                    set_connector_properties(&mut props, effective_max_bpc(&config), false);
-                } else {
-                    warn!("failed to get connector properties");
-                }
+                // max-bpc and hdr changes flow through the render loop's color state
+                // reconciliation; give a previously rejected state another chance with the
+                // new config.
+                surface.failed_color_state = None;
 
                 let change_mode = surface.compositor.pending_mode() != mode;
 
@@ -3347,114 +3452,42 @@ fn get_edid_info(
     libdisplay_info::info::Info::parse_edid(&data).context("error parsing EDID")
 }
 
-/// EOTF value for the HDR metadata infoframe: SMPTE ST 2084, a.k.a. PQ (`HDMI_EOTF_SMPTE_ST2084`).
-const HDMI_EOTF_SMPTE_ST2084: u8 = 2;
-/// Static metadata descriptor id 0 == "Static Metadata Type 1" (CTA-861.3).
-const HDMI_STATIC_METADATA_TYPE1: u8 = 0;
+/// Builds the HDR static metadata to signal on the connector for a client's image description:
+/// a PQ infoframe with BT.2020 mastering primaries and D65 white point.
+///
+/// Luminance priority: what the client provided (clamped to the sink's EDID capabilities) >
+/// the sink's EDID desired-content values > conservative ~500 nit placeholders.
+fn build_hdr_metadata(desc: &ImageDescription, edid: &EdidHdrInfo) -> HdrOutputMetadata {
+    let to_u16 = |v: u32| v.min(u16::MAX as u32) as u16;
+    // Clamps a client-provided value to the sink's EDID capability, when the EDID has one.
+    let clamp_to = |v: u16, edid_cap: u16| if edid_cap > 0 { v.min(edid_cap) } else { v };
 
-/// A CIE 1931 xy chromaticity coordinate, encoded in CTA-861.3 units (increments of 0.00002, i.e.
-/// the floating-point coordinate scaled by 50000).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct HdrColorPoint {
-    x: u16,
-    y: u16,
+    let max_luminance = desc
+        .mastering_luminance
+        .map(|(_, max)| clamp_to(to_u16(max), edid.max_luminance))
+        .or((edid.max_luminance > 0).then_some(edid.max_luminance))
+        .unwrap_or(500);
+    let min_luminance = desc
+        .mastering_luminance
+        .map(|(min, _)| to_u16(min).max(edid.min_luminance))
+        .or((edid.min_luminance > 0).then_some(edid.min_luminance))
+        .unwrap_or(50);
+    let max_cll = desc
+        .max_cll
+        .map(|v| clamp_to(to_u16(v), edid.max_luminance))
+        .or((edid.max_luminance > 0).then_some(edid.max_luminance))
+        .unwrap_or(500);
+    let max_fall = desc
+        .max_fall
+        .map(|v| clamp_to(to_u16(v), edid.max_frame_avg_luminance))
+        .or((edid.max_frame_avg_luminance > 0).then_some(edid.max_frame_avg_luminance))
+        .unwrap_or(500);
+
+    HdrOutputMetadata::pq_bt2020(max_luminance, min_luminance, max_cll, max_fall)
 }
 
-/// Binary layout of the kernel's `struct hdr_metadata_infoframe` (see `include/uapi/drm/drm_mode.h`).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct HdrMetadataInfoframe {
-    eotf: u8,
-    metadata_type: u8,
-    display_primaries: [HdrColorPoint; 3],
-    white_point: HdrColorPoint,
-    max_display_mastering_luminance: u16,
-    min_display_mastering_luminance: u16,
-    max_cll: u16,
-    max_fall: u16,
-}
-
-/// Binary layout of the kernel's `struct hdr_output_metadata`, the value of the connector's
-/// `HDR_OUTPUT_METADATA` blob property. Passed to the kernel verbatim, so the layout must match.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct HdrOutputMetadata {
-    metadata_type: u32,
-    hdmi_metadata_type1: HdrMetadataInfoframe,
-}
-
-/// The HDR signal niri attaches to a connector: PQ transfer, BT.2020 mastering primaries, and the
-/// sink's luminance characteristics. Built from the output's config and (eventually) its EDID.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HdrMetadata {
-    /// Max display mastering luminance, in cd/m² (1 cd/m² units).
-    pub max_luminance: u16,
-    /// Min display mastering luminance, in 0.0001 cd/m² units.
-    pub min_luminance: u16,
-    /// Maximum content light level, in cd/m².
-    pub max_cll: u16,
-    /// Maximum frame-average light level, in cd/m².
-    pub max_fall: u16,
-}
-
-impl Default for HdrMetadata {
-    fn default() -> Self {
-        // Conservative defaults sized for a ~500 nit panel. These should ideally be derived from the
-        // sink's EDID HDR static metadata block; until then they are a sane placeholder.
-        Self {
-            max_luminance: 500,
-            min_luminance: 50,
-            max_cll: 500,
-            max_fall: 500,
-        }
-    }
-}
-
-impl HdrMetadata {
-    /// Builds the HDR metadata to signal from a client's image description, using whatever mastering
-    /// metadata it provided and falling back to defaults otherwise.
-    // TODO: also clamp to the sink's EDID HDR static metadata block.
-    fn from_image_description(desc: &ImageDescription) -> Self {
-        let mut meta = Self::default();
-        if let Some(v) = desc.mastering_max_luminance {
-            meta.max_luminance = v;
-        }
-        if let Some(v) = desc.max_cll {
-            meta.max_cll = v;
-        }
-        if let Some(v) = desc.max_fall {
-            meta.max_fall = v;
-        }
-        meta
-    }
-
-    /// Serializes into the kernel `struct hdr_output_metadata` blob layout.
-    fn to_blob(self) -> HdrOutputMetadata {
-        // BT.2020 mastering primaries + D65 white point, in CTA-861.3 units (coordinate * 50000).
-        const BT2020_RED: HdrColorPoint = HdrColorPoint { x: 35400, y: 14600 };
-        const BT2020_GREEN: HdrColorPoint = HdrColorPoint { x: 8500, y: 39850 };
-        const BT2020_BLUE: HdrColorPoint = HdrColorPoint { x: 6550, y: 2300 };
-        const D65_WHITE: HdrColorPoint = HdrColorPoint { x: 15635, y: 16450 };
-
-        HdrOutputMetadata {
-            metadata_type: u32::from(HDMI_STATIC_METADATA_TYPE1),
-            hdmi_metadata_type1: HdrMetadataInfoframe {
-                eotf: HDMI_EOTF_SMPTE_ST2084,
-                metadata_type: HDMI_STATIC_METADATA_TYPE1,
-                display_primaries: [BT2020_RED, BT2020_GREEN, BT2020_BLUE],
-                white_point: D65_WHITE,
-                max_display_mastering_luminance: self.max_luminance,
-                min_display_mastering_luminance: self.min_luminance,
-                max_cll: self.max_cll,
-                max_fall: self.max_fall,
-            },
-        }
-    }
-}
-
-impl<'a> ConnectorProperties<'a> {
-    fn try_new(device: &'a DrmDevice, connector: connector::Handle) -> anyhow::Result<Self> {
+impl ConnectorProperties {
+    fn try_new(device: &DrmDevice, connector: connector::Handle) -> anyhow::Result<Self> {
         let prop_vals = device
             .get_properties(connector)
             .context("error getting properties")?;
@@ -3469,13 +3502,7 @@ impl<'a> ConnectorProperties<'a> {
             properties.push((info, value));
         }
 
-        Ok(Self {
-            device,
-            connector,
-            properties,
-            has_change: false,
-            requests: AtomicModeReq::new(),
-        })
+        Ok(Self { properties })
     }
 
     fn find(&self, name: &std::ffi::CStr) -> anyhow::Result<&(property::Info, property::RawValue)> {
@@ -3505,221 +3532,22 @@ impl<'a> ConnectorProperties<'a> {
             _ => bail!("panel orientation has wrong value type"),
         }
     }
-
-    fn reset_hdr(&mut self) -> anyhow::Result<()> {
-        const DRM_MODE_COLORIMETRY_DEFAULT: u64 = 0;
-
-        let (info, value) = self.find(c"HDR_OUTPUT_METADATA")?;
-
-        let property::ValueType::Blob = info.value_type() else {
-            bail!("wrong property type")
-        };
-        if *value != 0 {
-            self.requests
-                .add_raw_property(self.connector.into(), info.handle(), 0);
-            self.has_change = true;
-        }
-
-        let (info, value) = self.find(c"Colorspace")?;
-        let property::ValueType::Enum(_) = info.value_type() else {
-            bail!("wrong property type")
-        };
-        if *value != DRM_MODE_COLORIMETRY_DEFAULT {
-            self.requests.add_raw_property(
-                self.connector.into(),
-                info.handle(),
-                DRM_MODE_COLORIMETRY_DEFAULT,
-            );
-            self.has_change = true;
-        }
-
-        Ok(())
-    }
-
-    /// Signals HDR on the connector: sets `Colorspace` to BT.2020 RGB and attaches a PQ
-    /// `HDR_OUTPUT_METADATA` infoframe describing `meta`. Requires the driver to expose both
-    /// properties (e.g. amdgpu does on DP/eDP/HDMI); errors otherwise. Returns the id of the created
-    /// metadata blob, which the caller owns and must destroy once it is no longer referenced.
-    fn set_hdr(&mut self, meta: &HdrMetadata) -> anyhow::Result<u64> {
-        // Set Colorspace to BT.2020 RGB. Resolve the enum value by name rather than hardcoding it,
-        // since the raw value is driver-defined.
-        let (info, value) = self.find(c"Colorspace")?;
-        let property::ValueType::Enum(values) = info.value_type() else {
-            bail!("Colorspace has wrong property type")
-        };
-        let (_, enums) = values.values();
-        let bt2020 = enums
-            .iter()
-            .find(|e| e.name() == c"BT2020_RGB")
-            .map(|e| e.value())
-            .context("connector does not support the BT2020_RGB colorspace")?;
-        let colorspace_prop = info.handle();
-        let colorspace_cur = *value;
-        if colorspace_cur != bt2020 {
-            self.requests
-                .add_raw_property(self.connector.into(), colorspace_prop, bt2020);
-            self.has_change = true;
-        }
-
-        // Attach the HDR static metadata blob.
-        let (info, _value) = self.find(c"HDR_OUTPUT_METADATA")?;
-        let property::ValueType::Blob = info.value_type() else {
-            bail!("HDR_OUTPUT_METADATA has wrong property type")
-        };
-        let metadata_prop = info.handle();
-        let blob = self
-            .device
-            .create_property_blob(&meta.to_blob())
-            .context("error creating HDR_OUTPUT_METADATA blob")?;
-        let property::Value::Blob(blob_id) = blob else {
-            bail!("create_property_blob returned a non-blob value");
-        };
-        self.requests
-            .add_raw_property(self.connector.into(), metadata_prop, blob_id);
-        self.has_change = true;
-
-        Ok(blob_id)
-    }
-
-    fn set_max_bpc(&mut self, max_bpc: MaxBpc) -> anyhow::Result<u64> {
-        let (info, value) = self.find(c"max bpc")?;
-
-        let property::ValueType::UnsignedRange(min, max) = info.value_type() else {
-            bail!("wrong property type")
-        };
-
-        let max_bpc = max_bpc.0 as u64;
-        if !(min..=max).contains(&max_bpc) {
-            bail!("max-bpc {max_bpc} outside valid range of [{min}, {max}]");
-        }
-
-        let property::Value::UnsignedRange(value) = info.value_type().convert_value(*value) else {
-            bail!("wrong property type")
-        };
-
-        if value != max_bpc {
-            self.requests.add_raw_property(
-                self.connector.into(),
-                info.handle(),
-                property::Value::UnsignedRange(max_bpc).into(),
-            );
-            self.has_change = true;
-        }
-
-        Ok(max_bpc)
-    }
-
-    fn commit(&mut self) -> anyhow::Result<()> {
-        if self.has_change {
-            self.device.atomic_commit(
-                AtomicCommitFlags::ALLOW_MODESET,
-                std::mem::take(&mut self.requests),
-            )?;
-        }
-
-        Ok(())
-    }
-
-    /// Validates the pending atomic request with the kernel using `DRM_MODE_ATOMIC_TEST_ONLY`,
-    /// without applying it. Lets callers reject a configuration the driver won't accept *before*
-    /// committing it for real — important for the HDR path, where a bad commit on some drivers
-    /// (notably nvidia) can wedge the display pipe instead of returning an error. This does not
-    /// touch hardware, so it cannot catch a driver that hangs on the real commit, only one that
-    /// cleanly rejects the request.
-    fn commit_test(&self) -> anyhow::Result<()> {
-        if self.has_change {
-            self.device.atomic_commit(
-                AtomicCommitFlags::TEST_ONLY | AtomicCommitFlags::ALLOW_MODESET,
-                self.requests.clone(),
-            )?;
-        }
-
-        Ok(())
-    }
 }
 
-/// The `max-bpc` to request for an output: the configured value, or 10 when HDR is enabled but no
-/// explicit value was given (HDR needs at least 10 bits per channel so the PQ signal isn't crushed).
-fn effective_max_bpc(output: &niri_config::Output) -> Option<MaxBpc> {
-    output.max_bpc.or_else(|| {
-        output
-            .hdr
-            .is_some()
-            .then_some(MaxBpc(niri_ipc::MaxBpc::_10))
-    })
-}
-
-fn set_connector_properties(
-    props: &mut ConnectorProperties,
-    max_bpc: Option<MaxBpc>,
-    reset_hdr: bool,
-) {
-    if let Some(max_bpc) = max_bpc {
-        if let Err(err) = props.set_max_bpc(max_bpc) {
-            debug!("failed to set `max bpc` property: {err}");
-        }
-    }
-
-    if reset_hdr {
-        if let Err(err) = props.reset_hdr() {
-            debug!("failed to reset HDR properties: {err}");
-        }
-    }
-
-    if let Err(err) = props.commit() {
-        warn!("failed to atomically commit connector properties: {err}");
-    }
-}
-
-/// Applies (or clears) HDR signalling on a connector. Used by the render loop to follow content:
-/// `Some(meta)` sets `Colorspace=BT2020_RGB` + a PQ infoframe, `None` resets to SDR. Kept separate
-/// from [`set_connector_properties`] so it can run per-content-change without touching `max bpc`.
-///
-/// On success returns the id of the newly-created metadata blob (`Some` when HDR was set), which the
-/// caller owns and must destroy once it is no longer referenced (i.e. on the next change).
-fn apply_connector_hdr(
-    device: &DrmDevice,
-    connector: connector::Handle,
-    hdr: Option<&HdrMetadata>,
-) -> anyhow::Result<Option<u64>> {
-    let mut props = ConnectorProperties::try_new(device, connector)?;
-    let new_blob = match hdr {
-        Some(meta) => Some(props.set_hdr(meta)?),
-        None => {
-            props.reset_hdr()?;
-            None
-        }
-    };
-    // Validate the request with a TEST_ONLY commit first, so a configuration the driver refuses is
-    // rejected here rather than applied. This can't save us from a driver that hangs on the real
-    // commit, but it does turn a cleanly-rejectable HDR request into a skipped no-op instead of a
-    // committed one.
-    //
-    // NOTE: this is a connector-property-only commit (Colorspace + HDR_OUTPUT_METADATA) with no
-    // CRTC/plane state. amdgpu accepts that, but nvidia treats the Colorspace change as a full
-    // modeset and can hang when handed an incomplete pipeline state. These logs bracket both
-    // drmModeAtomicCommit calls so a hang is attributable to the exact ioctl.
-    debug!(
-        hdr = hdr.is_some(),
-        "HDR: validating atomic commit (TEST_ONLY)"
-    );
-    if let Err(err) = props.commit_test() {
-        if let Some(blob) = new_blob {
-            let _ = device.destroy_property_blob(blob);
-        }
-        return Err(err).context("HDR atomic configuration rejected by driver (TEST_ONLY)");
-    }
-    debug!("HDR: TEST_ONLY passed, applying real atomic commit");
-    if let Err(err) = props.commit() {
-        // The commit failed, so the blob we just created is orphaned (nothing references it). Free
-        // it immediately rather than leak it.
-        if let Some(blob) = new_blob {
-            let _ = device.destroy_property_blob(blob);
-        }
-        return Err(err);
-    }
-    debug!("HDR: atomic commit applied");
-    Ok(new_blob)
+/// The `max bpc` to request for an output: the configured value, or 10 when HDR is enabled but no
+/// explicit value was given (HDR needs at least 10 bits per channel so the PQ signal isn't
+/// crushed). Clamped to the connector's supported range; `None` when the connector has no
+/// `max bpc` property at all.
+fn effective_max_bpc(
+    output: &niri_config::Output,
+    range: &Option<RangeInclusive<u32>>,
+) -> Option<u32> {
+    let range = range.as_ref()?;
+    let requested = output
+        .max_bpc
+        .map(|max_bpc| max_bpc.0 as u32)
+        .or_else(|| output.hdr.is_some().then_some(10))?;
+    Some(requested.clamp(*range.start(), *range.end()))
 }
 
 fn is_vrr_capable(device: &DrmDevice, connector: connector::Handle) -> Option<bool> {
@@ -3846,53 +3674,69 @@ mod tests {
     use niri_config::output::Modeline;
     use niri_ipc::{HSyncPolarity, VSyncPolarity};
 
+    use smithay::wayland::color::management::ImageDescription;
+
     use crate::backend::tty::{
-        calculate_drm_mode_from_modeline, calculate_mode_cvt, HdrMetadata, HdrOutputMetadata,
+        build_hdr_metadata, calculate_drm_mode_from_modeline, calculate_mode_cvt, EdidHdrInfo,
     };
 
     #[test]
-    fn hdr_output_metadata_layout() {
-        // The blob is passed to the kernel verbatim, so the layout must match
-        // `struct hdr_output_metadata` exactly: 4-byte type + 26-byte infoframe, padded to 32.
-        assert_eq!(std::mem::size_of::<HdrOutputMetadata>(), 32);
-
-        let meta = HdrMetadata {
-            max_luminance: 500,
-            min_luminance: 50,
-            max_cll: 400,
-            max_fall: 300,
-        }
-        .to_blob();
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &meta as *const HdrOutputMetadata as *const u8,
-                std::mem::size_of::<HdrOutputMetadata>(),
-            )
+    fn hdr_metadata_luminance_priorities() {
+        let pq_desc = ImageDescription {
+            transfer: smithay::wayland::color::management::TransferFunction::St2084Pq,
+            primaries: smithay::wayland::color::management::Primaries::Bt2020,
+            max_cll: None,
+            max_fall: None,
+            mastering_luminance: None,
+            luminances: None,
+        };
+        let edid = EdidHdrInfo {
+            pq: true,
+            bt2020_rgb: true,
+            max_luminance: 800,
+            min_luminance: 100,
+            max_frame_avg_luminance: 600,
         };
 
-        // metadata_type: u32 = HDMI_STATIC_METADATA_TYPE1 (0)
-        assert_eq!(&bytes[0..4], &0u32.to_le_bytes());
-        // infoframe.eotf = SMPTE ST 2084 (PQ) = 2
-        assert_eq!(bytes[4], 2);
-        // infoframe.metadata_type = 0 (Static Metadata Type 1)
-        assert_eq!(bytes[5], 0);
-        // display_primaries[0] (red) = BT.2020 (0.708, 0.292) * 50000
-        assert_eq!(&bytes[6..8], &35400u16.to_le_bytes());
-        assert_eq!(&bytes[8..10], &14600u16.to_le_bytes());
-        // display_primaries[1] (green) = (0.170, 0.797) * 50000
-        assert_eq!(&bytes[10..12], &8500u16.to_le_bytes());
-        assert_eq!(&bytes[12..14], &39850u16.to_le_bytes());
-        // display_primaries[2] (blue) = (0.131, 0.046) * 50000
-        assert_eq!(&bytes[14..16], &6550u16.to_le_bytes());
-        assert_eq!(&bytes[16..18], &2300u16.to_le_bytes());
-        // white_point = D65 (0.3127, 0.3290) * 50000
-        assert_eq!(&bytes[18..20], &15635u16.to_le_bytes());
-        assert_eq!(&bytes[20..22], &16450u16.to_le_bytes());
-        // luminances and light levels
-        assert_eq!(&bytes[22..24], &500u16.to_le_bytes()); // max_display_mastering_luminance
-        assert_eq!(&bytes[24..26], &50u16.to_le_bytes()); // min_display_mastering_luminance
-        assert_eq!(&bytes[26..28], &400u16.to_le_bytes()); // max_cll
-        assert_eq!(&bytes[28..30], &300u16.to_le_bytes()); // max_fall
+        // No client data, no EDID data: conservative placeholders.
+        let meta = build_hdr_metadata(&pq_desc, &EdidHdrInfo::default());
+        assert_eq!(meta.max_display_mastering_luminance, 500);
+        assert_eq!(meta.min_display_mastering_luminance, 50);
+        assert_eq!(meta.max_cll, 500);
+        assert_eq!(meta.max_fall, 500);
+
+        // No client data: EDID desired-content values win.
+        let meta = build_hdr_metadata(&pq_desc, &edid);
+        assert_eq!(meta.max_display_mastering_luminance, 800);
+        assert_eq!(meta.min_display_mastering_luminance, 100);
+        assert_eq!(meta.max_cll, 800);
+        assert_eq!(meta.max_fall, 600);
+
+        // Client data within the sink's capabilities is used as-is.
+        let desc = ImageDescription {
+            mastering_luminance: Some((200, 700)),
+            max_cll: Some(650),
+            max_fall: Some(300),
+            ..pq_desc
+        };
+        let meta = build_hdr_metadata(&desc, &edid);
+        assert_eq!(meta.max_display_mastering_luminance, 700);
+        assert_eq!(meta.min_display_mastering_luminance, 200);
+        assert_eq!(meta.max_cll, 650);
+        assert_eq!(meta.max_fall, 300);
+
+        // Client data beyond the sink's capabilities is clamped to the EDID.
+        let desc = ImageDescription {
+            mastering_luminance: Some((1, 4000)),
+            max_cll: Some(4000),
+            max_fall: Some(2000),
+            ..pq_desc
+        };
+        let meta = build_hdr_metadata(&desc, &edid);
+        assert_eq!(meta.max_display_mastering_luminance, 800);
+        assert_eq!(meta.min_display_mastering_luminance, 100);
+        assert_eq!(meta.max_cll, 800);
+        assert_eq!(meta.max_fall, 600);
     }
 
     #[test]

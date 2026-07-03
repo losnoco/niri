@@ -73,7 +73,7 @@ glam = "0.33"
 input = { version = "0.10.0", features = ["libinput_1_21"] }
 keyframe = { version = "1.1.1", default-features = false }
 libc = "0.2.189"
-libdisplay-info = "0.3.0"
+libdisplay-info = { version = "0.3.0", features = ["v0_2"] }
 log = { version = "0.4", features = ["max_level_trace", "release_max_level_debug"] }
 niri-config = { version = "26.4.0", path = "niri-config" }
 niri-ipc = { version = "26.4.0", path = "niri-ipc", features = ["clap"] }
@@ -187,3 +187,9 @@ assets = [
     ["resources/niri.service", "/usr/lib/systemd/user/", "644"],
     ["resources/niri-shutdown.target", "/usr/lib/systemd/user/", "644"],
 ]
+
+# Local smithay with connector color state support (HDR) and the color-management
+# protocol from Smithay PR #1143. To be removed once both are upstream.
+[patch."https://github.com/Smithay/smithay.git"]
+smithay = { path = "../smithay" }
+smithay-drm-extras = { path = "../smithay/smithay-drm-extras" }

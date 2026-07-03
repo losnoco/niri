@@ -65,16 +65,15 @@ use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
 };
 use smithay::reexports::wayland_protocols::wp::color_management::v1::server::wp_image_description_info_v1::WpImageDescriptionInfoV1;
+use smithay::wayland::color::management::{
+    send_image_description_info, ColorManagementHandler, ColorManagementState, ImageDescription,
+};
 
-use crate::delegate_color_management;
 pub use crate::handlers::xdg_shell::KdeDecorationsModeState;
 use crate::input::click_grab::ClickGrab;
 use crate::layout::workspace::WorkspaceId;
 use crate::layout::{ActivateWindow, LayoutElement};
 use crate::niri::{DndIcon, NewClient, State};
-use crate::protocols::color_management::{
-    send_image_description_info, ColorManagementHandler, ColorManagementState, ImageDescription,
-};
 use crate::protocols::ext_workspace::{self, ExtWorkspaceHandler, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{
     self, ForeignToplevelHandler, ForeignToplevelManagerState,
@@ -783,7 +782,6 @@ impl ColorManagementHandler for State {
         });
     }
 }
-delegate_color_management!(State);
 
 struct UrgentOnlyMarker;
 
