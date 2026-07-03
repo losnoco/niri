@@ -28,6 +28,23 @@ pub enum Backend {
     Headless(Headless),
 }
 
+/// HDR capabilities of an output, inserted into the [`Output`]'s user data by the backend.
+///
+/// `supported` requires the DRM connector to expose the `Colorspace` (with BT2020_RGB) and
+/// `HDR_OUTPUT_METADATA` properties, and the sink's EDID to advertise the PQ EOTF. On backends
+/// without HDR support (winit, headless) the user data entry is absent, which reads as
+/// unsupported.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutputHdrCaps {
+    pub supported: bool,
+    /// Desired content max luminance from the EDID, in cd/m² (0 = not provided).
+    pub max_luminance: u16,
+    /// Desired content min luminance from the EDID, in 0.0001 cd/m² units (0 = not provided).
+    pub min_luminance: u16,
+    /// Desired content max frame-average luminance from the EDID, in cd/m² (0 = not provided).
+    pub max_frame_avg_luminance: u16,
+}
+
 #[derive(PartialEq, Eq)]
 pub enum RenderResult {
     /// The frame was submitted to the backend for presentation.

@@ -151,10 +151,40 @@ pub struct Vrr {
 /// only acted upon for outputs whose driver exposes the corresponding DRM connector properties.
 #[derive(knuffel::Decode, Debug, Clone, PartialEq, Default)]
 pub struct Hdr {
+    /// When HDR engages on this output.
+    #[knuffel(property, str, default)]
+    pub mode: HdrMode,
     /// Luminance, in cd/m² (nits), that SDR white (the value 1.0) is mapped to while the output is
     /// in HDR mode. Defaults to 203 cd/m² (the BT.2408 reference white) when unset.
     #[knuffel(child, unwrap(argument))]
     pub reference_luminance: Option<FloatOrInt<0, 10000>>,
+}
+
+/// When HDR engages on an `hdr`-enabled output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HdrMode {
+    /// HDR is signalled while a fullscreen surface with an HDR image description is shown, and the
+    /// output stays SDR otherwise.
+    #[default]
+    Auto,
+    /// The output is always treated as HDR: clients are told upfront that the output prefers
+    /// PQ/BT.2020 content, so applications that only probe HDR support once at startup (e.g. many
+    /// SDL games) detect it.
+    On,
+}
+
+impl std::str::FromStr for HdrMode {
+    type Err = miette::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "on" => Ok(Self::On),
+            _ => Err(miette::miette!(
+                r#"invalid HDR mode, can be "auto" or "on""#
+            )),
+        }
+    }
 }
 
 impl FromIterator<Output> for Outputs {

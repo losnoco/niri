@@ -10,6 +10,7 @@ use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_
 };
 
 use super::*;
+use crate::backend::OutputHdrCaps;
 
 /// A fixture whose config opts an output into HDR, so the (gated) `wp_color_manager_v1` global is
 /// advertised. Without an HDR-enabled output, niri does not advertise color management at all.
@@ -85,4 +86,107 @@ fn create_parametric_hdr_description_like_mpv() {
         RenderIntent::Perceptual,
     );
     f.double_roundtrip(id);
+}
+
+/// Fixture whose output is `hdr mode="on"` with backend HDR capabilities injected, simulating an
+/// HDR-capable monitor on the TTY backend.
+fn fixture_with_hdr_mode_on() -> Fixture {
+    use niri_config::output::HdrMode;
+
+    let mut config = Config::default();
+    config.outputs.0.push(Output {
+        name: "headless-1".to_owned(),
+        hdr: Some(Hdr {
+            mode: HdrMode::On,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+
+    // The headless backend doesn't probe HDR capabilities; inject them like the TTY backend would.
+    f.niri_output(1)
+        .user_data()
+        .insert_if_missing(|| OutputHdrCaps {
+            supported: true,
+            max_luminance: 800,
+            min_luminance: 100,
+            max_frame_avg_luminance: 600,
+        });
+    f
+}
+
+#[test]
+fn feedback_preferred_defaults_to_srgb() {
+    let mut f = fixture_with_hdr();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    f.client(id).probe_surface_preferred(&surface);
+    f.double_roundtrip(id);
+
+    let client = f.client(id);
+    assert_eq!(client.state.info_tf, Some(TransferFunction::Srgb));
+    assert_eq!(client.state.info_primaries, Some(Primaries::Srgb));
+}
+
+#[test]
+fn feedback_preferred_is_pq_with_mode_on() {
+    let mut f = fixture_with_hdr_mode_on();
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    // An SDL3-style client probes the preferred description once at startup, before going
+    // fullscreen. With mode "on" it must see PQ/BT.2020 right away.
+    f.client(id).probe_surface_preferred(&surface);
+    f.double_roundtrip(id);
+
+    let client = f.client(id);
+    assert_eq!(client.state.info_tf, Some(TransferFunction::St2084Pq));
+    assert_eq!(client.state.info_primaries, Some(Primaries::Bt2020));
+}
+
+#[test]
+fn preferred_identities_are_stable() {
+    let mut f = fixture_with_hdr_mode_on();
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    f.client(id).probe_surface_preferred(&surface);
+    f.double_roundtrip(id);
+    f.client(id).requery_preferred();
+    f.double_roundtrip(id);
+
+    let identities = &f.client(id).state.ready_identities;
+    assert!(
+        identities.len() >= 2,
+        "expected two ready events, got {identities:?}"
+    );
+    let last_two = &identities[identities.len() - 2..];
+    assert_eq!(
+        last_two[0], last_two[1],
+        "the same preferred description must keep the same identity"
+    );
 }

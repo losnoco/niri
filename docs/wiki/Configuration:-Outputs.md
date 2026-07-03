@@ -322,15 +322,33 @@ Opts this output into HDR. When present, niri:
 
 With no `hdr` node on any output, color management is not advertised at all and behavior is unchanged.
 HDR signalling only works on the TTY backend, and requires a GPU/display that exposes the HDR
-connector properties (amdgpu and recent Intel do).
+connector properties (amdgpu, recent Intel, and nvidia do).
 
-The optional `reference-luminance` child (in cd/m²) is reserved for the upcoming color-managed
-compositing and currently has no effect.
+The optional `mode` property controls when applications are told the output prefers HDR:
+
+- `mode="auto"` (the default): applications are told to prefer HDR (PQ / BT.2020) only while they are
+  the active fullscreen window on this output. Applications that listen for preference changes (SDL3
+  games, mpv with `--target-colorspace-hint`) switch to HDR when they go fullscreen.
+- `mode="on"`: applications on this output are told to prefer HDR upfront. Use this for games that
+  only probe HDR support once at startup and never re-check — with `auto`, such applications never
+  detect HDR. Note: until color-managed compositing lands, HDR content still only displays correctly
+  while fullscreen; a window rendering HDR while windowed will look washed out.
+
+The optional `reference-luminance` child (in cd/m²) is the luminance that SDR white is mapped to in
+HDR mode; it is reported to clients as the reference white level and defaults to 203 (the BT.2408
+reference). Its full effect arrives with the upcoming color-managed compositing.
 
 ```kdl
 // Enable HDR on the internal display.
 output "eDP-1" {
     hdr
+}
+
+// Games that only probe HDR at startup: advertise HDR upfront.
+output "DP-1" {
+    hdr mode="on" {
+        reference-luminance 203
+    }
 }
 ```
 

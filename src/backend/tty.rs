@@ -64,7 +64,7 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
-use super::{IpcOutputMap, RenderResult};
+use super::{IpcOutputMap, OutputHdrCaps, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, RedrawState, State};
@@ -1469,6 +1469,12 @@ impl Tty {
             .user_data()
             .insert_if_missing(|| TtyOutputState { node, crtc });
         output.user_data().insert_if_missing(|| output_name.clone());
+        output.user_data().insert_if_missing(|| OutputHdrCaps {
+            supported: hdr_supported,
+            max_luminance: edid_hdr.max_luminance,
+            min_luminance: edid_hdr.min_luminance,
+            max_frame_avg_luminance: edid_hdr.max_frame_avg_luminance,
+        });
         if let Some(x) = orientation {
             output.user_data().insert_if_missing(|| PanelOrientation(x));
         }

@@ -770,6 +770,14 @@ impl ColorManagementHandler for State {
         // reconciles HDR signalling. A redraw is already scheduled by the surface commit.
     }
 
+    fn description_for_output(&mut self, output: &Output) -> ImageDescription {
+        self.niri.output_blend_description(output)
+    }
+
+    fn preferred_description_for_surface(&mut self, surface: &WlSurface) -> ImageDescription {
+        self.niri.preferred_surface_description(surface)
+    }
+
     fn schedule_image_description_info(
         &mut self,
         info: WpImageDescriptionInfoV1,
