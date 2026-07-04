@@ -75,8 +75,9 @@ use smithay::utils::{
 };
 use smithay::wayland::background_effect::BackgroundEffectState;
 use smithay::wayland::color::management::{
-    get_surface_description, ColorManagementState, Feature, ImageDescription,
-    Primaries as CmPrimaries, RenderIntent, TransferFunction as CmTransferFunction,
+    get_surface_description, ColorManagementState, ColorManagementSurfaceCachedState, Feature,
+    ImageDescription, Primaries as CmPrimaries, RenderIntent,
+    TransferFunction as CmTransferFunction,
 };
 use smithay::wayland::compositor::{
     with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
@@ -2370,14 +2371,16 @@ impl Niri {
     /// an HDR (PQ / BT.2020) image description, returns that description. The TTY backend uses this
     /// to decide whether to signal HDR on the connector. Requires the window to be fullscreen so the
     /// HDR signal covers the whole output and doesn't wash out surrounding SDR content.
+    ///
+    /// The whole surface tree is searched, not just the toplevel surface: winewayland (Proton)
+    /// presents Vulkan content on a subsurface of the toplevel and attaches the HDR image
+    /// description there.
     pub fn output_hdr_image_description(&self, output: &Output) -> Option<ImageDescription> {
         let window = self.layout.monitor_for_output(output)?.active_window()?;
         if !window.sizing_mode().is_fullscreen() {
             return None;
         }
-        let (desc, _intent) = get_surface_description(window.toplevel().wl_surface());
-        let desc = desc?;
-        desc.is_hdr().then_some(desc)
+        surface_tree_hdr_description(window.toplevel().wl_surface())
     }
 
     /// Returns the HDR config of an output, but only if the output can actually do HDR
@@ -7287,6 +7290,38 @@ pub struct ClientState {
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+/// Searches a surface and its subsurfaces for a committed HDR image description, returning the
+/// first one found.
+///
+/// Clients differ in where they attach the description: mpv attaches it to the toplevel surface
+/// itself, while winewayland (Proton) presents Vulkan content on a subsurface and attaches it
+/// there.
+fn surface_tree_hdr_description(surface: &WlSurface) -> Option<ImageDescription> {
+    let mut found = None;
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, _| TraversalAction::DoChildren(()),
+        |_, states, _| {
+            if found.is_none() {
+                // The surface's states are already locked by the traversal, so read the cached
+                // state through them rather than via get_surface_description() (which would
+                // re-lock and deadlock).
+                let mut guard = states
+                    .cached_state
+                    .get::<ColorManagementSurfaceCachedState>();
+                if let Some(desc) = guard.current().description {
+                    if desc.is_hdr() {
+                        found = Some(desc);
+                    }
+                }
+            }
+        },
+        |_, _, _| true,
+    );
+    found
 }
 
 fn scale_relocate_crop<E: Element>(

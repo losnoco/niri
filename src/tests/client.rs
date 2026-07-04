@@ -41,6 +41,8 @@ use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
+use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
+use wayland_client::protocol::wl_subsurface::{self, WlSubsurface};
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle};
 
@@ -67,6 +69,7 @@ pub struct State {
     pub virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub viewporter: Option<WpViewporter>,
+    pub subcompositor: Option<WlSubcompositor>,
     pub color_manager: Option<WpColorManagerV1>,
     /// Feedback objects kept alive so preferred_changed events can arrive.
     pub surface_feedbacks: Vec<WpColorManagementSurfaceFeedbackV1>,
@@ -204,6 +207,7 @@ impl Client {
             virtual_pointer_manager: None,
             spbm: None,
             viewporter: None,
+            subcompositor: None,
             color_manager: None,
             surface_feedbacks: Vec::new(),
             preferred_changed: Vec::new(),
@@ -259,6 +263,27 @@ impl Client {
         let image = output_cm.get_image_description(&self.qh, ());
         let _info = image.get_information(&self.qh, ());
         self.connection.flush().unwrap();
+    }
+
+    /// Creates a subsurface of `parent` with a buffer attached and committed, like winewayland does
+    /// for Vulkan swapchain presentation. Returns the subsurface's wl_surface.
+    pub fn create_committed_subsurface(&mut self, parent: &WlSurface) -> WlSurface {
+        let compositor = self.state.compositor.as_ref().unwrap();
+        let subcompositor = self
+            .state
+            .subcompositor
+            .as_ref()
+            .expect("no wl_subcompositor");
+        let spbm = self.state.spbm.as_ref().unwrap();
+
+        let surface = compositor.create_surface(&self.qh, ());
+        let _subsurface = subcompositor.get_subsurface(&surface, parent, &self.qh, ());
+        let buffer = spbm.create_u32_rgba_buffer(0, 0, 0, u32::MAX, &self.qh, ());
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        parent.commit();
+        self.connection.flush().unwrap();
+        surface
     }
 
     /// Drives the color-management requests an HDR-aware client (SDL3) sends at startup: create a
@@ -611,6 +636,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == WpViewporter::interface().name {
                     let version = min(version, WpViewporter::interface().version);
                     state.viewporter = Some(registry.bind(name, version, qh, ()));
+                } else if interface == WlSubcompositor::interface().name {
+                    let version = min(version, WlSubcompositor::interface().version);
+                    state.subcompositor = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WpColorManagerV1::interface().name {
                     let version = min(version, WpColorManagerV1::interface().version);
                     state.color_manager = Some(registry.bind(name, version, qh, ()));
@@ -661,6 +689,32 @@ impl Dispatch<WlCompositor, ()> for State {
         _state: &mut Self,
         _proxy: &WlCompositor,
         _event: <WlCompositor as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<WlSubcompositor, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlSubcompositor,
+        _event: <WlSubcompositor as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<WlSubsurface, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlSubsurface,
+        _event: wl_subsurface::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,

@@ -190,3 +190,47 @@ fn preferred_identities_are_stable() {
         "the same preferred description must keep the same identity"
     );
 }
+
+#[test]
+fn hdr_description_on_subsurface_engages() {
+    // winewayland (Proton) attaches the HDR image description to a Vulkan *subsurface* of the
+    // toplevel, not the toplevel surface itself. Engagement must search the surface tree.
+    let mut f = fixture_with_hdr_mode_on();
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_fullscreen(None);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    // Vulkan-style subsurface carrying the HDR description.
+    let subsurface = f.client(id).create_committed_subsurface(&surface);
+    f.roundtrip(id);
+    f.client(id).create_and_attach_hdr_description(
+        &subsurface,
+        TransferFunction::St2084Pq,
+        Primaries::Bt2020,
+        RenderIntent::Perceptual,
+    );
+    f.roundtrip(id);
+    // The description is double-buffered; commit the subsurface and sync via the parent.
+    let subsurface_clone = subsurface.clone();
+    subsurface_clone.commit();
+    f.client(id).window(&surface).surface.commit();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+    let desc = f.niri().output_hdr_image_description(&output);
+    assert!(
+        desc.is_some_and(|d| d.is_hdr()),
+        "HDR description on a subsurface must engage HDR, got {desc:?}"
+    );
+}
