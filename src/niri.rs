@@ -78,7 +78,7 @@ use smithay::wayland::color::management::{
     Primaries as CmPrimaries, RenderIntent, TransferFunction as CmTransferFunction,
 };
 use smithay::wayland::compositor::{
-    with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
+    get_parent, with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
     CompositorState, HookId, SurfaceData, TraversalAction,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
@@ -2482,11 +2482,18 @@ impl Niri {
 
     /// The image description we'd prefer the given surface to use.
     pub fn preferred_surface_description(&self, surface: &WlSurface) -> ImageDescription {
-        if let Some((window, Some(output))) = self.layout.find_window_and_output(surface) {
+        // Resolve subsurfaces to their root: winewayland presents Vulkan content on a
+        // subsurface of the toplevel and may query color feedback there.
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+
+        if let Some((window, Some(output))) = self.layout.find_window_and_output(&root) {
             return self.preferred_description_for_window(window, output);
         }
         // Non-toplevel surfaces (e.g. layer shell): prefer the output's blend space.
-        if let Some(output) = self.output_for_root(surface) {
+        if let Some(output) = self.output_for_root(&root) {
             let output = output.clone();
             return self.output_blend_description(&output);
         }
