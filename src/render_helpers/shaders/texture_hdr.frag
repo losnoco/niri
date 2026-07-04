@@ -20,30 +20,25 @@ varying vec2 v_coords;
 uniform float tint;
 #endif
 
-// x is left edge, y is right edge of the gradient.
-uniform vec2 cutoff;
-
 vec4 niri_blend(vec4 color);
 
+// Same as the default texture shader, but encoding into the output blend space. Installed
+// as the frame-wide default texture program on HDR outputs.
 void main() {
-    // Sample the texture.
     vec4 color = texture2D(tex, v_coords);
+
 #if defined(NO_ALPHA)
-    color = vec4(color.rgb, 1.0);
+    color = vec4(color.rgb, 1.0) * alpha;
+#else
+    color = color * alpha;
 #endif
 
-    if (cutoff.x < cutoff.y) {
-        float fade = clamp((cutoff.y - v_coords.x) / (cutoff.y - cutoff.x), 0.0, 1.0);
-        color = color * fade;
-    }
-
-    // Apply final alpha and tint.
-    color = color * alpha;
+    color = niri_blend(color);
 
 #if defined(DEBUG_FLAGS)
     if (tint == 1.0)
         color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
 #endif
 
-    gl_FragColor = niri_blend(color);
+    gl_FragColor = color;
 }

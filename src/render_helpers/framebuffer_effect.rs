@@ -15,6 +15,7 @@ use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::RenderParams;
+use crate::render_helpers::blend::FrameBlendState;
 use crate::render_helpers::blur::{Blur, BlurOptions};
 use crate::render_helpers::renderer::AsGlesFrame as _;
 use crate::render_helpers::shaders::{mat3_uniform, Shaders};
@@ -389,9 +390,12 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
         );
 
         let program = Shaders::get_from_frame(frame).postprocess_and_clip.clone();
-        let uniforms = program
-            .is_some()
-            .then(|| self.compute_uniforms(crop, frame.transformation()));
+        let uniforms = program.is_some().then(|| {
+            let mut uniforms = self.compute_uniforms(crop, frame.transformation()).to_vec();
+            // The sampled framebuffer content is already in the output blend space.
+            uniforms.extend(FrameBlendState::uniforms_for_content(frame, true));
+            uniforms
+        });
         let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
 
         frame.render_texture_from_to(

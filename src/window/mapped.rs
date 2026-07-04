@@ -2,7 +2,6 @@ use std::cell::{Cell, Ref, RefCell};
 use std::time::Duration;
 
 use niri_config::{Color, Config, CornerRadius, GradientInterpolation, WindowRule};
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::space::SpaceElement as _;
@@ -29,6 +28,7 @@ use crate::layout::{
 };
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
+use crate::render_helpers::blend::BlendSurfaceRenderElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
@@ -660,7 +660,7 @@ impl LayoutElement for Mapped {
         } else {
             let buf_pos = location - self.window.geometry().loc.to_f64();
             let surface = self.toplevel().wl_surface();
-            let mut push = |elem: WaylandSurfaceRenderElement<R>| push(elem.into());
+            let mut push = |elem: BlendSurfaceRenderElement<R>| push(elem.into());
             push_elements_from_surface_tree(
                 ctx.renderer,
                 surface,

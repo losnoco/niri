@@ -1213,13 +1213,20 @@ impl<W: LayoutElement> Tile<W> {
                     // If we should clip to geometry, render a clipped window.
                     if clip_to_geometry {
                         if let Some(shader) = clip_shader.clone() {
-                            if ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius) {
+                            if ClippedSurfaceRenderElement::will_clip(
+                                elem.inner(),
+                                scale,
+                                geo,
+                                radius,
+                            ) {
+                                let content_hdr = elem.content_hdr();
                                 return ClippedSurfaceRenderElement::new(
-                                    elem,
+                                    elem.into_inner(),
                                     scale,
                                     geo,
                                     shader.clone(),
                                     radius,
+                                    content_hdr,
                                 )
                                 .into();
                             }

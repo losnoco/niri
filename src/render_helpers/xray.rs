@@ -15,6 +15,7 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::RenderParams;
+use crate::render_helpers::blend::FrameBlendState;
 use crate::render_helpers::effect_buffer::EffectBuffer;
 use crate::render_helpers::renderer::AsGlesFrame as _;
 use crate::render_helpers::shaders::{mat3_uniform, Shaders};
@@ -339,7 +340,11 @@ impl RenderElement<GlesRenderer> for XrayElement {
             damage
         };
 
-        let uniforms = self.program.is_some().then(|| self.compute_uniforms());
+        let uniforms = self.program.is_some().then(|| {
+            let mut uniforms = self.compute_uniforms().to_vec();
+            uniforms.extend(FrameBlendState::uniforms(frame));
+            uniforms
+        });
         let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
 
         frame.render_texture_from_to(

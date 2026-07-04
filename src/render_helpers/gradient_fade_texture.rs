@@ -6,6 +6,7 @@ use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions}
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 
+use super::blend::FrameBlendState;
 use super::texture::TextureRenderElement;
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::renderer::AsGlesFrame as _;
@@ -99,9 +100,11 @@ impl RenderElement<GlesRenderer> for GradientFadeTextureRenderElement {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        let uniforms = vec![Uniform::new("cutoff", self.cutoff)];
+        let mut uniforms = vec![Uniform::new("cutoff", self.cutoff)];
+        uniforms.extend(FrameBlendState::uniforms(frame));
+        let saved = frame.take_tex_program_override();
         frame.override_default_tex_program(self.program.0.clone(), uniforms);
-        RenderElement::<GlesRenderer>::draw(
+        let res = RenderElement::<GlesRenderer>::draw(
             &self.inner,
             frame,
             src,
@@ -109,9 +112,9 @@ impl RenderElement<GlesRenderer> for GradientFadeTextureRenderElement {
             damage,
             opaque_regions,
             cache,
-        )?;
-        frame.clear_tex_program_override();
-        Ok(())
+        );
+        frame.set_tex_program_override(saved);
+        res
     }
 
     fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {

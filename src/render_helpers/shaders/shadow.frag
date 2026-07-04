@@ -74,6 +74,8 @@ float roundedBoxShadow(vec2 lower, vec2 upper, vec2 point, float sigma, float co
 
 float niri_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius);
 
+vec4 niri_blend(vec4 color);
+
 void main() {
     vec3 coords_geo = input_to_geo * vec3(niri_v_coords, 1.0);
     vec3 coords_window_geo = window_input_to_geo * vec3(niri_v_coords, 1.0);
@@ -115,5 +117,5 @@ void main() {
         color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
 #endif
 
-    gl_FragColor = color;
+    gl_FragColor = niri_blend(color);
 }

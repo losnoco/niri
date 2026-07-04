@@ -167,9 +167,10 @@ pub enum HdrMode {
     /// output stays SDR otherwise.
     #[default]
     Auto,
-    /// The output is always treated as HDR: clients are told upfront that the output prefers
-    /// PQ/BT.2020 content, so applications that only probe HDR support once at startup (e.g. many
-    /// SDL games) detect it.
+    /// The output is always in HDR: the connector stays in BT.2020 + PQ, SDR content is
+    /// composited into the HDR blend space, and clients are told upfront that the output prefers
+    /// PQ/BT.2020 content — so applications that only probe HDR support once at startup (e.g.
+    /// many SDL games) detect it.
     On,
 }
 

@@ -6,13 +6,14 @@ use glam::{Mat3, Vec2};
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{
     ffi, link_program, Capability, GlesError, GlesFrame, GlesRenderer, GlesTexture, Uniform,
-    UniformDesc, UniformName,
+    UniformDesc, UniformName, UniformType,
 };
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::backend::renderer::DebugFlags;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
 
+use super::blend::FrameBlendState;
 use super::renderer::AsGlesFrame;
 use super::resources::Resources;
 use super::shaders::{ProgramType, Shaders};
@@ -164,8 +165,17 @@ impl ShaderProgram {
         additional_uniforms: &[UniformName<'_>],
         texture_uniforms: &[&str],
     ) -> Result<Self, GlesError> {
+        // All niri shader programs get the blend-space transform (and its uniforms), so their
+        // output is correct on HDR outputs. The uniforms are set per draw from the frame's
+        // blend state.
+        let mut src = src.to_string();
+        src.push_str(include_str!("shaders/hdr.frag"));
+        let mut additional_uniforms = additional_uniforms.to_vec();
+        additional_uniforms.push(UniformName::new("niri_hdr_pq", UniformType::_1f));
+        additional_uniforms.push(UniformName::new("niri_ref_lum_scale", UniformType::_1f));
+
         renderer.with_context(move |gl| unsafe {
-            compile_program(gl, src, additional_uniforms, texture_uniforms)
+            compile_program(gl, &src, &additional_uniforms, texture_uniforms)
         })?
     }
 
@@ -304,6 +314,8 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
             return Ok(());
         };
 
+        let blend_uniforms = FrameBlendState::uniforms(frame);
+
         let Some(resources) = Resources::get(frame) else {
             return Ok(());
         };
@@ -439,6 +451,14 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
                                 GlesError::UnknownUniform(uniform.name.clone().into_owned())
                             })?;
                     uniform.value.set(gl, desc)?;
+                }
+
+                // Uniform values persist in the program object, so set the blend uniforms on
+                // every draw.
+                for uniform in &blend_uniforms {
+                    if let Some(desc) = program.additional_uniforms.get(&*uniform.name) {
+                        uniform.value.set(gl, desc)?;
+                    }
                 }
 
                 gl.EnableVertexAttribArray(program.attrib_vert as u32);

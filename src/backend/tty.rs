@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, ensure, Context};
 use bytemuck::cast_slice_mut;
 use drm_ffi::drm_mode_modeinfo;
 use libc::dev_t;
-use niri_config::output::Modeline;
+use niri_config::output::{HdrMode, Modeline};
 use niri_config::{Config, OutputName};
 use niri_ipc::{HSyncPolarity, VSyncPolarity};
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -54,7 +54,9 @@ use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{DeviceFd, Transform};
-use smithay::wayland::color::management::ImageDescription;
+use smithay::wayland::color::management::{
+    ImageDescription, Primaries as CmPrimaries, TransferFunction as CmTransferFunction,
+};
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::drm_lease::{
     DrmLease, DrmLeaseBuilder, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
@@ -68,6 +70,7 @@ use super::{IpcOutputMap, OutputHdrCaps, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, RedrawState, State};
+use crate::render_helpers::blend::{self, set_frame_blend, DEFAULT_REFERENCE_LUMINANCE};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
@@ -400,6 +403,10 @@ struct Surface {
     /// The last color state we tried to stage and the driver rejected. Tracked so a rejected
     /// state isn't re-tested every frame (each test is an atomic TEST_ONLY commit).
     failed_color_state: Option<ConnectorColorState>,
+    /// The blend space of the last rendered frame: `Some(reference luminance)` = HDR, `None`
+    /// = SDR. Blend changes alter shader output without damaging anything, so a change forces
+    /// a full redraw.
+    last_blend: Option<Option<f64>>,
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     gamma_props: Option<GammaProps>,
     /// Gamma change to apply upon session resume.
@@ -883,6 +890,7 @@ impl Tty {
             let gles_renderer = renderer.as_gles_renderer();
             resources::init(gles_renderer);
             shaders::init(gles_renderer);
+            blend::FrameBlendState::init(gles_renderer);
 
             let config = self.config.borrow();
             if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {
@@ -1680,6 +1688,7 @@ impl Tty {
             edid_hdr,
             max_bpc_range,
             failed_color_state: None,
+            last_blend: None,
             compositor,
             dmabuf_feedback,
             gamma_props,
@@ -2029,33 +2038,58 @@ impl Tty {
             return rv;
         }
 
-        // Reconcile HDR signalling with the content about to be shown. HDR must be enabled for the
-        // output in the config, supported by driver and sink, and the output must be showing a
-        // fullscreen surface tagged as HDR (Phase 1 passthrough). The desired state is only
-        // *staged* here; smithay applies it inside its own commit as a single atomic modeset
-        // together with mode, CRTC and plane state (committing connector color properties
-        // standalone hangs some drivers, notably nvidia).
-        {
+        // Reconcile the output's blend space and HDR signalling with the config and content.
+        //
+        // With hdr mode="on", the connector stays in HDR (BT.2020 + PQ) and the desktop is
+        // composited into that blend space. In auto mode, HDR engages only while a fullscreen
+        // surface carries an HDR image description (passthrough), so the output is SDR
+        // otherwise.
+        //
+        // The connector state is only *staged* here; smithay applies it inside its own commit
+        // as a single atomic modeset together with mode, CRTC and plane state (committing
+        // connector color properties standalone hangs some drivers, notably nvidia).
+        let (blend_hdr, hdr_content, reference_luminance) = {
             let config = self.config.borrow();
             let output_config = config.outputs.find(&surface.name);
-            let hdr_allowed =
-                output_config.is_some_and(|o| o.hdr.is_some()) && surface.hdr_supported;
+            let hdr_config = output_config.and_then(|o| o.hdr.clone());
+            let hdr_allowed = hdr_config.is_some() && surface.hdr_supported;
             let max_bpc = output_config
                 .map(|o| effective_max_bpc(o, &surface.max_bpc_range))
                 .unwrap_or(None);
+            let always_on = hdr_config.as_ref().is_some_and(|h| h.mode == HdrMode::On);
+            let reference_luminance = hdr_config
+                .as_ref()
+                .and_then(|h| h.reference_luminance)
+                .map(|v| v.0)
+                .unwrap_or(DEFAULT_REFERENCE_LUMINANCE);
             drop(config);
 
             let hdr_desc = hdr_allowed
                 .then(|| niri.output_hdr_image_description(output))
                 .flatten();
-            let desired = ConnectorColorState {
-                colorspace: if hdr_desc.is_some() {
-                    Colorspace::Bt2020Rgb
-                } else {
-                    Colorspace::Default
-                },
-                hdr_metadata: hdr_desc.map(|desc| build_hdr_metadata(&desc, &surface.edid_hdr)),
-                max_bpc,
+            let blend_hdr = hdr_allowed && (always_on || hdr_desc.is_some());
+
+            let desired = if blend_hdr {
+                // Without fullscreen HDR content, the metadata comes from the sink's EDID.
+                let desc = hdr_desc.unwrap_or(ImageDescription {
+                    transfer: CmTransferFunction::St2084Pq,
+                    primaries: CmPrimaries::Bt2020,
+                    max_cll: None,
+                    max_fall: None,
+                    mastering_luminance: None,
+                    luminances: None,
+                });
+                ConnectorColorState {
+                    colorspace: Colorspace::Bt2020Rgb,
+                    hdr_metadata: Some(build_hdr_metadata(&desc, &surface.edid_hdr)),
+                    max_bpc,
+                }
+            } else {
+                ConnectorColorState {
+                    colorspace: Colorspace::Default,
+                    hdr_metadata: None,
+                    max_bpc,
+                }
             };
 
             if surface.compositor.pending_color_state() != desired
@@ -2076,6 +2110,16 @@ impl Tty {
                     }
                 }
             }
+
+            (blend_hdr, hdr_desc.is_some(), reference_luminance)
+        };
+
+        // A blend-space change alters what every shader outputs without any element damage;
+        // force a full redraw.
+        let blend = blend_hdr.then_some(reference_luminance);
+        if surface.last_blend != Some(blend) {
+            surface.last_blend = Some(blend);
+            surface.compositor.reset_buffers();
         }
 
         let mut renderer = match self.gpu_manager.renderer(
@@ -2133,12 +2177,28 @@ impl Tty {
                 }
             }
 
+            if blend_hdr {
+                // The cursor plane is filled without going through GLES, so its content would
+                // bypass the blend transform; render the cursor on the primary plane instead.
+                flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
+                flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+                if !hdr_content {
+                    // SDR content must go through the blend shader.
+                    flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT);
+                    flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY);
+                }
+            }
+
             flags
         };
 
         // Hand them over to the DRM.
+        set_frame_blend(renderer.as_gles_renderer(), blend);
         let drm_compositor = &mut surface.compositor;
-        match drm_compositor.render_frame::<_, _>(&mut renderer, &elements, [0.; 4], flags) {
+        let render_frame_result =
+            drm_compositor.render_frame::<_, _>(&mut renderer, &elements, [0.; 4], flags);
+        set_frame_blend(renderer.as_gles_renderer(), None);
+        match render_frame_result {
             Ok(res) => {
                 let needs_sync = res.needs_sync()
                     || self

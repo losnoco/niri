@@ -382,9 +382,16 @@ impl Thumbnail {
         let clip = move |elem| match elem {
             LayoutElementRenderElement::Wayland(elem) => {
                 if let Some(shader) = clip_shader.clone() {
-                    if ClippedSurfaceRenderElement::will_clip(&elem, s, geo, radius) {
-                        let elem =
-                            ClippedSurfaceRenderElement::new(elem, s, geo, shader.clone(), radius);
+                    if ClippedSurfaceRenderElement::will_clip(elem.inner(), s, geo, radius) {
+                        let content_hdr = elem.content_hdr();
+                        let elem = ClippedSurfaceRenderElement::new(
+                            elem.into_inner(),
+                            s,
+                            geo,
+                            shader.clone(),
+                            radius,
+                            content_hdr,
+                        );
                         return ThumbnailRenderElement::ClippedSurface(elem);
                     }
                 }

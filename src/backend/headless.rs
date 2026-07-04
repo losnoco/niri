@@ -54,6 +54,7 @@ impl Headless {
 
         resources::init(&mut renderer);
         shaders::init(&mut renderer);
+        crate::render_helpers::blend::FrameBlendState::init(&mut renderer);
 
         self.renderer = Some(renderer);
         Ok(())
