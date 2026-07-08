@@ -18,10 +18,10 @@ use libc::dev_t;
 use niri_config::output::{HdrMode, Modeline};
 use niri_config::{Config, OutputName};
 use niri_ipc::{HSyncPolarity, VSyncPolarity};
-use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::{Allocator, Fourcc};
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{
@@ -34,7 +34,7 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer};
-use smithay::backend::renderer::{DebugFlags, ImportDma, ImportEgl, RendererSuper};
+use smithay::backend::renderer::{Bind, DebugFlags, ImportDma, ImportEgl, RendererSuper};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
@@ -94,6 +94,55 @@ const HDR_COLOR_FORMATS: [Fourcc; 4] = [
     Fourcc::Argb8888,
     Fourcc::Abgr8888,
 ];
+
+/// Probe whether the render GPU can actually *bind* a 10-bit scanout buffer as a render target.
+///
+/// `dmabuf_render_formats()` (the source of the compositor's render formats) advertises 2101010
+/// on some drivers, and the connector can scan it out, so `DrmCompositor::new()` succeeds — but
+/// importing the buffer as a color-renderable EGL image can still fail (it imports as an external
+/// texture, or the resulting framebuffer is incomplete). That only shows up at render time as a
+/// per-frame `Failed to bind Framebuffer`, after the compositor exists, so the creation-time
+/// 10-bit → 8-bit fallback never sees it. Doing one real bind up front — exactly what
+/// `DrmCompositor::render_frame` does internally — lets us drop to 8-bit cleanly instead of
+/// freezing the display. Returns `true` if at least one 10-bit format binds.
+fn can_bind_10bit(
+    renderer: &mut GlesRenderer,
+    allocator: &mut GbmAllocator<DrmDeviceFd>,
+    render_formats: &FormatSet,
+) -> bool {
+    // The 10-bit formats HDR_COLOR_FORMATS would offer for scanout.
+    const TEN_BIT: [Fourcc; 4] = [
+        Fourcc::Xrgb2101010,
+        Fourcc::Xbgr2101010,
+        Fourcc::Argb2101010,
+        Fourcc::Abgr2101010,
+    ];
+
+    for fourcc in TEN_BIT {
+        let modifiers: Vec<Modifier> = render_formats
+            .iter()
+            .filter(|format| format.code == fourcc)
+            .map(|format| format.modifier)
+            .collect();
+        if modifiers.is_empty() {
+            continue;
+        }
+
+        let Ok(buffer) = allocator.create_buffer(16, 16, fourcc, &modifiers) else {
+            continue;
+        };
+        let Ok(mut dmabuf) = buffer.export() else {
+            continue;
+        };
+        // A real bind: EGL image import + framebuffer completeness check. On error the renderer
+        // unbinds itself, so this leaves no lingering GL state for the subsequent real frames.
+        if renderer.bind(&mut dmabuf).is_ok() {
+            return true;
+        }
+    }
+
+    false
+}
 
 pub struct Tty {
     config: Rc<RefCell<Config>>,
@@ -1488,7 +1537,7 @@ impl Tty {
         }
 
         let render_node = device.render_node.unwrap_or(self.primary_render_node);
-        let renderer = self.gpu_manager.single_renderer(&render_node)?;
+        let mut renderer = self.gpu_manager.single_renderer(&render_node)?;
         let egl_context = renderer.as_ref().egl_context();
         let render_formats = egl_context.dmabuf_render_formats();
 
@@ -1541,7 +1590,29 @@ impl Tty {
         // hangs). Remove once HDR on nvidia is understood.
         let force_8bit = std::env::var_os("NIRI_HDR_FORCE_8BIT").is_some()
             || self.config.borrow().debug.disable_10bit_output;
-        let mut color_formats: &[Fourcc] = if config.hdr.is_some() && hdr_supported && !force_8bit {
+        let mut want_10bit = config.hdr.is_some() && hdr_supported && !force_8bit;
+
+        // Some GPUs advertise 2101010 in `dmabuf_render_formats()` (and can scan it out, so
+        // `DrmCompositor::new()` succeeds) yet cannot import it as a color-renderable EGL image —
+        // the failure only surfaces per-frame at render time as "Failed to bind Framebuffer",
+        // after the compositor is already created, so the creation-time fallback below never
+        // catches it. Probe an actual render-target bind up front and drop to 8-bit if it fails.
+        // HDR signalling still works on an 8-bit framebuffer, just with banding.
+        if want_10bit
+            && !can_bind_10bit(
+                renderer.as_gles_renderer(),
+                &mut device.allocator,
+                &render_formats,
+            )
+        {
+            warn!(
+                connector = connector_name,
+                "GPU can scan out but not render into 10-bit; using an 8-bit HDR framebuffer"
+            );
+            want_10bit = false;
+        }
+
+        let mut color_formats: &[Fourcc] = if want_10bit {
             &HDR_COLOR_FORMATS
         } else {
             &SDR_COLOR_FORMATS
