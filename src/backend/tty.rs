@@ -84,16 +84,17 @@ use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOri
 /// Smithay should fall back to Xrgb/Xbgr automatically if needed.
 const SDR_COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Argb8888, Fourcc::Abgr8888];
 
-/// Scanout formats offered on HDR outputs: 10-bit preferred (needed so the PQ signal isn't crushed),
-/// falling back to 8-bit if the GPU won't scan out 10-bit at the chosen mode.
+/// 10-bit scanout formats probed individually on HDR outputs, in order of preference. Each one
+/// that works is offered ahead of the 8-bit fallbacks, which are needed so the PQ signal isn't
+/// crushed.
 ///
 /// When copying from rendering Nvidia dGPU to target iGPU, it only understands X/Abgr and not
-/// X/Argb, so Abgr2101010 comes first.
-const HDR_COLOR_FORMATS: [Fourcc; 4] = [
+/// X/Argb, so those come first.
+const HDR_TEN_BIT_COLOR_FORMATS: [Fourcc; 4] = [
     Fourcc::Abgr2101010,
+    Fourcc::Xbgr2101010,
     Fourcc::Argb2101010,
-    Fourcc::Argb8888,
-    Fourcc::Abgr8888,
+    Fourcc::Xrgb2101010,
 ];
 
 pub struct Tty {
@@ -1542,8 +1543,101 @@ impl Tty {
         // hangs). Remove once HDR on nvidia is understood.
         let force_8bit = std::env::var_os("NIRI_HDR_FORCE_8BIT").is_some()
             || self.config.borrow().debug.disable_10bit_output;
-        let mut color_formats: &[Fourcc] = if config.hdr.is_some() && hdr_supported && !force_8bit {
-            &HDR_COLOR_FORMATS
+        let mut using_10bit_formats = config.hdr.is_some() && hdr_supported && !force_8bit;
+        let mut hdr_color_formats = Vec::new();
+
+        if using_10bit_formats {
+            // Do a throwaway compositor + render_frame probe for each 10-bit format separately.
+            // Some drivers can render into AR30/AB30 but not XR30/XB30; treating 10-bit as a
+            // boolean capability would either pick a broken format or fall back too far to 8-bit.
+            for format in HDR_TEN_BIT_COLOR_FORMATS {
+                let surface = device
+                    .drm
+                    .create_surface(crtc, mode, &[connector.handle()])?;
+
+                let mut compositor: GbmDrmCompositor = match DrmCompositor::new(
+                    OutputModeSource::Auto(output.downgrade()),
+                    surface,
+                    None,
+                    device.allocator.clone(),
+                    GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
+                    std::iter::once(format),
+                    render_formats.clone(),
+                    device.drm.cursor_size(),
+                    Some(device.gbm.clone()),
+                ) {
+                    Ok(compositor) => compositor,
+                    Err(err) => {
+                        warn!(
+                            connector = connector_name,
+                            ?format,
+                            "10-bit format is not usable for DRM compositor creation: {err:?}"
+                        );
+                        continue;
+                    }
+                };
+
+                let render_ok = match self.gpu_manager.renderer(
+                    &self.primary_render_node,
+                    &render_node,
+                    compositor.format(),
+                ) {
+                    Ok(mut renderer) => {
+                        let no_elements: [SolidColorRenderElement; 0] = [];
+                        match compositor.render_frame(
+                            &mut renderer,
+                            &no_elements,
+                            [0.; 4],
+                            FrameFlags::empty(),
+                        ) {
+                            Ok(_) => true,
+                            Err(err) => {
+                                warn!(
+                                    connector = connector_name,
+                                    ?format,
+                                    "10-bit format is not renderable: {err:?}"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    // Couldn't build a renderer to probe with; don't block startup — keep the
+                    // format and let the real render path try, as the previous probe did.
+                    Err(err) => {
+                        warn!(
+                            connector = connector_name,
+                            ?format,
+                            "could not probe 10-bit format renderability: {err:?}"
+                        );
+                        true
+                    }
+                };
+
+                compositor.reset_buffers();
+
+                if render_ok {
+                    debug!(
+                        connector = connector_name,
+                        ?format,
+                        "keeping renderable 10-bit format"
+                    );
+                    hdr_color_formats.push(format);
+                }
+            }
+
+            if hdr_color_formats.is_empty() {
+                warn!(
+                    connector = connector_name,
+                    "GPU can scan out but not render into any 10-bit format; using an 8-bit HDR framebuffer"
+                );
+                using_10bit_formats = false;
+            } else {
+                hdr_color_formats.extend(SDR_COLOR_FORMATS);
+            }
+        }
+
+        let mut color_formats: &[Fourcc] = if using_10bit_formats {
+            &hdr_color_formats
         } else {
             &SDR_COLOR_FORMATS
         };
@@ -1571,10 +1665,11 @@ impl Tty {
 
         // If 10-bit formats didn't work out, fall back to plain 8-bit before trying anything
         // else. HDR signalling still works on an 8-bit framebuffer, just with banding.
-        if res.is_err() && std::ptr::eq(color_formats, &HDR_COLOR_FORMATS as &[_]) {
+        if res.is_err() && using_10bit_formats {
             let err = res.as_ref().err().unwrap();
             warn!("error creating DRM compositor with 10-bit formats, retrying 8-bit: {err:?}");
             color_formats = &SDR_COLOR_FORMATS;
+            using_10bit_formats = false;
 
             // DrmCompositor::new() consumed the surface...
             let surface = device
@@ -1629,7 +1724,7 @@ impl Tty {
         // Do one throwaway `render_frame` — the exact path that would fail — and, if it errors,
         // recreate the compositor with 8-bit formats. HDR signalling still works on an 8-bit
         // framebuffer, just with banding. Only runs for 10-bit HDR outputs, once per connector at setup.
-        if std::ptr::eq(color_formats, &HDR_COLOR_FORMATS as &[_]) {
+        if using_10bit_formats {
             let trial_ok = match self.gpu_manager.renderer(
                 &self.primary_render_node,
                 &render_node,
