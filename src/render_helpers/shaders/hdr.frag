@@ -3,7 +3,8 @@
 // niri_hdr_pq = 1.0 enables the transform, 0.0 passes through (SDR outputs; uniforms
 // default to 0). niri_ref_lum_scale = reference luminance / 10000 (PQ peak).
 // niri_scrgb = 1.0 treats the content as Windows scRGB (linear BT.709, 1.0 = 80 cd/m²)
-// instead of electrical sRGB.
+// instead of electrical sRGB; unlike other content it is also transformed on SDR outputs,
+// since its raw linear values are meaningless there.
 
 uniform float niri_hdr_pq;
 uniform float niri_ref_lum_scale;
@@ -21,7 +22,7 @@ vec3 niri_pq_inv_eotf(vec3 lin) {
 
 // Premultiplied in, premultiplied out.
 vec4 niri_blend(vec4 color) {
-    if (niri_hdr_pq < 0.5)
+    if (niri_hdr_pq < 0.5 && niri_scrgb < 0.5)
         return color;
 
     float a = color.a;
@@ -34,13 +35,23 @@ vec4 niri_blend(vec4 color) {
         0.043313, 0.011362, 0.895595);
 
     if (niri_scrgb > 0.5) {
-        // Windows scRGB: already linear light with 1.0 = 80 cd/m²; negative values escape
-        // the BT.709 gamut. The mapping to PQ is absolute (80 / 10000 per channel) and
-        // deliberately independent of the SDR reference luminance: scRGB is display-referred
-        // for a BT.2100/PQ-mode screen and must never be tone mapped, only clamped to the
-        // output volume (which niri_pq_inv_eotf does).
-        rgb = to_bt2020 * rgb;
-        rgb = niri_pq_inv_eotf(rgb * 0.008);
+        if (niri_hdr_pq > 0.5) {
+            // Windows scRGB on an HDR output: already linear light with 1.0 = 80 cd/m²;
+            // negative values escape the BT.709 gamut. The mapping to PQ is absolute
+            // (80 / 10000 per channel) and deliberately independent of the SDR reference
+            // luminance: scRGB is display-referred for a BT.2100/PQ-mode screen and must
+            // never be tone mapped, only clamped to the output volume (which
+            // niri_pq_inv_eotf does).
+            rgb = to_bt2020 * rgb;
+            rgb = niri_pq_inv_eotf(rgb * 0.008);
+        } else {
+            // Windows scRGB on an SDR output: rendering the raw linear values would blow
+            // out (any channel above 1.0 clamps to full-scale in the framebuffer, turning
+            // bright colors into white). Anchor the assumed 203 cd/m² reference white
+            // (203 / 80 = 2.5375 in scRGB units) to display white, clamp the HDR headroom
+            // away, and gamma-encode; primaries stay sRGB.
+            rgb = pow(clamp(rgb / 2.5375, 0.0, 1.0), vec3(1.0 / 2.2));
+        }
         return vec4(rgb * a, a);
     }
 

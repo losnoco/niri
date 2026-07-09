@@ -39,6 +39,10 @@ pub enum ContentColor {
     /// Windows scRGB content (linear BT.709, 1.0 = 80 cd/m²); encoded into the blend space
     /// with the fixed absolute scRGB mapping. Immune to tone mapping by definition: only
     /// clamped to the output volume, never rescaled by the SDR reference luminance.
+    ///
+    /// Unlike other content this is also transformed on SDR outputs (reference white anchored
+    /// to display white, HDR headroom clamped away): the raw linear values would otherwise
+    /// blow bright colors out to white in the framebuffer.
     Scrgb,
 }
 
@@ -232,9 +236,11 @@ impl<R: Renderer> BlendSurfaceRenderElement<R> {
 /// Adjusts the frame's default-texture-program override for a draw of the given content,
 /// returning the previous override to restore afterwards (`None` = nothing was changed).
 ///
-/// Blend-space content suspends the override entirely (numeric passthrough); scRGB content
-/// re-installs it with the `niri_scrgb` flag raised. On SDR frames there is no override and
-/// nothing happens (like PQ content, scRGB then renders raw).
+/// Blend-space content suspends the override entirely (numeric passthrough). scRGB content
+/// installs the blend texture program with the `niri_scrgb` flag raised — on HDR *and* SDR
+/// frames: raw linear scRGB values are meaningless on an SDR framebuffer (channels above 1.0
+/// clamp to full scale, blowing bright colors out to white), so SDR frames get the
+/// reference-white-anchored SDR encode from the shader instead of a passthrough.
 fn adjust_tex_program_for_content(
     frame: &mut GlesFrame,
     content: ContentColor,
@@ -251,16 +257,24 @@ fn adjust_tex_program_for_content(
             saved.is_some().then_some(saved)
         }
         ContentColor::Scrgb => {
+            let program = Shaders::get_from_frame(frame).texture_hdr.clone();
             let saved = frame.take_tex_program_override();
-            if let Some((program, uniforms)) = &saved {
-                let mut uniforms = uniforms.clone();
-                // Later uniforms win; this overrides the frame-wide niri_scrgb = 0.
-                uniforms.push(Uniform::new("niri_scrgb", 1.0f32));
-                frame.set_tex_program_override(Some((program.clone(), uniforms)));
-                Some(saved)
-            } else {
-                None
-            }
+            // Prefer the frame override's program; on SDR frames (no override) fall back to
+            // the blend shader directly.
+            let Some(program) = saved.as_ref().map(|(p, _)| p.clone()).or(program) else {
+                // Shader failed to compile at startup (already warned); render raw.
+                return None;
+            };
+            let (hdr_pq, scale) = FrameBlendState::values_from_frame(frame);
+            frame.set_tex_program_override(Some((
+                program,
+                vec![
+                    Uniform::new("niri_hdr_pq", if hdr_pq { 1.0f32 } else { 0.0 }),
+                    Uniform::new("niri_ref_lum_scale", scale),
+                    Uniform::new("niri_scrgb", 1.0f32),
+                ],
+            )));
+            Some(saved)
         }
     }
 }
