@@ -286,6 +286,67 @@ fn windows_scrgb_engages_hdr() {
 }
 
 #[test]
+fn windows_bt2100_engages_hdr() {
+    // winewayland maps VK_COLOR_SPACE_HDR10_ST2084_EXT swapchains through the v3
+    // create_windows_bt2100 request; the description must become ready, attach, and engage
+    // HDR like other PQ content.
+    let mut f = fixture_with_hdr_mode_on();
+
+    let id = f.add_client();
+    let surface = fullscreen_window(&mut f, id);
+
+    let ready_before = f.client(id).state.ready_identities.len();
+    f.client(id).create_and_attach_bt2100_description(&surface);
+    f.roundtrip(id);
+    f.client(id).window(&surface).surface.commit();
+    f.double_roundtrip(id);
+
+    let ready = &f.client(id).state.ready_identities;
+    assert!(
+        ready.len() > ready_before,
+        "the BT.2100 image description must deliver ready, got {ready:?}"
+    );
+
+    let output = f.niri_output(1);
+    let desc = f.niri().output_hdr_image_description(&output);
+    assert!(
+        desc.is_some_and(|d| d.windows_bt2100),
+        "a fullscreen BT.2100 description must engage HDR with the flag intact, got {desc:?}"
+    );
+}
+
+#[test]
+fn output_description_luminances_satisfy_wine_hdr_check() {
+    // winewayland only reports an HDR display to Windows when the output image description's
+    // max target luminance exceeds its reference white — both read from the info events. Probe
+    // the output like the wine driver does and evaluate its exact condition.
+    let mut f = fixture_with_hdr_mode_on();
+
+    let id = f.add_client();
+    f.double_roundtrip(id);
+
+    f.client(id).probe_output_color_management();
+    f.double_roundtrip(id);
+
+    let client = f.client(id);
+    let (_, _, reference_lum) = client
+        .state
+        .info_luminances
+        .expect("the luminances info event must be sent");
+    let (_, max_target_lum) = client
+        .state
+        .info_target_luminance
+        .expect("the target_luminance info event must be sent");
+    // Reference white 203 cd/m² (default), max target = the injected EDID max of 800 cd/m².
+    assert_eq!(reference_lum, 203);
+    assert_eq!(max_target_lum, 800);
+    assert!(
+        max_target_lum > reference_lum,
+        "wine's HDR display detection requires max target luminance > reference white"
+    );
+}
+
+#[test]
 fn extended_target_volume_roundtrip() {
     use smithay::wayland::color::management::{Chromaticities, Primaries as ServerPrimaries};
 

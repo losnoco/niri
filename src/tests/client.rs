@@ -80,6 +80,10 @@ pub struct State {
     /// Named transfer function / primaries from the latest image description info exchange.
     pub info_tf: Option<TransferFunction>,
     pub info_primaries: Option<Primaries>,
+    /// Last received luminances info event as (min ×10000, max, reference white).
+    pub info_luminances: Option<(u32, u32, u32)>,
+    /// Last received target_luminance info event as (min ×10000, max).
+    pub info_target_luminance: Option<(u32, u32)>,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
@@ -214,6 +218,8 @@ impl Client {
             ready_identities: Vec::new(),
             info_tf: None,
             info_primaries: None,
+            info_luminances: None,
+            info_target_luminance: None,
             windows: Vec::new(),
             layers: Vec::new(),
         };
@@ -391,6 +397,18 @@ impl Client {
         let manager = self.state.color_manager.clone().expect("manager not bound");
 
         let image = manager.create_windows_scrgb(&self.qh, ());
+        let cm_surface = manager.get_surface(surface, &self.qh, ());
+        cm_surface.set_image_description(&image, RenderIntent::Perceptual);
+        self.connection.flush().unwrap();
+    }
+
+    /// Drives the requests winewayland sends for HDR10 (VK_COLOR_SPACE_HDR10_ST2084_EXT)
+    /// swapchains: create the pre-defined Windows-BT.2100 image description (v3) and attach it
+    /// to a surface.
+    pub fn create_and_attach_bt2100_description(&mut self, surface: &WlSurface) {
+        let manager = self.state.color_manager.clone().expect("manager not bound");
+
+        let image = manager.create_windows_bt2100(&self.qh, ());
         let cm_surface = manager.get_surface(surface, &self.qh, ());
         cm_surface.set_image_description(&image, RenderIntent::Perceptual);
         self.connection.flush().unwrap();
@@ -1025,8 +1043,20 @@ impl Dispatch<WpImageDescriptionV1, ()> for State {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        if let wp_image_description_v1::Event::Ready { identity } = event {
-            state.ready_identities.push(identity);
+        match event {
+            // v1 event; sent to clients binding wp_color_manager_v1 version 1.
+            wp_image_description_v1::Event::Ready { identity } => {
+                state.ready_identities.push(identity);
+            }
+            // v2+ replacement with a 64-bit identity.
+            wp_image_description_v1::Event::Ready2 {
+                identity_hi,
+                identity_lo,
+            } => {
+                assert_eq!(identity_hi, 0, "niri's identities fit in 32 bits");
+                state.ready_identities.push(identity_lo);
+            }
+            _ => {}
         }
     }
 }
@@ -1040,9 +1070,18 @@ impl Dispatch<WpColorManagementSurfaceFeedbackV1, ()> for State {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        if let wp_color_management_surface_feedback_v1::Event::PreferredChanged { identity } = event
-        {
-            state.preferred_changed.push(identity);
+        match event {
+            wp_color_management_surface_feedback_v1::Event::PreferredChanged { identity } => {
+                state.preferred_changed.push(identity);
+            }
+            wp_color_management_surface_feedback_v1::Event::PreferredChanged2 {
+                identity_hi,
+                identity_lo,
+            } => {
+                assert_eq!(identity_hi, 0, "niri's identities fit in 32 bits");
+                state.preferred_changed.push(identity_lo);
+            }
+            _ => {}
         }
     }
 }
@@ -1062,6 +1101,16 @@ impl Dispatch<WpImageDescriptionInfoV1, ()> for State {
             }
             wp_image_description_info_v1::Event::PrimariesNamed { primaries } => {
                 state.info_primaries = primaries.into_result().ok();
+            }
+            wp_image_description_info_v1::Event::Luminances {
+                min_lum,
+                max_lum,
+                reference_lum,
+            } => {
+                state.info_luminances = Some((min_lum, max_lum, reference_lum));
+            }
+            wp_image_description_info_v1::Event::TargetLuminance { min_lum, max_lum } => {
+                state.info_target_luminance = Some((min_lum, max_lum));
             }
             _ => {}
         }
