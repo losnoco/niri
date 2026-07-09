@@ -2692,9 +2692,15 @@ impl Niri {
         let advertise_color_management = config.borrow().outputs.0.iter().any(|o| o.hdr.is_some());
         let color_management_state = ColorManagementState::new::<State, _>(
             &display_handle,
+            // ext_linear is what Mesa's Vulkan WSI needs (in combination with sRGB primaries
+            // and extended_target_volume) to advertise scRGB
+            // (VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) swapchains, which in turn is what
+            // Windows games running under Proton probe for scRGB HDR support; see
+            // `render_helpers::blend` for how the linear content is composited.
             [
                 CmTransferFunction::Srgb,
                 CmTransferFunction::Gamma22,
+                CmTransferFunction::ExtLinear,
                 CmTransferFunction::St2084Pq,
             ],
             [CmPrimaries::Srgb, CmPrimaries::Bt2020],

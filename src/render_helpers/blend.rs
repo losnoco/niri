@@ -17,7 +17,9 @@ use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions}
 use smithay::backend::renderer::{Color32F, ImportAll, Renderer};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
-use smithay::wayland::color::management::ImageDescription;
+use smithay::wayland::color::management::{
+    ImageDescription, Primaries as CmPrimaries, TransferFunction as CmTransferFunction,
+};
 
 use super::renderer::AsGlesFrame as _;
 use super::shaders::Shaders;
@@ -36,23 +38,43 @@ pub enum ContentColor {
     /// Content already encoded in the output blend space (carries an HDR image description);
     /// passes through numerically.
     BlendSpace,
-    /// Windows scRGB content (linear BT.709, 1.0 = 80 cd/m²); encoded into the blend space
-    /// with the fixed absolute scRGB mapping. Immune to tone mapping by definition: only
+    /// Extended-linear content: Windows scRGB or a parametric `ext_linear` image description
+    /// (what Mesa's Vulkan WSI attaches for `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`
+    /// swapchains). Linear light where encoded 1.0 = `max_lum` cd/m²; encoded into the blend
+    /// space with the fixed absolute mapping. Immune to tone mapping by definition: only
     /// clamped to the output volume, never rescaled by the SDR reference luminance.
     ///
     /// Unlike other content this is also transformed on SDR outputs (reference white anchored
     /// to display white, HDR headroom clamped away): the raw linear values would otherwise
     /// blow bright colors out to white in the framebuffer.
-    Scrgb,
+    Linear {
+        /// The container primaries are BT.2020 rather than BT.709/sRGB.
+        bt2020: bool,
+        /// Luminance of encoded 1.0 in cd/m² (80 for scRGB and default ext_linear).
+        max_lum: u32,
+        /// Reference white luminance in cd/m² (203 for scRGB, 80 for default ext_linear).
+        ref_lum: u32,
+    },
 }
 
 impl ContentColor {
     /// The content color of a surface with the given committed image description.
     pub fn from_description(desc: Option<ImageDescription>) -> Self {
-        match desc {
-            Some(desc) if desc.windows_scrgb => ContentColor::Scrgb,
-            Some(desc) if desc.is_hdr() => ContentColor::BlendSpace,
-            _ => ContentColor::Sdr,
+        let Some(desc) = desc else {
+            return ContentColor::Sdr;
+        };
+        if desc.windows_scrgb || desc.transfer == CmTransferFunction::ExtLinear {
+            let (_, max_lum, ref_lum) = desc.luminances_or_default();
+            return ContentColor::Linear {
+                bt2020: desc.primaries.named == Some(CmPrimaries::Bt2020),
+                max_lum: max_lum.max(1),
+                ref_lum: ref_lum.max(1),
+            };
+        }
+        if desc.is_hdr() {
+            ContentColor::BlendSpace
+        } else {
+            ContentColor::Sdr
         }
     }
 }
@@ -105,27 +127,34 @@ impl FrameBlendState {
     }
 
     /// The `niri_blend` uniform values for a draw of SDR content in this frame.
-    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; 3] {
+    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; 5] {
         Self::uniforms_for_content(frame, ContentColor::Sdr)
     }
 
     /// The `niri_blend` uniform values for a draw in this frame; [`ContentColor::BlendSpace`]
-    /// exempts content already encoded in the blend space, [`ContentColor::Scrgb`] selects the
-    /// absolute scRGB encode.
-    pub fn uniforms_for_content(frame: &GlesFrame, content: ContentColor) -> [Uniform<'static>; 3] {
+    /// exempts content already encoded in the blend space, [`ContentColor::Linear`] selects
+    /// the absolute extended-linear encode.
+    pub fn uniforms_for_content(frame: &GlesFrame, content: ContentColor) -> [Uniform<'static>; 5] {
         let (hdr_pq, scale) = Self::values_from_frame(frame);
         let apply = hdr_pq && content != ContentColor::BlendSpace;
+        let (linear, linear_scale, linear_to_ref) = match content {
+            ContentColor::Linear {
+                bt2020,
+                max_lum,
+                ref_lum,
+            } => (
+                if bt2020 { 2.0f32 } else { 1.0 },
+                max_lum as f32 / 10000.,
+                max_lum as f32 / ref_lum as f32,
+            ),
+            _ => (0.0, 0.0, 0.0),
+        };
         [
             Uniform::new("niri_hdr_pq", if apply { 1.0f32 } else { 0.0 }),
             Uniform::new("niri_ref_lum_scale", scale),
-            Uniform::new(
-                "niri_scrgb",
-                if content == ContentColor::Scrgb {
-                    1.0f32
-                } else {
-                    0.0
-                },
-            ),
+            Uniform::new("niri_linear", linear),
+            Uniform::new("niri_linear_scale", linear_scale),
+            Uniform::new("niri_linear_to_ref", linear_to_ref),
         ]
     }
 }
@@ -150,9 +179,12 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, reference_luminance: Option<
                     vec![
                         Uniform::new("niri_hdr_pq", 1.0f32),
                         Uniform::new("niri_ref_lum_scale", scale),
-                        // Uniform values persist in the program object; reset the scRGB flag
-                        // that BlendSurfaceRenderElement sets for scRGB draws.
-                        Uniform::new("niri_scrgb", 0.0f32),
+                        // Uniform values persist in the program object; reset the
+                        // extended-linear state that BlendSurfaceRenderElement sets for
+                        // linear-content draws.
+                        Uniform::new("niri_linear", 0.0f32),
+                        Uniform::new("niri_linear_scale", 0.0f32),
+                        Uniform::new("niri_linear_to_ref", 0.0f32),
                     ],
                 )));
             } else {
@@ -236,10 +268,10 @@ impl<R: Renderer> BlendSurfaceRenderElement<R> {
 /// Adjusts the frame's default-texture-program override for a draw of the given content,
 /// returning the previous override to restore afterwards (`None` = nothing was changed).
 ///
-/// Blend-space content suspends the override entirely (numeric passthrough). scRGB content
-/// installs the blend texture program with the `niri_scrgb` flag raised — on HDR *and* SDR
-/// frames: raw linear scRGB values are meaningless on an SDR framebuffer (channels above 1.0
-/// clamp to full scale, blowing bright colors out to white), so SDR frames get the
+/// Blend-space content suspends the override entirely (numeric passthrough). Extended-linear
+/// content installs the blend texture program with the `niri_linear` state set — on HDR *and*
+/// SDR frames: raw extended-linear values are meaningless on an SDR framebuffer (channels
+/// above 1.0 clamp to full scale, blowing bright colors out to white), so SDR frames get the
 /// reference-white-anchored SDR encode from the shader instead of a passthrough.
 fn adjust_tex_program_for_content(
     frame: &mut GlesFrame,
@@ -256,7 +288,7 @@ fn adjust_tex_program_for_content(
             let saved = frame.take_tex_program_override();
             saved.is_some().then_some(saved)
         }
-        ContentColor::Scrgb => {
+        ContentColor::Linear { .. } => {
             let program = Shaders::get_from_frame(frame).texture_hdr.clone();
             let saved = frame.take_tex_program_override();
             // Prefer the frame override's program; on SDR frames (no override) fall back to
@@ -265,15 +297,8 @@ fn adjust_tex_program_for_content(
                 // Shader failed to compile at startup (already warned); render raw.
                 return None;
             };
-            let (hdr_pq, scale) = FrameBlendState::values_from_frame(frame);
-            frame.set_tex_program_override(Some((
-                program,
-                vec![
-                    Uniform::new("niri_hdr_pq", if hdr_pq { 1.0f32 } else { 0.0 }),
-                    Uniform::new("niri_ref_lum_scale", scale),
-                    Uniform::new("niri_scrgb", 1.0f32),
-                ],
-            )));
+            let uniforms = FrameBlendState::uniforms_for_content(frame, content).to_vec();
+            frame.set_tex_program_override(Some((program, uniforms)));
             Some(saved)
         }
     }
@@ -355,8 +380,9 @@ impl RenderElement<GlesRenderer> for BlendSurfaceRenderElement<GlesRenderer> {
     }
 
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        // scRGB buffers need the GL encode; their raw linear values must not be scanned out.
-        if self.content == ContentColor::Scrgb {
+        // Extended-linear buffers need the GL encode; their raw values must not be scanned
+        // out.
+        if matches!(self.content, ContentColor::Linear { .. }) {
             return None;
         }
         self.inner.underlying_storage(renderer)
@@ -388,8 +414,9 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         &self,
         renderer: &mut TtyRenderer<'render>,
     ) -> Option<UnderlyingStorage<'_>> {
-        // scRGB buffers need the GL encode; their raw linear values must not be scanned out.
-        if self.content == ContentColor::Scrgb {
+        // Extended-linear buffers need the GL encode; their raw values must not be scanned
+        // out.
+        if matches!(self.content, ContentColor::Linear { .. }) {
             return None;
         }
         self.inner.underlying_storage(renderer)
@@ -399,6 +426,74 @@ impl<'render> RenderElement<TtyRenderer<'render>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_color_classification() {
+        use smithay::wayland::color::management::PrimariesOption;
+
+        assert_eq!(ContentColor::from_description(None), ContentColor::Sdr);
+        assert_eq!(
+            ContentColor::from_description(Some(ImageDescription::SRGB)),
+            ContentColor::Sdr
+        );
+
+        // Windows scRGB: 1.0 = 80 cd/m² with a 203 cd/m² reference white.
+        assert_eq!(
+            ContentColor::from_description(Some(ImageDescription::WINDOWS_SCRGB)),
+            ContentColor::Linear {
+                bt2020: false,
+                max_lum: 80,
+                ref_lum: 203,
+            }
+        );
+
+        // A parametric ext_linear + sRGB description (Mesa's WSI mapping for
+        // VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) with default luminances.
+        let mesa_scrgb = ImageDescription {
+            transfer: CmTransferFunction::ExtLinear,
+            ..ImageDescription::SRGB
+        };
+        assert_eq!(
+            ContentColor::from_description(Some(mesa_scrgb)),
+            ContentColor::Linear {
+                bt2020: false,
+                max_lum: 80,
+                ref_lum: 80,
+            }
+        );
+
+        // BT.2020 linear content skips the 709 -> 2020 conversion.
+        let bt2020_linear = ImageDescription {
+            transfer: CmTransferFunction::ExtLinear,
+            primaries: PrimariesOption {
+                named: Some(CmPrimaries::Bt2020),
+                values: None,
+            },
+            ..ImageDescription::SRGB
+        };
+        assert!(matches!(
+            ContentColor::from_description(Some(bt2020_linear)),
+            ContentColor::Linear { bt2020: true, .. }
+        ));
+
+        // PQ content passes through the blend space numerically.
+        let pq = ImageDescription {
+            transfer: CmTransferFunction::St2084Pq,
+            primaries: PrimariesOption {
+                named: Some(CmPrimaries::Bt2020),
+                values: None,
+            },
+            ..ImageDescription::SRGB
+        };
+        assert_eq!(
+            ContentColor::from_description(Some(pq)),
+            ContentColor::BlendSpace
+        );
+        assert_eq!(
+            ContentColor::from_description(Some(ImageDescription::WINDOWS_BT2100)),
+            ContentColor::BlendSpace
+        );
+    }
 
     #[test]
     fn srgb_to_pq_reference_values() {

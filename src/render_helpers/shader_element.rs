@@ -173,7 +173,9 @@ impl ShaderProgram {
         let mut additional_uniforms = additional_uniforms.to_vec();
         additional_uniforms.push(UniformName::new("niri_hdr_pq", UniformType::_1f));
         additional_uniforms.push(UniformName::new("niri_ref_lum_scale", UniformType::_1f));
-        additional_uniforms.push(UniformName::new("niri_scrgb", UniformType::_1f));
+        additional_uniforms.push(UniformName::new("niri_linear", UniformType::_1f));
+        additional_uniforms.push(UniformName::new("niri_linear_scale", UniformType::_1f));
+        additional_uniforms.push(UniformName::new("niri_linear_to_ref", UniformType::_1f));
 
         renderer.with_context(move |gl| unsafe {
             compile_program(gl, &src, &additional_uniforms, texture_uniforms)
