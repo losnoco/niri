@@ -35,9 +35,9 @@ pub enum ContentColor {
     /// Electrical sRGB content; encoded into the blend space on HDR outputs.
     #[default]
     Sdr,
-    /// Content already encoded in the output blend space (carries an HDR image description);
-    /// passes through numerically.
-    BlendSpace,
+    /// Client content already encoded as HDR PQ in the output blend space.
+    /// Passes through numerically on HDR frames, and is converted back to SDR for capture.
+    HdrPq,
     /// Extended-linear content: Windows scRGB or a parametric `ext_linear` image description
     /// (what Mesa's Vulkan WSI attaches for `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`
     /// swapchains). Linear light where encoded 1.0 = `max_lum` cd/m²; encoded into the blend
@@ -72,7 +72,7 @@ impl ContentColor {
             };
         }
         if desc.is_hdr() {
-            ContentColor::BlendSpace
+            ContentColor::HdrPq
         } else {
             ContentColor::Sdr
         }
@@ -117,6 +117,14 @@ impl FrameBlendState {
         }
     }
 
+    pub fn set_sdr_capture(renderer: &mut GlesRenderer, reference_luminance: f64) {
+        let state = Self::get(renderer);
+        state.hdr_pq.set(false);
+        state
+            .ref_lum_scale
+            .set((reference_luminance / 10000.) as f32);
+    }
+
     fn values_from_frame(frame: &GlesFrame) -> (bool, f32) {
         let state: &Self = frame
             .egl_context()
@@ -126,17 +134,40 @@ impl FrameBlendState {
         (state.hdr_pq.get(), state.ref_lum_scale.get())
     }
 
+    pub fn is_hdr_frame(frame: &GlesFrame) -> bool {
+        Self::values_from_frame(frame).0
+    }
+
+    pub fn ref_lum_scale(frame: &GlesFrame) -> f32 {
+        Self::values_from_frame(frame).1
+    }
+
+    /// The `niri_blend` uniform values for content already rendered in the frame blend space.
+    pub fn uniforms_for_blend_space(frame: &GlesFrame) -> [Uniform<'static>; 6] {
+        let (_, scale) = Self::values_from_frame(frame);
+        [
+            Uniform::new("niri_hdr_pq", 0.0f32),
+            Uniform::new("niri_ref_lum_scale", scale),
+            Uniform::new("niri_linear", 0.0f32),
+            Uniform::new("niri_linear_scale", 0.0f32),
+            Uniform::new("niri_linear_to_ref", 0.0f32),
+            Uniform::new("niri_hdr_to_sdr", 0.0f32),
+        ]
+    }
+
     /// The `niri_blend` uniform values for a draw of SDR content in this frame.
-    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; 5] {
+    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; 6] {
         Self::uniforms_for_content(frame, ContentColor::Sdr)
     }
 
-    /// The `niri_blend` uniform values for a draw in this frame; [`ContentColor::BlendSpace`]
-    /// exempts content already encoded in the blend space, [`ContentColor::Linear`] selects
-    /// the absolute extended-linear encode.
-    pub fn uniforms_for_content(frame: &GlesFrame, content: ContentColor) -> [Uniform<'static>; 5] {
+    /// The `niri_blend` uniform values for a draw in this frame; [`ContentColor::HdrPq`]
+    /// exempts client content already encoded in HDR PQ from SDR-to-HDR conversion,
+    /// [`ContentColor::Linear`] selects the absolute extended-linear encode. HDR PQ content is
+    /// converted back to SDR when drawn into SDR capture buffers.
+    pub fn uniforms_for_content(frame: &GlesFrame, content: ContentColor) -> [Uniform<'static>; 6] {
         let (hdr_pq, scale) = Self::values_from_frame(frame);
-        let apply = hdr_pq && content != ContentColor::BlendSpace;
+        let sdr_to_hdr = hdr_pq && content != ContentColor::HdrPq;
+        let hdr_to_sdr = !hdr_pq && content == ContentColor::HdrPq;
         let (linear, linear_scale, linear_to_ref) = match content {
             ContentColor::Linear {
                 bt2020,
@@ -150,11 +181,12 @@ impl FrameBlendState {
             _ => (0.0, 0.0, 0.0),
         };
         [
-            Uniform::new("niri_hdr_pq", if apply { 1.0f32 } else { 0.0 }),
+            Uniform::new("niri_hdr_pq", if sdr_to_hdr { 1.0f32 } else { 0.0 }),
             Uniform::new("niri_ref_lum_scale", scale),
             Uniform::new("niri_linear", linear),
             Uniform::new("niri_linear_scale", linear_scale),
             Uniform::new("niri_linear_to_ref", linear_to_ref),
+            Uniform::new("niri_hdr_to_sdr", if hdr_to_sdr { 1.0f32 } else { 0.0 }),
         ]
     }
 }
@@ -185,6 +217,7 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, reference_luminance: Option<
                         Uniform::new("niri_linear", 0.0f32),
                         Uniform::new("niri_linear_scale", 0.0f32),
                         Uniform::new("niri_linear_to_ref", 0.0f32),
+                        Uniform::new("niri_hdr_to_sdr", 0.0f32),
                     ],
                 )));
             } else {
@@ -198,6 +231,14 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, reference_luminance: Option<
             renderer.set_solid_color_transform(None);
         }
     }
+}
+
+/// Configures the renderer for rendering into an SDR capture buffer, while preserving the
+/// reference luminance needed to convert HDR content back to SDR.
+pub fn set_sdr_capture_blend(renderer: &mut GlesRenderer, reference_luminance: f64) {
+    FrameBlendState::set_sdr_capture(renderer, reference_luminance);
+    renderer.set_default_tex_program_override(None);
+    renderer.set_solid_color_transform(None);
 }
 
 /// CPU counterpart of the shaders' `niri_blend`: encodes an electrical sRGB premultiplied
@@ -268,11 +309,12 @@ impl<R: Renderer> BlendSurfaceRenderElement<R> {
 /// Adjusts the frame's default-texture-program override for a draw of the given content,
 /// returning the previous override to restore afterwards (`None` = nothing was changed).
 ///
-/// Blend-space content suspends the override entirely (numeric passthrough). Extended-linear
-/// content installs the blend texture program with the `niri_linear` state set — on HDR *and*
-/// SDR frames: raw extended-linear values are meaningless on an SDR framebuffer (channels
-/// above 1.0 clamp to full scale, blowing bright colors out to white), so SDR frames get the
-/// reference-white-anchored SDR encode from the shader instead of a passthrough.
+/// HDR PQ client content suspends the override on HDR frames (numeric passthrough) and installs
+/// the HDR-to-SDR texture program on SDR capture frames. Extended-linear content installs the
+/// blend texture program with the `niri_linear` state set — on HDR *and* SDR frames: raw
+/// extended-linear values are meaningless on an SDR framebuffer (channels above 1.0 clamp to full
+/// scale, blowing bright colors out to white), so SDR frames get the reference-white-anchored SDR
+/// encode from the shader instead of a passthrough.
 fn adjust_tex_program_for_content(
     frame: &mut GlesFrame,
     content: ContentColor,
@@ -284,9 +326,22 @@ fn adjust_tex_program_for_content(
 > {
     match content {
         ContentColor::Sdr => None,
-        ContentColor::BlendSpace => {
+        ContentColor::HdrPq => {
             let saved = frame.take_tex_program_override();
-            saved.is_some().then_some(saved)
+            if FrameBlendState::is_hdr_frame(frame) {
+                saved.is_some().then_some(saved)
+            } else if let Some(program) = Shaders::get_from_frame(frame).texture_hdr_to_sdr.clone()
+            {
+                let ref_lum_scale = FrameBlendState::ref_lum_scale(frame);
+                frame.override_default_tex_program(
+                    program,
+                    vec![Uniform::new("niri_ref_lum_scale", ref_lum_scale)],
+                );
+                Some(saved)
+            } else {
+                warn!("HDR-to-SDR texture shader missing; HDR capture will render raw");
+                Some(saved)
+            }
         }
         ContentColor::Linear { .. } => {
             let program = Shaders::get_from_frame(frame).texture_hdr.clone();
@@ -487,11 +542,11 @@ mod tests {
         };
         assert_eq!(
             ContentColor::from_description(Some(pq)),
-            ContentColor::BlendSpace
+            ContentColor::HdrPq
         );
         assert_eq!(
             ContentColor::from_description(Some(ImageDescription::WINDOWS_BT2100)),
-            ContentColor::BlendSpace
+            ContentColor::HdrPq
         );
     }
 

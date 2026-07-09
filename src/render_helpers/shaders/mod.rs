@@ -12,6 +12,7 @@ use crate::render_helpers::blur::BlurProgram;
 
 pub struct Shaders {
     pub texture_hdr: Option<GlesTexProgram>,
+    pub texture_hdr_to_sdr: Option<GlesTexProgram>,
     pub border: Option<ShaderProgram>,
     pub shadow: Option<ShaderProgram>,
     pub clipped_surface: Option<GlesTexProgram>,
@@ -46,10 +47,21 @@ impl Shaders {
                     UniformName::new("niri_linear", UniformType::_1f),
                     UniformName::new("niri_linear_scale", UniformType::_1f),
                     UniformName::new("niri_linear_to_ref", UniformType::_1f),
+                    UniformName::new("niri_hdr_to_sdr", UniformType::_1f),
                 ],
             )
             .map_err(|err| {
                 warn!("error compiling HDR texture shader: {err:?}");
+            })
+            .ok();
+
+        let texture_hdr_to_sdr = renderer
+            .compile_custom_texture_shader(
+                include_str!("texture_hdr_to_sdr.frag"),
+                &[UniformName::new("niri_ref_lum_scale", UniformType::_1f)],
+            )
+            .map_err(|err| {
+                warn!("error compiling HDR-to-SDR texture shader: {err:?}");
             })
             .ok();
 
@@ -120,6 +132,7 @@ impl Shaders {
                     UniformName::new("niri_linear", UniformType::_1f),
                     UniformName::new("niri_linear_scale", UniformType::_1f),
                     UniformName::new("niri_linear_to_ref", UniformType::_1f),
+                    UniformName::new("niri_hdr_to_sdr", UniformType::_1f),
                 ],
             )
             .map_err(|err| {
@@ -148,6 +161,7 @@ impl Shaders {
                     UniformName::new("niri_linear", UniformType::_1f),
                     UniformName::new("niri_linear_scale", UniformType::_1f),
                     UniformName::new("niri_linear_to_ref", UniformType::_1f),
+                    UniformName::new("niri_hdr_to_sdr", UniformType::_1f),
                 ],
             )
             .map_err(|err| {
@@ -171,6 +185,7 @@ impl Shaders {
                     UniformName::new("niri_linear", UniformType::_1f),
                     UniformName::new("niri_linear_scale", UniformType::_1f),
                     UniformName::new("niri_linear_to_ref", UniformType::_1f),
+                    UniformName::new("niri_hdr_to_sdr", UniformType::_1f),
                 ],
             )
             .map_err(|err| {
@@ -186,6 +201,7 @@ impl Shaders {
 
         Self {
             texture_hdr,
+            texture_hdr_to_sdr,
             border,
             shadow,
             clipped_surface,

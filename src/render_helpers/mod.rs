@@ -23,6 +23,7 @@ use solid_color::{SolidColorBuffer, SolidColorRenderElement};
 
 use self::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use self::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::blend::set_sdr_capture_blend;
 use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::xray::Xray;
 
@@ -305,8 +306,10 @@ pub fn render_to_dmabuf(
     mut dmabuf: Dmabuf,
     elements: &[impl RenderElement<GlesRenderer>],
     states: RenderElementStates,
+    reference_luminance: f64,
 ) -> anyhow::Result<SyncPoint> {
     let _span = tracy_client::span!();
+    set_sdr_capture_blend(renderer, reference_luminance);
     let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
     ensure!(
         dmabuf.width() == size.w as u32 && dmabuf.height() == size.h as u32,
@@ -334,8 +337,10 @@ pub fn render_to_shm(
     format: wl_shm::Format,
     elements: &[impl RenderElement<GlesRenderer>],
     states: RenderElementStates,
+    reference_luminance: f64,
 ) -> anyhow::Result<()> {
     let _span = tracy_client::span!();
+    set_sdr_capture_blend(renderer, reference_luminance);
     // The pointer and length are the client's entire pool, which may hold other
     // buffers besides this one... buffer_data is the one we want.
     shm::with_buffer_contents_mut(buffer, |pool, pool_len, buffer_data| {

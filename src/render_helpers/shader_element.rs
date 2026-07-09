@@ -176,6 +176,7 @@ impl ShaderProgram {
         additional_uniforms.push(UniformName::new("niri_linear", UniformType::_1f));
         additional_uniforms.push(UniformName::new("niri_linear_scale", UniformType::_1f));
         additional_uniforms.push(UniformName::new("niri_linear_to_ref", UniformType::_1f));
+        additional_uniforms.push(UniformName::new("niri_hdr_to_sdr", UniformType::_1f));
 
         renderer.with_context(move |gl| unsafe {
             compile_program(gl, &src, &additional_uniforms, texture_uniforms)

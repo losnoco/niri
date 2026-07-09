@@ -55,6 +55,7 @@ use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode};
 use crate::niri::{CastTarget, State};
+use crate::render_helpers::blend::set_sdr_capture_blend;
 use crate::render_helpers::{
     clear_dmabuf, encompassing_geo, render_and_download, render_and_download_with_damage,
     render_to_dmabuf,
@@ -1215,6 +1216,7 @@ impl Cast {
         cursor_data: &CursorData<CastRenderElement<GlesRenderer>>,
         size: Size<i32, Physical>,
         scale: Scale<f64>,
+        reference_luminance: f64,
     ) -> bool {
         let mut inner = self.inner.borrow_mut();
 
@@ -1311,8 +1313,15 @@ impl Cast {
             let res = match (*(*spa_buffer).datas).type_ {
                 x if x == DataType::DmaBuf.as_raw() => {
                     let dmabuf = inner_.dmabufs[&fd].clone();
-                    render_to_dmabuf(renderer, damage_tracker, dmabuf, elements, states)
-                        .map(|x| (x, SharingBuf::Dma))
+                    render_to_dmabuf(
+                        renderer,
+                        damage_tracker,
+                        dmabuf,
+                        elements,
+                        states,
+                        reference_luminance,
+                    )
+                    .map(|x| (x, SharingBuf::Dma))
                 }
                 x if x == DataType::MemFd.as_raw() => {
                     let shmbuf = &inner_.shmbufs[&fd];
@@ -1323,8 +1332,16 @@ impl Cast {
                         Fourcc::Xrgb8888
                     };
 
-                    render_to_shmbuf(renderer, damage_tracker, shmbuf, fourcc, elements, states)
-                        .map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf.layout)))
+                    render_to_shmbuf(
+                        renderer,
+                        damage_tracker,
+                        shmbuf,
+                        fourcc,
+                        elements,
+                        states,
+                        reference_luminance,
+                    )
+                    .map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf.layout)))
                 }
                 _ => Err(anyhow::anyhow!(
                     "unknown data type in dequeue_buffer_and_render"
@@ -1913,8 +1930,10 @@ fn render_to_shmbuf(
     fourcc: Fourcc,
     elements: &[impl RenderElement<GlesRenderer>],
     states: RenderElementStates,
+    reference_luminance: f64,
 ) -> anyhow::Result<()> {
     let _span = tracy_client::span!();
+    set_sdr_capture_blend(renderer, reference_luminance);
     let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
     let expected_size = size.w as usize * size.h as usize * SHM_BYTES_PER_PIXEL;
     ensure!(
