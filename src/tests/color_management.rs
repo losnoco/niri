@@ -8,7 +8,9 @@ use niri_config::{Config, Output};
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_color_manager_v1::{
     Primaries, RenderIntent, TransferFunction,
 };
+use wayland_client::protocol::wl_surface::WlSurface;
 
+use super::client::ClientId;
 use super::*;
 use crate::backend::OutputHdrCaps;
 
@@ -232,5 +234,137 @@ fn hdr_description_on_subsurface_engages() {
     assert!(
         desc.is_some_and(|d| d.is_hdr()),
         "HDR description on a subsurface must engage HDR, got {desc:?}"
+    );
+}
+
+/// Sets up a fullscreen window with a committed buffer and returns its surface, the shared
+/// preamble of the engagement tests.
+fn fullscreen_window(f: &mut Fixture, id: ClientId) -> WlSurface {
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_fullscreen(None);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    surface
+}
+
+#[test]
+fn windows_scrgb_engages_hdr() {
+    // winewayland in scRGB mode uses create_windows_scrgb rather than a parametric
+    // description; it must become ready, attach, and engage HDR like PQ content.
+    let mut f = fixture_with_hdr_mode_on();
+
+    let id = f.add_client();
+    let surface = fullscreen_window(&mut f, id);
+
+    let ready_before = f.client(id).state.ready_identities.len();
+    f.client(id).create_and_attach_scrgb_description(&surface);
+    f.roundtrip(id);
+    // The description is double-buffered surface state.
+    f.client(id).window(&surface).surface.commit();
+    f.double_roundtrip(id);
+
+    let ready = &f.client(id).state.ready_identities;
+    assert!(
+        ready.len() > ready_before,
+        "the scRGB image description must deliver ready, got {ready:?}"
+    );
+
+    let output = f.niri_output(1);
+    let desc = f.niri().output_hdr_image_description(&output);
+    assert!(
+        desc.is_some_and(|d| d.windows_scrgb),
+        "a fullscreen scRGB description must engage HDR with the flag intact, got {desc:?}"
+    );
+}
+
+#[test]
+fn extended_target_volume_roundtrip() {
+    use smithay::wayland::color::management::{Chromaticities, Primaries as ServerPrimaries};
+
+    // A target color volume (BT.2020 mastering primaries) exceeding the container primaries
+    // (sRGB) requires the advertised extended_target_volume feature; without it, smithay
+    // fails the description gracefully and set_image_description would raise a protocol
+    // error. The mastering primaries must round-trip into the engaged description, where the
+    // TTY backend forwards them as ST 2086 metadata.
+    let mut f = fixture_with_hdr_mode_on();
+
+    let id = f.add_client();
+    let surface = fullscreen_window(&mut f, id);
+
+    f.client(id)
+        .create_and_attach_hdr_description_with_target_volume(
+            &surface,
+            TransferFunction::St2084Pq,
+            Primaries::Srgb,
+            RenderIntent::Perceptual,
+        );
+    f.roundtrip(id);
+    f.client(id).window(&surface).surface.commit();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+    let desc = f
+        .niri()
+        .output_hdr_image_description(&output)
+        .expect("PQ description must engage HDR");
+    assert_eq!(
+        desc.mastering_primaries,
+        Some(Chromaticities::from_named(ServerPrimaries::Bt2020)),
+        "client mastering display primaries must be preserved"
+    );
+    assert_eq!(desc.primaries.named, Some(ServerPrimaries::Srgb));
+}
+
+#[test]
+fn custom_primaries_description() {
+    use smithay::wayland::color::management::Chromaticities;
+
+    // A set_primaries client provides raw chromaticity coordinates instead of a named set;
+    // the description must be created (the feature is advertised) and the raw values must be
+    // visible server-side, with no named primaries attached.
+    let mut f = fixture_with_hdr_mode_on();
+
+    let id = f.add_client();
+    let surface = fullscreen_window(&mut f, id);
+
+    // Display P3 coordinates, in protocol wire units (xy * 1e6).
+    let p3 = [
+        (680_000, 320_000),
+        (265_000, 690_000),
+        (150_000, 60_000),
+        (312_700, 329_000),
+    ];
+    f.client(id).create_and_attach_custom_primaries_description(
+        &surface,
+        TransferFunction::St2084Pq,
+        p3,
+        RenderIntent::Perceptual,
+    );
+    f.roundtrip(id);
+    f.client(id).window(&surface).surface.commit();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+    let desc = f
+        .niri()
+        .output_hdr_image_description(&output)
+        .expect("PQ description must engage HDR");
+    assert_eq!(desc.primaries.named, None);
+    assert_eq!(
+        desc.primaries.values,
+        Some(Chromaticities {
+            red: p3[0],
+            green: p3[1],
+            blue: p3[2],
+            white: p3[3],
+        })
     );
 }

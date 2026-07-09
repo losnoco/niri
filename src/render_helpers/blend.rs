@@ -17,6 +17,7 @@ use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions}
 use smithay::backend::renderer::{Color32F, ImportAll, Renderer};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
+use smithay::wayland::color::management::ImageDescription;
 
 use super::renderer::AsGlesFrame as _;
 use super::shaders::Shaders;
@@ -24,6 +25,33 @@ use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
 /// Default SDR reference white in cd/m² (BT.2408).
 pub const DEFAULT_REFERENCE_LUMINANCE: f64 = 203.;
+
+/// How a surface's content relates to the output blend space, derived from its committed
+/// image description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContentColor {
+    /// Electrical sRGB content; encoded into the blend space on HDR outputs.
+    #[default]
+    Sdr,
+    /// Content already encoded in the output blend space (carries an HDR image description);
+    /// passes through numerically.
+    BlendSpace,
+    /// Windows scRGB content (linear BT.709, 1.0 = 80 cd/m²); encoded into the blend space
+    /// with the fixed absolute scRGB mapping. Immune to tone mapping by definition: only
+    /// clamped to the output volume, never rescaled by the SDR reference luminance.
+    Scrgb,
+}
+
+impl ContentColor {
+    /// The content color of a surface with the given committed image description.
+    pub fn from_description(desc: Option<ImageDescription>) -> Self {
+        match desc {
+            Some(desc) if desc.windows_scrgb => ContentColor::Scrgb,
+            Some(desc) if desc.is_hdr() => ContentColor::BlendSpace,
+            _ => ContentColor::Sdr,
+        }
+    }
+}
 
 /// The blend state of the frame currently being rendered, stored in the renderer's EGL user
 /// data (like [`super::shaders::Shaders`]).
@@ -73,18 +101,27 @@ impl FrameBlendState {
     }
 
     /// The `niri_blend` uniform values for a draw of SDR content in this frame.
-    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; 2] {
-        Self::uniforms_for_content(frame, false)
+    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; 3] {
+        Self::uniforms_for_content(frame, ContentColor::Sdr)
     }
 
-    /// The `niri_blend` uniform values for a draw in this frame; `content_hdr` exempts
-    /// content already encoded in the blend space.
-    pub fn uniforms_for_content(frame: &GlesFrame, content_hdr: bool) -> [Uniform<'static>; 2] {
+    /// The `niri_blend` uniform values for a draw in this frame; [`ContentColor::BlendSpace`]
+    /// exempts content already encoded in the blend space, [`ContentColor::Scrgb`] selects the
+    /// absolute scRGB encode.
+    pub fn uniforms_for_content(frame: &GlesFrame, content: ContentColor) -> [Uniform<'static>; 3] {
         let (hdr_pq, scale) = Self::values_from_frame(frame);
-        let apply = hdr_pq && !content_hdr;
+        let apply = hdr_pq && content != ContentColor::BlendSpace;
         [
             Uniform::new("niri_hdr_pq", if apply { 1.0f32 } else { 0.0 }),
             Uniform::new("niri_ref_lum_scale", scale),
+            Uniform::new(
+                "niri_scrgb",
+                if content == ContentColor::Scrgb {
+                    1.0f32
+                } else {
+                    0.0
+                },
+            ),
         ]
     }
 }
@@ -109,6 +146,9 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, reference_luminance: Option<
                     vec![
                         Uniform::new("niri_hdr_pq", 1.0f32),
                         Uniform::new("niri_ref_lum_scale", scale),
+                        // Uniform values persist in the program object; reset the scRGB flag
+                        // that BlendSurfaceRenderElement sets for scRGB draws.
+                        Uniform::new("niri_scrgb", 0.0f32),
                     ],
                 )));
             } else {
@@ -157,21 +197,23 @@ pub fn srgb_to_pq(color: Color32F, ref_lum_scale: f32) -> Color32F {
     )
 }
 
-/// A surface-tree render element that knows whether its content is already encoded in an HDR
-/// blend space (carries an HDR image description).
+/// A surface-tree render element that knows how its content relates to the output blend space
+/// (from its committed image description).
 ///
-/// For HDR content the frame-wide blend-space texture program is suspended around the draw,
-/// so the client's PQ values pass through numerically. Underlying storage is delegated, so
-/// direct scanout keeps working.
+/// For blend-space (PQ) content the frame-wide blend-space texture program is suspended around
+/// the draw, so the client's PQ values pass through numerically, and underlying storage is
+/// delegated so direct scanout keeps working. For scRGB content the frame program is swapped
+/// for one applying the absolute scRGB encode, and direct scanout is prevented (the raw linear
+/// buffer must not reach a PQ-signalled connector).
 #[derive(Debug)]
 pub struct BlendSurfaceRenderElement<R: Renderer> {
     inner: WaylandSurfaceRenderElement<R>,
-    content_hdr: bool,
+    content: ContentColor,
 }
 
 impl<R: Renderer> BlendSurfaceRenderElement<R> {
-    pub fn new(inner: WaylandSurfaceRenderElement<R>, content_hdr: bool) -> Self {
-        Self { inner, content_hdr }
+    pub fn new(inner: WaylandSurfaceRenderElement<R>, content: ContentColor) -> Self {
+        Self { inner, content }
     }
 
     pub fn inner(&self) -> &WaylandSurfaceRenderElement<R> {
@@ -182,8 +224,44 @@ impl<R: Renderer> BlendSurfaceRenderElement<R> {
         self.inner
     }
 
-    pub fn content_hdr(&self) -> bool {
-        self.content_hdr
+    pub fn content(&self) -> ContentColor {
+        self.content
+    }
+}
+
+/// Adjusts the frame's default-texture-program override for a draw of the given content,
+/// returning the previous override to restore afterwards (`None` = nothing was changed).
+///
+/// Blend-space content suspends the override entirely (numeric passthrough); scRGB content
+/// re-installs it with the `niri_scrgb` flag raised. On SDR frames there is no override and
+/// nothing happens (like PQ content, scRGB then renders raw).
+fn adjust_tex_program_for_content(
+    frame: &mut GlesFrame,
+    content: ContentColor,
+) -> Option<
+    Option<(
+        smithay::backend::renderer::gles::GlesTexProgram,
+        Vec<Uniform<'static>>,
+    )>,
+> {
+    match content {
+        ContentColor::Sdr => None,
+        ContentColor::BlendSpace => {
+            let saved = frame.take_tex_program_override();
+            saved.is_some().then_some(saved)
+        }
+        ContentColor::Scrgb => {
+            let saved = frame.take_tex_program_override();
+            if let Some((program, uniforms)) = &saved {
+                let mut uniforms = uniforms.clone();
+                // Later uniforms win; this overrides the frame-wide niri_scrgb = 0.
+                uniforms.push(Uniform::new("niri_scrgb", 1.0f32));
+                frame.set_tex_program_override(Some((program.clone(), uniforms)));
+                Some(saved)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -246,11 +324,7 @@ impl RenderElement<GlesRenderer> for BlendSurfaceRenderElement<GlesRenderer> {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        let saved = if self.content_hdr {
-            frame.take_tex_program_override()
-        } else {
-            None
-        };
+        let saved = adjust_tex_program_for_content(frame, self.content);
         let res = RenderElement::<GlesRenderer>::draw(
             &self.inner,
             frame,
@@ -260,13 +334,17 @@ impl RenderElement<GlesRenderer> for BlendSurfaceRenderElement<GlesRenderer> {
             opaque_regions,
             cache,
         );
-        if saved.is_some() {
+        if let Some(saved) = saved {
             frame.set_tex_program_override(saved);
         }
         res
     }
 
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+        // scRGB buffers need the GL encode; their raw linear values must not be scanned out.
+        if self.content == ContentColor::Scrgb {
+            return None;
+        }
         self.inner.underlying_storage(renderer)
     }
 }
@@ -284,13 +362,9 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
         let gles_frame = frame.as_gles_frame();
-        let saved = if self.content_hdr {
-            gles_frame.take_tex_program_override()
-        } else {
-            None
-        };
+        let saved = adjust_tex_program_for_content(gles_frame, self.content);
         let res = RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache);
-        if saved.is_some() {
+        if let Some(saved) = saved {
             frame.as_gles_frame().set_tex_program_override(saved);
         }
         res
@@ -300,6 +374,10 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         &self,
         renderer: &mut TtyRenderer<'render>,
     ) -> Option<UnderlyingStorage<'_>> {
+        // scRGB buffers need the GL encode; their raw linear values must not be scanned out.
+        if self.content == ContentColor::Scrgb {
+            return None;
+        }
         self.inner.underlying_storage(renderer)
     }
 }

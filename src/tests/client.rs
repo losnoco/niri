@@ -335,6 +335,67 @@ impl Client {
         self.connection.flush().unwrap();
     }
 
+    /// Like [`create_and_attach_hdr_description`](Self::create_and_attach_hdr_description), but
+    /// additionally sets BT.2020 mastering display primaries — a target color volume that
+    /// requires the `extended_target_volume` feature whenever it exceeds the container
+    /// primaries.
+    pub fn create_and_attach_hdr_description_with_target_volume(
+        &mut self,
+        surface: &WlSurface,
+        tf: TransferFunction,
+        primaries: Primaries,
+        intent: RenderIntent,
+    ) {
+        let manager = self.state.color_manager.clone().expect("manager not bound");
+
+        let creator = manager.create_parametric_creator(&self.qh, ());
+        creator.set_tf_named(tf);
+        creator.set_primaries_named(primaries);
+        // BT.2020 primaries and D65 white point, in protocol wire units (xy * 1e6).
+        creator.set_mastering_display_primaries(
+            708_000, 292_000, 170_000, 797_000, 131_000, 46_000, 312_700, 329_000,
+        );
+        creator.set_mastering_luminance(50, 1000);
+        let image = creator.create(&self.qh, ());
+
+        let cm_surface = manager.get_surface(surface, &self.qh, ());
+        cm_surface.set_image_description(&image, intent);
+        self.connection.flush().unwrap();
+    }
+
+    /// Builds a parametric image description using raw chromaticity coordinates
+    /// (`set_primaries`) instead of a named set, and attaches it to a surface.
+    pub fn create_and_attach_custom_primaries_description(
+        &mut self,
+        surface: &WlSurface,
+        tf: TransferFunction,
+        primaries: [(i32, i32); 4],
+        intent: RenderIntent,
+    ) {
+        let manager = self.state.color_manager.clone().expect("manager not bound");
+
+        let creator = manager.create_parametric_creator(&self.qh, ());
+        creator.set_tf_named(tf);
+        let [r, g, b, w] = primaries;
+        creator.set_primaries(r.0, r.1, g.0, g.1, b.0, b.1, w.0, w.1);
+        let image = creator.create(&self.qh, ());
+
+        let cm_surface = manager.get_surface(surface, &self.qh, ());
+        cm_surface.set_image_description(&image, intent);
+        self.connection.flush().unwrap();
+    }
+
+    /// Drives the requests a Windows-scRGB client (winewayland in scRGB mode) sends: create the
+    /// pre-defined scRGB image description and attach it to a surface.
+    pub fn create_and_attach_scrgb_description(&mut self, surface: &WlSurface) {
+        let manager = self.state.color_manager.clone().expect("manager not bound");
+
+        let image = manager.create_windows_scrgb(&self.qh, ());
+        let cm_surface = manager.get_surface(surface, &self.qh, ());
+        cm_surface.set_image_description(&image, RenderIntent::Perceptual);
+        self.connection.flush().unwrap();
+    }
+
     pub fn create_layer(
         &mut self,
         output: Option<&WlOutput>,

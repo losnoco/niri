@@ -8,7 +8,7 @@ use smithay::utils::{Logical, Physical, Point, Scale};
 use smithay::wayland::color::management::ColorManagementSurfaceCachedState;
 use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
 
-use super::blend::BlendSurfaceRenderElement;
+use super::blend::{BlendSurfaceRenderElement, ContentColor};
 use super::texture::TextureBuffer;
 use super::BakedBuffer;
 
@@ -132,20 +132,20 @@ pub fn push_elements_from_surface_tree<R>(
 
                 if has_view {
                     // Content carrying an HDR image description is already encoded in the
-                    // output blend space and must not be re-encoded when composited.
-                    let content_hdr = states
-                        .cached_state
-                        .get::<ColorManagementSurfaceCachedState>()
-                        .current()
-                        .description
-                        .is_some_and(|desc| desc.is_hdr());
+                    // output blend space and must not be re-encoded when composited;
+                    // Windows-scRGB content instead needs the dedicated absolute encode.
+                    let content = ContentColor::from_description(
+                        states
+                            .cached_state
+                            .get::<ColorManagementSurfaceCachedState>()
+                            .current()
+                            .description,
+                    );
 
                     match WaylandSurfaceRenderElement::from_surface(
                         renderer, surface, states, location, alpha, kind,
                     ) {
-                        Ok(Some(surface)) => {
-                            push(BlendSurfaceRenderElement::new(surface, content_hdr))
-                        }
+                        Ok(Some(surface)) => push(BlendSurfaceRenderElement::new(surface, content)),
                         Ok(None) => {} // surface is not mapped
                         Err(err) => {
                             warn!("failed to import surface: {}", err);

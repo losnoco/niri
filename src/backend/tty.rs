@@ -25,8 +25,8 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{
-    Colorspace, ConnectorColorState, DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata,
-    DrmEventTime, DrmNode, HdrOutputMetadata, NodeType, VrrSupport,
+    Colorspace, ConnectorColorState, CtaCoordinate, DrmDevice, DrmDeviceFd, DrmEvent,
+    DrmEventMetadata, DrmEventTime, DrmNode, Eotf, HdrOutputMetadata, NodeType, VrrSupport,
 };
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
@@ -56,7 +56,8 @@ use smithay::reexports::wayland_protocols;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{DeviceFd, Transform};
 use smithay::wayland::color::management::{
-    ImageDescription, Primaries as CmPrimaries, TransferFunction as CmTransferFunction,
+    Chromaticities, ImageDescription, Primaries as CmPrimaries,
+    PrimariesOption as CmPrimariesOption, TransferFunction as CmTransferFunction,
 };
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::drm_lease::{
@@ -2231,11 +2232,16 @@ impl Tty {
                 // Without fullscreen HDR content, the metadata comes from the sink's EDID.
                 let desc = hdr_desc.unwrap_or(ImageDescription {
                     transfer: CmTransferFunction::St2084Pq,
-                    primaries: CmPrimaries::Bt2020,
+                    primaries: CmPrimariesOption {
+                        named: Some(CmPrimaries::Bt2020),
+                        values: None,
+                    },
                     max_cll: None,
                     max_fall: None,
                     mastering_luminance: None,
+                    mastering_primaries: None,
                     luminances: None,
+                    windows_scrgb: false,
                 });
                 ConnectorColorState {
                     colorspace: Colorspace::Bt2020Rgb,
@@ -3677,7 +3683,8 @@ fn get_edid_info(
 }
 
 /// Builds the HDR static metadata to signal on the connector for a client's image description:
-/// a PQ infoframe with BT.2020 mastering primaries and D65 white point.
+/// a PQ infoframe with the description's mastering display primaries (target color volume),
+/// falling back to its container primaries when the client didn't provide any.
 ///
 /// Luminance priority: what the client provided (clamped to the sink's EDID capabilities) >
 /// the sink's EDID desired-content values > conservative ~500 nit placeholders.
@@ -3707,7 +3714,25 @@ fn build_hdr_metadata(desc: &ImageDescription, edid: &EdidHdrInfo) -> HdrOutputM
         .or((edid.max_frame_avg_luminance > 0).then_some(edid.max_frame_avg_luminance))
         .unwrap_or(500);
 
-    HdrOutputMetadata::pq_bt2020(max_luminance, min_luminance, max_cll, max_fall)
+    // ST 2086 mastering primaries: the client's target color volume, which may exceed the
+    // container primaries (extended target volume). Without one, the target defaults to the
+    // container primaries per the color-management protocol.
+    let chroma = desc.mastering_primaries.unwrap_or_else(|| {
+        Chromaticities::from_option(desc.primaries)
+            .unwrap_or(Chromaticities::from_named(CmPrimaries::Srgb))
+    });
+    // Protocol wire units (xy * 1e6) -> CTA-861.3 units (xy * 50000).
+    let coord = |(x, y): (i32, i32)| CtaCoordinate::from_xy(f64::from(x) / 1e6, f64::from(y) / 1e6);
+
+    HdrOutputMetadata {
+        eotf: Eotf::SmpteSt2084,
+        display_primaries: [coord(chroma.red), coord(chroma.green), coord(chroma.blue)],
+        white_point: coord(chroma.white),
+        max_display_mastering_luminance: max_luminance,
+        min_display_mastering_luminance: min_luminance,
+        max_cll,
+        max_fall,
+    }
 }
 
 impl ConnectorProperties {
@@ -3908,11 +3933,16 @@ mod tests {
     fn hdr_metadata_luminance_priorities() {
         let pq_desc = ImageDescription {
             transfer: smithay::wayland::color::management::TransferFunction::St2084Pq,
-            primaries: smithay::wayland::color::management::Primaries::Bt2020,
+            primaries: smithay::wayland::color::management::PrimariesOption {
+                named: Some(smithay::wayland::color::management::Primaries::Bt2020),
+                values: None,
+            },
             max_cll: None,
             max_fall: None,
             mastering_luminance: None,
+            mastering_primaries: None,
             luminances: None,
+            windows_scrgb: false,
         };
         let edid = EdidHdrInfo {
             pq: true,
@@ -3961,6 +3991,49 @@ mod tests {
         assert_eq!(meta.min_display_mastering_luminance, 100);
         assert_eq!(meta.max_cll, 800);
         assert_eq!(meta.max_fall, 600);
+    }
+
+    #[test]
+    fn hdr_metadata_mastering_primaries() {
+        use smithay::backend::drm::CtaCoordinate;
+        use smithay::wayland::color::management::{Chromaticities, Primaries, PrimariesOption};
+
+        let pq_desc = ImageDescription {
+            transfer: smithay::wayland::color::management::TransferFunction::St2084Pq,
+            primaries: PrimariesOption {
+                named: Some(Primaries::Bt2020),
+                values: None,
+            },
+            max_cll: None,
+            max_fall: None,
+            mastering_luminance: None,
+            mastering_primaries: None,
+            luminances: None,
+            windows_scrgb: false,
+        };
+
+        // Without mastering primaries the infoframe carries the container primaries
+        // (BT.2020, matching the previous hardcoded behavior).
+        let meta = build_hdr_metadata(&pq_desc, &EdidHdrInfo::default());
+        assert_eq!(meta.display_primaries[0], CtaCoordinate::BT2020_RED);
+        assert_eq!(meta.display_primaries[1], CtaCoordinate::BT2020_GREEN);
+        assert_eq!(meta.display_primaries[2], CtaCoordinate::BT2020_BLUE);
+        assert_eq!(meta.white_point, CtaCoordinate::D65_WHITE);
+
+        // Client-provided mastering primaries (e.g. a DCI-P3 mastered HDR10 stream) are
+        // forwarded to the sink.
+        let p3 = Chromaticities::from_named(Primaries::DisplayP3);
+        let desc = ImageDescription {
+            mastering_primaries: Some(p3),
+            ..pq_desc
+        };
+        let meta = build_hdr_metadata(&desc, &EdidHdrInfo::default());
+        // Display P3 red is (0.680, 0.320): x = 0.680 * 50000 = 34000.
+        assert_eq!(
+            meta.display_primaries[0],
+            CtaCoordinate { x: 34000, y: 16000 }
+        );
+        assert_eq!(meta.white_point, CtaCoordinate::D65_WHITE);
     }
 
     #[test]

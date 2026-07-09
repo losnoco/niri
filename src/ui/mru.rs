@@ -383,14 +383,14 @@ impl Thumbnail {
             LayoutElementRenderElement::Wayland(elem) => {
                 if let Some(shader) = clip_shader.clone() {
                     if ClippedSurfaceRenderElement::will_clip(elem.inner(), s, geo, radius) {
-                        let content_hdr = elem.content_hdr();
+                        let content = elem.content();
                         let elem = ClippedSurfaceRenderElement::new(
                             elem.into_inner(),
                             s,
                             geo,
                             shader.clone(),
                             radius,
-                            content_hdr,
+                            content,
                         );
                         return ThumbnailRenderElement::ClippedSurface(elem);
                     }

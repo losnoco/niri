@@ -43,6 +43,7 @@ impl Shaders {
                 &[
                     UniformName::new("niri_hdr_pq", UniformType::_1f),
                     UniformName::new("niri_ref_lum_scale", UniformType::_1f),
+                    UniformName::new("niri_scrgb", UniformType::_1f),
                 ],
             )
             .map_err(|err| {
@@ -114,6 +115,7 @@ impl Shaders {
                     UniformName::new("input_to_geo", UniformType::Matrix3x3),
                     UniformName::new("niri_hdr_pq", UniformType::_1f),
                     UniformName::new("niri_ref_lum_scale", UniformType::_1f),
+                    UniformName::new("niri_scrgb", UniformType::_1f),
                 ],
             )
             .map_err(|err| {
@@ -139,6 +141,7 @@ impl Shaders {
                     UniformName::new("bg_color", UniformType::_4f),
                     UniformName::new("niri_hdr_pq", UniformType::_1f),
                     UniformName::new("niri_ref_lum_scale", UniformType::_1f),
+                    UniformName::new("niri_scrgb", UniformType::_1f),
                 ],
             )
             .map_err(|err| {
@@ -159,6 +162,7 @@ impl Shaders {
                     UniformName::new("cutoff", UniformType::_2f),
                     UniformName::new("niri_hdr_pq", UniformType::_1f),
                     UniformName::new("niri_ref_lum_scale", UniformType::_1f),
+                    UniformName::new("niri_scrgb", UniformType::_1f),
                 ],
             )
             .map_err(|err| {

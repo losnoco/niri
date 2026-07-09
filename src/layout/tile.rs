@@ -1219,14 +1219,14 @@ impl<W: LayoutElement> Tile<W> {
                                 geo,
                                 radius,
                             ) {
-                                let content_hdr = elem.content_hdr();
+                                let content = elem.content();
                                 return ClippedSurfaceRenderElement::new(
                                     elem.into_inner(),
                                     scale,
                                     geo,
                                     shader.clone(),
                                     radius,
-                                    content_hdr,
+                                    content,
                                 )
                                 .into();
                             }

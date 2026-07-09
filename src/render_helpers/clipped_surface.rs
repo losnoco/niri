@@ -10,7 +10,7 @@ use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions}
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
-use super::blend::FrameBlendState;
+use super::blend::{ContentColor, FrameBlendState};
 use super::damage::ExtraDamage;
 use super::renderer::{AsGlesFrame as _, NiriRenderer};
 use super::shaders::{mat3_uniform, Shaders};
@@ -23,8 +23,8 @@ pub struct ClippedSurfaceRenderElement<R: NiriRenderer> {
     corner_radius: CornerRadius,
     geometry: Rectangle<f64, Logical>,
     scale: f32,
-    /// Content already encoded in the output blend space (HDR image description attached).
-    content_hdr: bool,
+    /// How the content relates to the output blend space (from its image description).
+    content: ContentColor,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -40,7 +40,7 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         geometry: Rectangle<f64, Logical>,
         program: GlesTexProgram,
         corner_radius: CornerRadius,
-        content_hdr: bool,
+        content: ContentColor,
     ) -> Self {
         Self {
             inner: elem,
@@ -48,7 +48,7 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
             corner_radius,
             geometry,
             scale: scale.x as f32,
-            content_hdr,
+            content,
         }
     }
 
@@ -244,10 +244,7 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
         let mut uniforms = self.compute_uniforms();
-        uniforms.extend(FrameBlendState::uniforms_for_content(
-            frame,
-            self.content_hdr,
-        ));
+        uniforms.extend(FrameBlendState::uniforms_for_content(frame, self.content));
         let saved = frame.take_tex_program_override();
         frame.override_default_tex_program(self.program.clone(), uniforms);
         let res = RenderElement::<GlesRenderer>::draw(
@@ -286,7 +283,7 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         let mut uniforms = self.compute_uniforms();
         uniforms.extend(FrameBlendState::uniforms_for_content(
             gles_frame,
-            self.content_hdr,
+            self.content,
         ));
         let saved = gles_frame.take_tex_program_override();
         gles_frame.override_default_tex_program(self.program.clone(), uniforms);
