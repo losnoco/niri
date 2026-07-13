@@ -27,8 +27,9 @@ use smithay::backend::drm::compositor::{
 };
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{
-    Colorspace, ConnectorColorState, CtaCoordinate, DrmDevice, DrmDeviceFd, DrmEvent,
-    DrmEventMetadata, DrmEventTime, DrmNode, Eotf, HdrOutputMetadata, NodeType, VrrSupport,
+    ColorOpKind, ColorPipeline, Colorspace, ConnectorColorState, CtaCoordinate, DrmDevice,
+    DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, Eotf, HdrOutputMetadata,
+    NodeType, VrrSupport,
 };
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
@@ -1438,6 +1439,26 @@ impl Tty {
                  HDR_OUTPUT_METADATA: {supports_hdr_metadata}, EDID PQ: {})",
                 edid_hdr.pq,
             );
+        }
+
+        // Probe the color pipelines (kernel drm_colorop API, Linux 6.19+) the primary plane
+        // offers. Not used for anything yet; they will let color-mismatched fullscreen content
+        // (SDR or scRGB on a PQ output) go direct scanout with the conversion done in the
+        // display hardware.
+        match surface.plane_color_pipelines(surface.plane()) {
+            Ok(pipelines) if pipelines.is_empty() => {
+                debug!("primary plane offers no color pipelines");
+            }
+            Ok(pipelines) => {
+                for pipeline in &pipelines {
+                    debug!(
+                        id = pipeline.id,
+                        "primary plane color pipeline: {}",
+                        describe_color_pipeline(pipeline),
+                    );
+                }
+            }
+            Err(err) => warn!("error querying plane color pipelines: {err:?}"),
         }
 
         // Try to enable VRR if requested.
@@ -3771,6 +3792,33 @@ fn get_edid_info(
         .get_property_blob(blob)
         .context("error getting EDID blob value")?;
     libdisplay_info::info::Info::parse_edid(&data).context("error parsing EDID")
+}
+
+/// Formats a plane color pipeline as a compact one-line summary for logging, e.g.
+/// `1D Curve[sRGB EOTF, PQ 125 EOTF] → Multiplier → 3x4 Matrix → 3D LUT[17³]`.
+fn describe_color_pipeline(pipeline: &ColorPipeline) -> String {
+    let ops: Vec<String> = pipeline
+        .ops
+        .iter()
+        .map(|op| {
+            let mut s = match &op.kind {
+                ColorOpKind::Curve1D { supported } => {
+                    let curves: Vec<_> = supported.iter().map(|(c, _)| c.kernel_name()).collect();
+                    format!("1D Curve[{}]", curves.join(", "))
+                }
+                ColorOpKind::Lut1D { size, .. } => format!("1D LUT[{size}]"),
+                ColorOpKind::Ctm3x4 => "3x4 Matrix".to_owned(),
+                ColorOpKind::Multiplier => "Multiplier".to_owned(),
+                ColorOpKind::Lut3D { size, .. } => format!("3D LUT[{size}³]"),
+                ColorOpKind::Unknown { type_name } => format!("Unknown({type_name})"),
+            };
+            if !op.bypassable {
+                s.push_str(" (fixed)");
+            }
+            s
+        })
+        .collect();
+    ops.join(" → ")
 }
 
 /// Builds the HDR static metadata to signal on the connector for a client's image description:
