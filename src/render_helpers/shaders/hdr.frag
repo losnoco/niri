@@ -4,7 +4,8 @@
 // default to 0). niri_ref_lum_scale = reference luminance / 10000 (PQ peak).
 //
 // niri_linear selects extended-linear content handling (Windows scRGB or a parametric
-// ext_linear image description): 0 = off, 1 = BT.709/sRGB container primaries, 2 = BT.2020.
+// ext_linear image description): 0 = off, nonzero = on; the container gamut comes from
+// niri_gamut.
 // Encoded 1.0 corresponds to max_lum cd/m²; niri_linear_scale = max_lum / 10000 and
 // niri_linear_to_ref = max_lum / reference_lum. Unlike other content it is also transformed
 // on SDR outputs, since its raw linear values are meaningless there.
@@ -15,6 +16,13 @@ uniform float niri_linear;
 uniform float niri_linear_scale;
 uniform float niri_linear_to_ref;
 uniform float niri_hdr_to_sdr;
+// 1.0 = re-encode PQ content through niri_gamut (non-BT.2020 PQ containers on HDR outputs).
+uniform float niri_pq_gamut;
+// 1.0 = use niri_gamut (container primaries -> blend space, identity when equal) instead of
+// the built-in constants. Set for every content-aware draw; the frame-wide default path
+// (plain sRGB content) leaves it at 0 and uses the constants.
+uniform float niri_use_gamut;
+uniform mat3 niri_gamut;
 
 vec3 niri_pq_inv_eotf(vec3 lin) {
     const float pq_m1 = 0.1593017578125;
@@ -51,11 +59,21 @@ vec4 niri_blend(vec4 color) {
             1.660491, -0.124550, -0.018151,
            -0.587641,  1.132900, -0.100579,
            -0.072850, -0.008349,  1.118730);
-        rgb = to_bt709 * rgb;
+        rgb = niri_use_gamut > 0.5 ? niri_gamut * rgb : to_bt709 * rgb;
 
         float ref_scale = niri_ref_lum_scale > 0.0 ? niri_ref_lum_scale : 0.0203;
         rgb = clamp(rgb / ref_scale, 0.0, 1.0);
         rgb = pow(rgb, vec3(1.0 / 2.2));
+        return vec4(rgb * a, a);
+    }
+
+    // PQ content whose container primaries differ from the BT.2020 blend space: decode,
+    // convert in linear light, re-encode. The matrix is scale-invariant, so the normalized
+    // PQ linear range works as-is.
+    if (niri_pq_gamut > 0.5) {
+        float a = color.a;
+        vec3 rgb = a > 0.0 ? color.rgb / a : color.rgb;
+        rgb = niri_pq_inv_eotf(niri_gamut * niri_pq_eotf(rgb));
         return vec4(rgb * a, a);
     }
 
@@ -79,8 +97,7 @@ vec4 niri_blend(vec4 color) {
             // reference luminance: scRGB-style content is display-referred for a
             // BT.2100/PQ-mode screen and must never be tone mapped, only clamped to the
             // output volume (which niri_pq_inv_eotf does).
-            if (niri_linear < 1.5)
-                rgb = to_bt2020 * rgb;
+            rgb = niri_use_gamut > 0.5 ? niri_gamut * rgb : to_bt2020 * rgb;
             rgb = niri_pq_inv_eotf(rgb * niri_linear_scale);
         } else {
             // Extended-linear content on an SDR output: rendering the raw linear values
@@ -88,13 +105,8 @@ vec4 niri_blend(vec4 color) {
             // framebuffer, turning bright colors into white). Anchor the reference white
             // to display white, clamp the HDR headroom away, and gamma-encode.
             //
-            // BT.2020 -> BT.709 primaries, linear light, D65 (column-major).
-            const mat3 to_bt709 = mat3(
-                1.660491, -0.124550, -0.018151,
-                -0.587641, 1.132900, -0.100579,
-                -0.072850, -0.008349, 1.118730);
-            if (niri_linear > 1.5)
-                rgb = to_bt709 * rgb;
+            if (niri_use_gamut > 0.5)
+                rgb = niri_gamut * rgb;
             rgb = pow(clamp(rgb * niri_linear_to_ref, 0.0, 1.0), vec3(1.0 / 2.2));
         }
         return vec4(rgb * a, a);
@@ -104,7 +116,7 @@ vec4 niri_blend(vec4 color) {
     // (the piecewise sRGB curve would lift shadows).
     rgb = pow(max(rgb, vec3(0.0)), vec3(2.2));
 
-    rgb = to_bt2020 * rgb;
+    rgb = niri_use_gamut > 0.5 ? niri_gamut * rgb : to_bt2020 * rgb;
 
     rgb = niri_pq_inv_eotf(rgb * niri_ref_lum_scale);
     return vec4(rgb * a, a);

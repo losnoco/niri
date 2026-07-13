@@ -12,17 +12,21 @@ use std::cell::Cell;
 
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, Uniform};
+use smithay::backend::renderer::gles::{
+    GlesError, GlesFrame, GlesRenderer, Uniform, UniformName, UniformType, UniformValue,
+};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::backend::renderer::Color32F;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
 use smithay::wayland::color::management::{
-    ImageDescription, Primaries as CmPrimaries, TransferFunction as CmTransferFunction,
+    Chromaticities, ImageDescription, Primaries as CmPrimaries, PrimariesOption,
+    TransferFunction as CmTransferFunction,
 };
 
 use smithay::backend::renderer::{ImportAll, Renderer};
 
+use super::colorimetry::{self, Mat3};
 use super::renderer::AsGlesFrame as _;
 use super::shaders::Shaders;
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
@@ -30,16 +34,77 @@ use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 /// Default SDR reference white in cd/m² (BT.2408).
 pub const DEFAULT_REFERENCE_LUMINANCE: f64 = 203.;
 
+/// The container gamut of content, relative to the two spaces niri blends in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContentGamut {
+    /// sRGB / BT.709 container primaries (also the assumption for surfaces without a
+    /// description).
+    #[default]
+    Srgb,
+    /// BT.2020 container primaries, i.e. the HDR blend space's own gamut.
+    Bt2020,
+    /// Any other container primaries: a named set like Display-P3 or raw client-provided
+    /// chromaticities. Converted in linear light during composition and scanout using the
+    /// same matrix (see [`colorimetry::gamut_matrix`]).
+    Custom(Chromaticities),
+}
+
+impl ContentGamut {
+    /// The container gamut described by an image description's primaries.
+    pub fn from_primaries(primaries: &PrimariesOption) -> Self {
+        let chroma = primaries
+            .values
+            .or_else(|| primaries.named.map(Chromaticities::from_named));
+        match chroma {
+            None => ContentGamut::Srgb,
+            Some(c) if c == Chromaticities::from_named(CmPrimaries::Srgb) => ContentGamut::Srgb,
+            Some(c) if c == Chromaticities::from_named(CmPrimaries::Bt2020) => ContentGamut::Bt2020,
+            Some(c) => ContentGamut::Custom(c),
+        }
+    }
+
+    /// The linear-light matrix converting this gamut into the blend space (`true` = BT.2020,
+    /// `false` = BT.709/sRGB); `None` means no conversion is needed.
+    ///
+    /// The known pairs use the same constants as the shaders; custom chromaticities are
+    /// computed (and produce the constants to ~1e-6 for the known primaries).
+    fn matrix_to(self, bt2020: bool) -> Option<Mat3> {
+        match (self, bt2020) {
+            (ContentGamut::Srgb, false) | (ContentGamut::Bt2020, true) => None,
+            (ContentGamut::Srgb, true) => Some(BT709_TO_BT2020),
+            (ContentGamut::Bt2020, false) => Some(BT2020_TO_BT709),
+            (ContentGamut::Custom(c), _) => {
+                let target = if bt2020 {
+                    CmPrimaries::Bt2020
+                } else {
+                    CmPrimaries::Srgb
+                };
+                // Degenerate chromaticities (never sent by well-behaved clients) fall back
+                // to no conversion rather than producing garbage.
+                colorimetry::gamut_matrix(&c, &Chromaticities::from_named(target))
+                    .filter(|m| *m != colorimetry::IDENTITY)
+            }
+        }
+    }
+}
+
 /// How a surface's content relates to the output blend space, derived from its committed
 /// image description.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentColor {
-    /// Electrical sRGB content; encoded into the blend space on HDR outputs.
-    #[default]
-    Sdr,
-    /// Client content already encoded as HDR PQ in the output blend space.
-    /// Passes through numerically on HDR frames, and is converted back to SDR for capture.
-    HdrPq,
+    /// Electrical sRGB-transfer content; encoded into the blend space on HDR outputs.
+    /// Non-sRGB container gamuts are converted in linear light after the 2.2 decode.
+    Sdr {
+        /// The container primaries of the content.
+        gamut: ContentGamut,
+    },
+    /// Client content encoded as HDR PQ (or HLG, which niri passes through like PQ).
+    /// BT.2020-container content passes through numerically on HDR frames; other containers
+    /// are decoded, converted and re-encoded. Converted back to SDR for capture.
+    HdrPq {
+        /// The container primaries of the content.
+        gamut: ContentGamut,
+    },
     /// Extended-linear content: Windows scRGB or a parametric `ext_linear` image description
     /// (what Mesa's Vulkan WSI attaches for `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`
     /// swapchains). Linear light where encoded 1.0 = `max_lum` cd/m²; encoded into the blend
@@ -50,8 +115,8 @@ pub enum ContentColor {
     /// to display white, HDR headroom clamped away): the raw linear values would otherwise
     /// blow bright colors out to white in the framebuffer.
     Linear {
-        /// The container primaries are BT.2020 rather than BT.709/sRGB.
-        bt2020: bool,
+        /// The container primaries of the content.
+        gamut: ContentGamut,
         /// Luminance of encoded 1.0 in cd/m² (80 for scRGB and default ext_linear).
         max_lum: u32,
         /// Reference white luminance in cd/m² (203 for scRGB, 80 for default ext_linear).
@@ -59,26 +124,78 @@ pub enum ContentColor {
     },
 }
 
+impl Default for ContentColor {
+    fn default() -> Self {
+        ContentColor::Sdr {
+            gamut: ContentGamut::Srgb,
+        }
+    }
+}
+
 impl ContentColor {
     /// The content color of a surface with the given committed image description.
     pub fn from_description(desc: Option<ImageDescription>) -> Self {
         let Some(desc) = desc else {
-            return ContentColor::Sdr;
+            return Self::default();
         };
+        let gamut = ContentGamut::from_primaries(&desc.primaries);
         if desc.windows_scrgb || desc.transfer == CmTransferFunction::ExtLinear {
             let (_, max_lum, ref_lum) = desc.luminances_or_default();
             return ContentColor::Linear {
-                bt2020: desc.primaries.named == Some(CmPrimaries::Bt2020),
+                gamut,
                 max_lum: max_lum.max(1),
                 ref_lum: ref_lum.max(1),
             };
         }
-        if desc.is_hdr() {
-            ContentColor::HdrPq
-        } else {
-            ContentColor::Sdr
+        // Classify on the transfer characteristic: PQ (and HLG, which niri passes through
+        // the same way) is blend-space-encoded content, everything else is SDR. Notably an
+        // SDR transfer in a BT.2020 container is *wide-gamut SDR*, not HDR.
+        match desc.transfer {
+            CmTransferFunction::St2084Pq | CmTransferFunction::Hlg => ContentColor::HdrPq { gamut },
+            _ => ContentColor::Sdr { gamut },
         }
     }
+}
+
+/// BT.709 -> BT.2020 primaries in linear light (D65), row-major. Matches the shaders'
+/// `to_bt2020` exactly, so plane color pipelines and gamut uniforms built from it reproduce
+/// the GLES blend output ([`colorimetry::gamut_matrix`] computes the same values to ~1e-6).
+const BT709_TO_BT2020: Mat3 = [
+    0.627404, 0.329283, 0.043313, //
+    0.069097, 0.919540, 0.011362, //
+    0.016391, 0.088013, 0.895595,
+];
+
+/// BT.2020 -> BT.709 primaries in linear light (D65), matching the shaders' `to_bt709`.
+const BT2020_TO_BT709: Mat3 = [
+    1.660491, -0.587641, -0.072850, //
+    -0.124550, 1.132900, -0.008349, //
+    -0.018151, -0.100579, 1.118730,
+];
+
+/// The gamut uniforms for a draw: `niri_use_gamut` and the column-major `niri_gamut` matrix.
+///
+/// `enabled` distinguishes "multiply by the (possibly identity) uniform matrix" from "use the
+/// shader's built-in constants" (the frame-wide default path for plain sRGB content).
+fn gamut_uniforms(enabled: bool, matrix: Option<Mat3>) -> [Uniform<'static>; 2] {
+    let m = matrix.unwrap_or(colorimetry::IDENTITY);
+    let mut column_major = [0f32; 9];
+    for row in 0..3 {
+        for col in 0..3 {
+            // GLES2 requires transpose = false, so transpose on the CPU.
+            column_major[col * 3 + row] = m[row * 3 + col] as f32;
+        }
+    }
+    [
+        Uniform::new("niri_use_gamut", if enabled { 1.0f32 } else { 0.0 }),
+        Uniform::new(
+            "niri_gamut",
+            UniformValue::Matrix3x3 {
+                matrices: vec![column_major],
+                transpose: false,
+            },
+        ),
+    ]
 }
 
 /// The blend state of the frame currently being rendered, stored in the renderer's EGL user
@@ -144,52 +261,102 @@ impl FrameBlendState {
         Self::values_from_frame(frame).1
     }
 
-    /// The `niri_blend` uniform values for content already rendered in the frame blend space.
-    pub fn uniforms_for_blend_space(frame: &GlesFrame) -> [Uniform<'static>; 6] {
-        let (_, scale) = Self::values_from_frame(frame);
+    /// The compile-time declarations for every uniform the `niri_blend` stage (and the gamut
+    /// uniforms) can set per draw.
+    ///
+    /// Every shader program that receives uniforms from [`Self::uniforms`],
+    /// [`Self::uniforms_for_content`], [`Self::uniforms_for_blend_space`] or `gamut_uniforms`
+    /// must include these in its uniform list: smithay rejects per-draw uniforms that were not
+    /// declared when the program was compiled. Over-declaring is harmless (names the GLSL does
+    /// not use resolve to location -1, which GL ignores), so programs declare the full set
+    /// even when they only use a subset.
+    pub fn uniform_names() -> [UniformName<'static>; 9] {
         [
+            UniformName::new("niri_hdr_pq", UniformType::_1f),
+            UniformName::new("niri_ref_lum_scale", UniformType::_1f),
+            UniformName::new("niri_linear", UniformType::_1f),
+            UniformName::new("niri_linear_scale", UniformType::_1f),
+            UniformName::new("niri_linear_to_ref", UniformType::_1f),
+            UniformName::new("niri_hdr_to_sdr", UniformType::_1f),
+            UniformName::new("niri_pq_gamut", UniformType::_1f),
+            UniformName::new("niri_use_gamut", UniformType::_1f),
+            UniformName::new("niri_gamut", UniformType::Matrix3x3),
+        ]
+    }
+
+    /// The `niri_blend` uniform values for content already rendered in the frame blend space.
+    pub fn uniforms_for_blend_space(frame: &GlesFrame) -> Vec<Uniform<'static>> {
+        let (_, scale) = Self::values_from_frame(frame);
+        let mut uniforms = vec![
             Uniform::new("niri_hdr_pq", 0.0f32),
             Uniform::new("niri_ref_lum_scale", scale),
             Uniform::new("niri_linear", 0.0f32),
             Uniform::new("niri_linear_scale", 0.0f32),
             Uniform::new("niri_linear_to_ref", 0.0f32),
             Uniform::new("niri_hdr_to_sdr", 0.0f32),
-        ]
+            Uniform::new("niri_pq_gamut", 0.0f32),
+        ];
+        uniforms.extend(gamut_uniforms(false, None));
+        uniforms
     }
 
     /// The `niri_blend` uniform values for a draw of SDR content in this frame.
-    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; 6] {
-        Self::uniforms_for_content(frame, ContentColor::Sdr)
+    pub fn uniforms(frame: &GlesFrame) -> Vec<Uniform<'static>> {
+        Self::uniforms_for_content(frame, ContentColor::default())
     }
 
     /// The `niri_blend` uniform values for a draw in this frame; [`ContentColor::HdrPq`]
-    /// exempts client content already encoded in HDR PQ from SDR-to-HDR conversion,
-    /// [`ContentColor::Linear`] selects the absolute extended-linear encode. HDR PQ content is
-    /// converted back to SDR when drawn into SDR capture buffers.
-    pub fn uniforms_for_content(frame: &GlesFrame, content: ContentColor) -> [Uniform<'static>; 6] {
+    /// exempts BT.2020-container PQ content from SDR-to-HDR conversion (other containers are
+    /// re-encoded through the gamut matrix), [`ContentColor::Linear`] selects the absolute
+    /// extended-linear encode. HDR PQ content is converted back to SDR when drawn into SDR
+    /// capture buffers.
+    pub fn uniforms_for_content(frame: &GlesFrame, content: ContentColor) -> Vec<Uniform<'static>> {
         let (hdr_pq, scale) = Self::values_from_frame(frame);
-        let sdr_to_hdr = hdr_pq && content != ContentColor::HdrPq;
-        let hdr_to_sdr = !hdr_pq && content == ContentColor::HdrPq;
+
+        let is_pq = matches!(content, ContentColor::HdrPq { .. });
+        let sdr_to_hdr = hdr_pq && !is_pq;
+        let hdr_to_sdr = !hdr_pq && is_pq;
+
+        // The gamut conversion into the frame's blend space, when the draw transforms the
+        // content at all (SDR content on SDR frames passes through untouched).
+        let gamut = match content {
+            ContentColor::Sdr { .. } if !hdr_pq => None,
+            ContentColor::Sdr { gamut } => Some(gamut.matrix_to(true)),
+            ContentColor::HdrPq { gamut } => {
+                let matrix = gamut.matrix_to(hdr_pq);
+                // On HDR frames, BT.2020-container PQ passes through without any transform.
+                if hdr_pq && matrix.is_none() {
+                    None
+                } else {
+                    Some(matrix)
+                }
+            }
+            ContentColor::Linear { gamut, .. } => Some(gamut.matrix_to(hdr_pq)),
+        };
+        let pq_gamut = hdr_pq && is_pq && gamut.is_some();
+
         let (linear, linear_scale, linear_to_ref) = match content {
             ContentColor::Linear {
-                bt2020,
-                max_lum,
-                ref_lum,
+                max_lum, ref_lum, ..
             } => (
-                if bt2020 { 2.0f32 } else { 1.0 },
+                1.0f32,
                 max_lum as f32 / 10000.,
                 max_lum as f32 / ref_lum as f32,
             ),
             _ => (0.0, 0.0, 0.0),
         };
-        [
+
+        let mut uniforms = vec![
             Uniform::new("niri_hdr_pq", if sdr_to_hdr { 1.0f32 } else { 0.0 }),
             Uniform::new("niri_ref_lum_scale", scale),
             Uniform::new("niri_linear", linear),
             Uniform::new("niri_linear_scale", linear_scale),
             Uniform::new("niri_linear_to_ref", linear_to_ref),
             Uniform::new("niri_hdr_to_sdr", if hdr_to_sdr { 1.0f32 } else { 0.0 }),
-        ]
+            Uniform::new("niri_pq_gamut", if pq_gamut { 1.0f32 } else { 0.0 }),
+        ];
+        uniforms.extend(gamut_uniforms(gamut.is_some(), gamut.flatten()));
+        uniforms
     }
 }
 
@@ -220,6 +387,10 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, reference_luminance: Option<
                         Uniform::new("niri_linear_scale", 0.0f32),
                         Uniform::new("niri_linear_to_ref", 0.0f32),
                         Uniform::new("niri_hdr_to_sdr", 0.0f32),
+                        Uniform::new("niri_pq_gamut", 0.0f32),
+                        // Plain sRGB content on the default path uses the shader's built-in
+                        // constants.
+                        Uniform::new("niri_use_gamut", 0.0f32),
                     ],
                 )));
             } else {
@@ -327,18 +498,53 @@ fn adjust_tex_program_for_content(
     )>,
 > {
     match content {
-        ContentColor::Sdr => None,
-        ContentColor::HdrPq => {
+        // Plain sRGB SDR content uses the frame's default path (the blend-space program on
+        // HDR frames, no transform on SDR frames).
+        ContentColor::Sdr {
+            gamut: ContentGamut::Srgb,
+        } => None,
+        // Wide-gamut SDR content needs the gamut uniform on HDR frames; on SDR frames it
+        // passes through like any SDR content.
+        ContentColor::Sdr { .. } => {
+            if !FrameBlendState::is_hdr_frame(frame) {
+                return None;
+            }
+            let program = Shaders::get_from_frame(frame).texture_hdr.clone();
+            let saved = frame.take_tex_program_override();
+            let Some(program) = saved.as_ref().map(|(p, _)| p.clone()).or(program) else {
+                // Shader failed to compile at startup (already warned); render raw.
+                return None;
+            };
+            let uniforms = FrameBlendState::uniforms_for_content(frame, content);
+            frame.set_tex_program_override(Some((program, uniforms)));
+            Some(saved)
+        }
+        ContentColor::HdrPq { gamut } => {
             let saved = frame.take_tex_program_override();
             if FrameBlendState::is_hdr_frame(frame) {
-                saved.is_some().then_some(saved)
+                match gamut.matrix_to(true) {
+                    // BT.2020-container PQ passes through numerically.
+                    None => saved.is_some().then_some(saved),
+                    // Other containers are decoded, converted and re-encoded.
+                    Some(_) => {
+                        let program = Shaders::get_from_frame(frame).texture_hdr.clone();
+                        let Some(program) = saved.as_ref().map(|(p, _)| p.clone()).or(program)
+                        else {
+                            return saved.is_some().then_some(saved);
+                        };
+                        let uniforms = FrameBlendState::uniforms_for_content(frame, content);
+                        frame.set_tex_program_override(Some((program, uniforms)));
+                        Some(saved)
+                    }
+                }
             } else if let Some(program) = Shaders::get_from_frame(frame).texture_hdr_to_sdr.clone()
             {
                 let ref_lum_scale = FrameBlendState::ref_lum_scale(frame);
-                frame.override_default_tex_program(
-                    program,
-                    vec![Uniform::new("niri_ref_lum_scale", ref_lum_scale)],
-                );
+                let mut uniforms = vec![Uniform::new("niri_ref_lum_scale", ref_lum_scale)];
+                // Convert the container gamut to BT.709; the uniform (rather than the
+                // shader's built-in 2020 constant) also covers non-2020 containers.
+                uniforms.extend(gamut_uniforms(true, gamut.matrix_to(false)));
+                frame.override_default_tex_program(program, uniforms);
                 Some(saved)
             } else {
                 warn!("HDR-to-SDR texture shader missing; HDR capture will render raw");
@@ -354,7 +560,7 @@ fn adjust_tex_program_for_content(
                 // Shader failed to compile at startup (already warned); render raw.
                 return None;
             };
-            let uniforms = FrameBlendState::uniforms_for_content(frame, content).to_vec();
+            let uniforms = FrameBlendState::uniforms_for_content(frame, content);
             frame.set_tex_program_override(Some((program, uniforms)));
             Some(saved)
         }
@@ -488,17 +694,22 @@ mod tests {
     fn content_color_classification() {
         use smithay::wayland::color::management::PrimariesOption;
 
-        assert_eq!(ContentColor::from_description(None), ContentColor::Sdr);
+        assert_eq!(
+            ContentColor::from_description(None),
+            ContentColor::default()
+        );
         assert_eq!(
             ContentColor::from_description(Some(ImageDescription::SRGB)),
-            ContentColor::Sdr
+            ContentColor::Sdr {
+                gamut: ContentGamut::Srgb
+            }
         );
 
         // Windows scRGB: 1.0 = 80 cd/m² with a 203 cd/m² reference white.
         assert_eq!(
             ContentColor::from_description(Some(ImageDescription::WINDOWS_SCRGB)),
             ContentColor::Linear {
-                bt2020: false,
+                gamut: ContentGamut::Srgb,
                 max_lum: 80,
                 ref_lum: 203,
             }
@@ -513,7 +724,7 @@ mod tests {
         assert_eq!(
             ContentColor::from_description(Some(mesa_scrgb)),
             ContentColor::Linear {
-                bt2020: false,
+                gamut: ContentGamut::Srgb,
                 max_lum: 80,
                 ref_lum: 80,
             }
@@ -530,7 +741,10 @@ mod tests {
         };
         assert!(matches!(
             ContentColor::from_description(Some(bt2020_linear)),
-            ContentColor::Linear { bt2020: true, .. }
+            ContentColor::Linear {
+                gamut: ContentGamut::Bt2020,
+                ..
+            }
         ));
 
         // PQ content passes through the blend space numerically.
@@ -544,11 +758,62 @@ mod tests {
         };
         assert_eq!(
             ContentColor::from_description(Some(pq)),
-            ContentColor::HdrPq
+            ContentColor::HdrPq {
+                gamut: ContentGamut::Bt2020
+            }
         );
         assert_eq!(
             ContentColor::from_description(Some(ImageDescription::WINDOWS_BT2100)),
-            ContentColor::HdrPq
+            ContentColor::HdrPq {
+                gamut: ContentGamut::Bt2020
+            }
+        );
+
+        // PQ in a Display-P3 container keeps its custom gamut for conversion.
+        let p3_chroma = Chromaticities::from_named(CmPrimaries::DisplayP3);
+        let pq_p3 = ImageDescription {
+            transfer: CmTransferFunction::St2084Pq,
+            primaries: PrimariesOption {
+                named: Some(CmPrimaries::DisplayP3),
+                values: None,
+            },
+            ..ImageDescription::SRGB
+        };
+        assert_eq!(
+            ContentColor::from_description(Some(pq_p3)),
+            ContentColor::HdrPq {
+                gamut: ContentGamut::Custom(p3_chroma)
+            }
+        );
+
+        // Raw chromaticities equal to a known named set normalize to the named gamut.
+        let raw_srgb = ImageDescription {
+            primaries: PrimariesOption {
+                named: None,
+                values: Some(Chromaticities::from_named(CmPrimaries::Srgb)),
+            },
+            ..ImageDescription::SRGB
+        };
+        assert_eq!(
+            ContentColor::from_description(Some(raw_srgb)),
+            ContentColor::Sdr {
+                gamut: ContentGamut::Srgb
+            }
+        );
+
+        // An SDR transfer in a BT.2020 container is wide-gamut SDR, not HDR.
+        let wide_sdr = ImageDescription {
+            primaries: PrimariesOption {
+                named: Some(CmPrimaries::Bt2020),
+                values: None,
+            },
+            ..ImageDescription::SRGB
+        };
+        assert_eq!(
+            ContentColor::from_description(Some(wide_sdr)),
+            ContentColor::Sdr {
+                gamut: ContentGamut::Bt2020
+            }
         );
     }
 
