@@ -193,8 +193,8 @@ use crate::utils::{
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
 use smithay::wayland::color::management::{
-    ColorManagementState, ColorManagementSurfaceCachedState, Feature, ImageDescription,
-    Primaries as CmPrimaries, PrimariesOption as CmPrimariesOption, RenderIntent,
+    get_surface_description, ColorManagementState, ColorManagementSurfaceCachedState, Feature,
+    ImageDescription, Primaries as CmPrimaries, PrimariesOption as CmPrimariesOption, RenderIntent,
     TransferFunction as CmTransferFunction,
 };
 
@@ -2325,6 +2325,21 @@ impl Niri {
             return None;
         }
         surface_tree_hdr_description(window.toplevel().wl_surface())
+    }
+
+    /// Whether the current cursor image is plain sRGB SDR content, i.e. safe to place on the
+    /// cursor plane of an HDR output after the CPU sRGB-to-PQ encode (which assumes sRGB).
+    ///
+    /// Named/theme cursors always are; client cursor surfaces are checked against their
+    /// committed image description.
+    pub fn cursor_content_is_plain_sdr(&self) -> bool {
+        match self.cursor_manager.cursor_image() {
+            CursorImageStatus::Surface(surface) => {
+                let (desc, _) = get_surface_description(surface);
+                ContentColor::from_description(desc) == ContentColor::default()
+            }
+            _ => true,
+        }
     }
 
     /// The per-element color transforms for direct scanout on this output, mapping every

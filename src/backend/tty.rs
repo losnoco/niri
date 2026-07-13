@@ -2352,11 +2352,20 @@ impl Tty {
             .use_color_transforms(transforms, blend_hdr);
 
         // A blend-space change alters what every shader outputs without any element damage;
-        // force a full redraw.
+        // force a full redraw. The cursor plane's contents bypass the renderer entirely, so
+        // they get the equivalent sRGB-to-PQ encode on the CPU instead.
         let blend = blend_hdr.then_some(reference_luminance);
         if surface.last_blend != Some(blend) {
             surface.last_blend = Some(blend);
             surface.compositor.reset_buffers();
+            surface
+                .compositor
+                .set_cursor_buffer_transform(blend.map(|ref_lum| {
+                    let scale = (ref_lum / 10000.) as f32;
+                    Box::new(move |data: &mut [u8], stride: u32, size: (u32, u32)| {
+                        blend::srgb_to_pq_argb8888(data, stride, size, scale);
+                    }) as Box<_>
+                }));
         }
 
         let mut renderer = match self.gpu_manager.renderer(
@@ -2421,14 +2430,18 @@ impl Tty {
             }
 
             if blend_hdr {
-                // The cursor plane is filled without going through GLES, so its content would
-                // bypass the blend transform; render the cursor on the primary plane instead.
-                flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
-                flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
-                // Primary-plane scanout stays allowed: every window surface has a scanout
-                // color transform (see use_color_transforms above), so mismatched content is
-                // converted by the plane's color pipeline, composited when the hardware can't
-                // express the conversion, and unlisted elements are denied scanout.
+                // The cursor plane is filled without going through GLES; its contents are
+                // encoded into the blend space on the CPU instead (see
+                // set_cursor_buffer_transform above), which assumes plain sRGB content. The
+                // rare non-SDR client cursor falls back to primary-plane composition.
+                if !niri.cursor_content_is_plain_sdr() {
+                    flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
+                }
+                // Primary- and overlay-plane scanout stay allowed: every window surface has a
+                // scanout color transform (see use_color_transforms above), so mismatched
+                // content is converted by the plane's color pipeline, composited when the
+                // hardware can't express the conversion, and unlisted elements are denied
+                // scanout.
             }
 
             (flags, presentation_mode)
