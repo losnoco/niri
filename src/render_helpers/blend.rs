@@ -539,6 +539,32 @@ pub fn srgb_to_pq(color: Color32F, ref_lum_scale: f32) -> Color32F {
     )
 }
 
+/// CPU encode of a premultiplied ARGB8888 buffer (little-endian, so B,G,R,A bytes) from
+/// electrical sRGB into PQ/BT.2020, for the cursor plane on HDR outputs: its contents bypass
+/// the renderer, so the conversion the blend shaders would do runs here instead.
+///
+/// Runs only when the cursor *image* changes (cursor movement reuses the buffer), so the
+/// per-pixel `powf` cost is acceptable.
+pub fn srgb_to_pq_argb8888(data: &mut [u8], stride: u32, size: (u32, u32), ref_lum_scale: f32) {
+    let (width, height) = size;
+    for row in 0..height as usize {
+        let start = row * stride as usize;
+        let row_data = &mut data[start..start + width as usize * 4];
+        for px in row_data.chunks_exact_mut(4) {
+            let color = Color32F::new(
+                f32::from(px[2]) / 255.,
+                f32::from(px[1]) / 255.,
+                f32::from(px[0]) / 255.,
+                f32::from(px[3]) / 255.,
+            );
+            let color = srgb_to_pq(color, ref_lum_scale);
+            px[2] = (color.r() * 255.).round().clamp(0., 255.) as u8;
+            px[1] = (color.g() * 255.).round().clamp(0., 255.) as u8;
+            px[0] = (color.b() * 255.).round().clamp(0., 255.) as u8;
+        }
+    }
+}
+
 /// A surface-tree render element that knows how its content relates to the output blend space
 /// (from its committed image description).
 ///
