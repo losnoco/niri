@@ -15,6 +15,10 @@ uniform sampler2D tex;
 
 uniform float alpha;
 uniform float niri_ref_lum_scale;
+// 1.0 = use niri_gamut (container primaries -> BT.709, identity when equal) instead of the
+// built-in BT.2020 constant.
+uniform float niri_use_gamut;
+uniform mat3 niri_gamut;
 varying vec2 v_coords;
 
 #if defined(DEBUG_FLAGS)
@@ -46,7 +50,7 @@ vec4 niri_hdr_to_sdr(vec4 color) {
         1.660491, -0.124550, -0.018151,
        -0.587641,  1.132900, -0.100579,
        -0.072850, -0.008349,  1.118730);
-    rgb = to_bt709 * rgb;
+    rgb = niri_use_gamut > 0.5 ? niri_gamut * rgb : to_bt709 * rgb;
 
     // Convert absolute PQ luminance to the SDR reference white used by niri's HDR blend path.
     float ref_scale = niri_ref_lum_scale > 0.0 ? niri_ref_lum_scale : 0.0203;
