@@ -10,6 +10,7 @@
 
 use std::cell::Cell;
 
+use smithay::backend::drm::{Curve1DType, ScanoutColorTransform};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{
@@ -171,6 +172,16 @@ const BT2020_TO_BT709: Mat3 = [
     -0.018151, -0.100579, 1.118730,
 ];
 
+/// Embeds a linear 3x3 matrix into the 3x4 (with offset column) layout of
+/// `struct drm_color_ctm_3x4`.
+fn mat3_to_ctm(m: Mat3) -> [f64; 12] {
+    [
+        m[0], m[1], m[2], 0.0, //
+        m[3], m[4], m[5], 0.0, //
+        m[6], m[7], m[8], 0.0,
+    ]
+}
+
 /// The gamut uniforms for a draw: `niri_use_gamut` and the column-major `niri_gamut` matrix.
 ///
 /// `enabled` distinguishes "multiply by the (possibly identity) uniform matrix" from "use the
@@ -194,6 +205,89 @@ fn gamut_uniforms(enabled: bool, matrix: Option<Mat3>) -> [Uniform<'static>; 2] 
             },
         ),
     ]
+}
+
+/// The plane color transform reproducing what the blend shaders do to content of this color
+/// during composition, for direct scanout via the kernel color pipeline (drm_colorop) API.
+///
+/// `blend_hdr` and `reference_luminance` describe the output: an HDR (PQ/BT.2020) blend space
+/// with the configured SDR reference white, or an SDR output (where the shaders assume the
+/// default 203 cd/m² reference, so callers should pass that).
+///
+/// The math mirrors `niri_blend` in `shaders/hdr.frag` stage by stage; the kernel's named
+/// `PQ 125` curves use a linear scale of 1.0 = 80 cd/m², hence the /80 in the multipliers
+/// (the shaders scale against 10,000 cd/m² instead, which cancels out identically).
+///
+/// Container gamuts are converted with the same matrices the shaders use (constants for the
+/// known sRGB/BT.2020 pairs, [`colorimetry::gamut_matrix`] for custom primaries), so scanout
+/// and composition stay numerically identical.
+pub fn scanout_color_transform(
+    content: ContentColor,
+    blend_hdr: bool,
+    reference_luminance: f64,
+) -> ScanoutColorTransform {
+    if blend_hdr {
+        match content {
+            // Pure 2.2 decode, scale reference white to its luminance, convert the gamut,
+            // encode as PQ.
+            ContentColor::Sdr { gamut } => ScanoutColorTransform {
+                decode: Some(Curve1DType::Gamma22),
+                multiplier: reference_luminance / 80.,
+                ctm: gamut.matrix_to(true).map(mat3_to_ctm),
+                encode: Some(Curve1DType::Pq125InvEotf),
+            },
+            // BT.2020-container PQ is already encoded in the blend space; other containers
+            // are decoded, gamut-converted in linear light and re-encoded (matching the
+            // shaders' niri_pq_gamut path).
+            ContentColor::HdrPq { gamut } => match gamut.matrix_to(true) {
+                None => ScanoutColorTransform::IDENTITY,
+                Some(m) => ScanoutColorTransform {
+                    decode: Some(Curve1DType::Pq125Eotf),
+                    multiplier: 1.0,
+                    ctm: Some(mat3_to_ctm(m)),
+                    encode: Some(Curve1DType::Pq125InvEotf),
+                },
+            },
+            // Absolute mapping: encoded 1.0 = max_lum cd/m², deliberately independent of the
+            // SDR reference luminance (display-referred, never tone mapped).
+            ContentColor::Linear {
+                gamut,
+                max_lum,
+                ref_lum: _,
+            } => ScanoutColorTransform {
+                decode: None,
+                multiplier: f64::from(max_lum) / 80.,
+                ctm: gamut.matrix_to(true).map(mat3_to_ctm),
+                encode: Some(Curve1DType::Pq125InvEotf),
+            },
+        }
+    } else {
+        match content {
+            // SDR content on an SDR output passes through, whatever its container gamut
+            // (the shaders don't convert wide-gamut SDR on SDR outputs either).
+            ContentColor::Sdr { .. } => ScanoutColorTransform::IDENTITY,
+            // PQ decode, anchor the reference white to display white (clamping the headroom
+            // away at the encode), convert the gamut, gamma-encode.
+            ContentColor::HdrPq { gamut } => ScanoutColorTransform {
+                decode: Some(Curve1DType::Pq125Eotf),
+                multiplier: 80. / reference_luminance,
+                ctm: gamut.matrix_to(false).map(mat3_to_ctm),
+                encode: Some(Curve1DType::Gamma22Inv),
+            },
+            // Reference white anchored to display white via the content's own reference
+            // luminance, HDR headroom clamped away by the encode curve.
+            ContentColor::Linear {
+                gamut,
+                max_lum,
+                ref_lum,
+            } => ScanoutColorTransform {
+                decode: None,
+                multiplier: f64::from(max_lum) / f64::from(ref_lum),
+                ctm: gamut.matrix_to(false).map(mat3_to_ctm),
+                encode: Some(Curve1DType::Gamma22Inv),
+            },
+        }
+    }
 }
 
 /// The blend state of the frame currently being rendered, stored in the renderer's EGL user
@@ -641,11 +735,11 @@ impl RenderElement<GlesRenderer> for BlendSurfaceRenderElement<GlesRenderer> {
     }
 
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        // Extended-linear buffers need the GL encode; their raw values must not be scanned
-        // out.
-        if matches!(self.content, ContentColor::Linear { .. }) {
-            return None;
-        }
+        // Raw buffer values must never reach a connector whose signal differs from them
+        // (e.g. an extended-linear buffer on any output, or an SDR buffer on a PQ output);
+        // the TTY backend guards this by handing the DrmCompositor a per-element
+        // ScanoutColorTransform for every window surface, which either programs the
+        // conversion into the plane's color pipeline or keeps the element composited.
         self.inner.underlying_storage(renderer)
     }
 }
@@ -675,11 +769,8 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         &self,
         renderer: &mut TtyRenderer<'render>,
     ) -> Option<UnderlyingStorage<'_>> {
-        // Extended-linear buffers need the GL encode; their raw values must not be scanned
-        // out.
-        if matches!(self.content, ContentColor::Linear { .. }) {
-            return None;
-        }
+        // Raw buffer values must never reach a connector whose signal differs from them;
+        // see the GlesRenderer impl above for how the TTY backend guards this.
         self.inner.underlying_storage(renderer)
     }
 }
@@ -813,6 +904,105 @@ mod tests {
                 gamut: ContentGamut::Bt2020
             }
         );
+    }
+
+    #[test]
+    fn scanout_transforms_mirror_the_shaders() {
+        use smithay::backend::drm::Curve1DType;
+
+        let srgb = ContentGamut::Srgb;
+        let bt2020 = ContentGamut::Bt2020;
+
+        // SDR on an HDR output: gamma 2.2 decode, reference white at 203 cd/m² = a gain of
+        // 203/80 on the PQ-125 linear scale, 709 -> 2020, PQ encode.
+        let sdr = scanout_color_transform(ContentColor::Sdr { gamut: srgb }, true, 203.);
+        assert_eq!(sdr.decode, Some(Curve1DType::Gamma22));
+        assert!((sdr.multiplier - 2.5375).abs() < 1e-9);
+        assert_eq!(sdr.ctm, Some(mat3_to_ctm(BT709_TO_BT2020)));
+        assert_eq!(sdr.encode, Some(Curve1DType::Pq125InvEotf));
+
+        // BT.2020-container PQ on an HDR output passes through numerically, like the shaders.
+        assert!(
+            scanout_color_transform(ContentColor::HdrPq { gamut: bt2020 }, true, 203.)
+                .is_identity()
+        );
+        // ... and anything on an SDR output that is already SDR needs no transform.
+        assert!(
+            scanout_color_transform(ContentColor::Sdr { gamut: srgb }, false, 203.).is_identity()
+        );
+
+        // PQ in a Display-P3 container on an HDR output: decode, convert, re-encode.
+        let p3 = ContentGamut::Custom(Chromaticities::from_named(CmPrimaries::DisplayP3));
+        let pq_p3 = scanout_color_transform(ContentColor::HdrPq { gamut: p3 }, true, 203.);
+        assert_eq!(pq_p3.decode, Some(Curve1DType::Pq125Eotf));
+        assert_eq!(pq_p3.multiplier, 1.0);
+        assert_eq!(pq_p3.encode, Some(Curve1DType::Pq125InvEotf));
+        let ctm = pq_p3.ctm.unwrap();
+        // Display-P3 and BT.2020 share the D65 white point: rows sum to 1.
+        for row in 0..3 {
+            let sum: f64 = ctm[row * 4..row * 4 + 3].iter().sum();
+            assert!((sum - 1.0).abs() < 1e-6, "row {row} sums to {sum}");
+            assert_eq!(ctm[row * 4 + 3], 0.0);
+        }
+
+        // Windows scRGB on an HDR output: already linear at 1.0 = 80 cd/m², which is
+        // exactly the PQ-125 scale, so only the gamut conversion and the PQ encode remain.
+        let scrgb = scanout_color_transform(
+            ContentColor::Linear {
+                gamut: srgb,
+                max_lum: 80,
+                ref_lum: 203,
+            },
+            true,
+            203.,
+        );
+        assert_eq!(scrgb.decode, None);
+        assert_eq!(scrgb.multiplier, 1.0);
+        assert_eq!(scrgb.ctm, Some(mat3_to_ctm(BT709_TO_BT2020)));
+        assert_eq!(scrgb.encode, Some(Curve1DType::Pq125InvEotf));
+
+        // BT.2020 extended-linear content skips the gamut conversion.
+        let linear_2020 = scanout_color_transform(
+            ContentColor::Linear {
+                gamut: bt2020,
+                max_lum: 80,
+                ref_lum: 203,
+            },
+            true,
+            203.,
+        );
+        assert_eq!(linear_2020.ctm, None);
+
+        // PQ content on an SDR output: decode, anchor 203 cd/m² to display white,
+        // 2020 -> 709, gamma encode (clamping the headroom away).
+        let pq_on_sdr = scanout_color_transform(ContentColor::HdrPq { gamut: bt2020 }, false, 203.);
+        assert_eq!(pq_on_sdr.decode, Some(Curve1DType::Pq125Eotf));
+        assert!((pq_on_sdr.multiplier - 80. / 203.).abs() < 1e-9);
+        assert_eq!(pq_on_sdr.ctm, Some(mat3_to_ctm(BT2020_TO_BT709)));
+        assert_eq!(pq_on_sdr.encode, Some(Curve1DType::Gamma22Inv));
+
+        // scRGB on an SDR output: reference white (203) anchored to display white.
+        let scrgb_on_sdr = scanout_color_transform(
+            ContentColor::Linear {
+                gamut: srgb,
+                max_lum: 80,
+                ref_lum: 203,
+            },
+            false,
+            203.,
+        );
+        assert_eq!(scrgb_on_sdr.decode, None);
+        assert!((scrgb_on_sdr.multiplier - 80. / 203.).abs() < 1e-9);
+        assert_eq!(scrgb_on_sdr.ctm, None);
+        assert_eq!(scrgb_on_sdr.encode, Some(Curve1DType::Gamma22Inv));
+
+        // Rows of the built-in matrices sum to ~1 (white maps to white).
+        for row in 0..3 {
+            let sum: f64 = BT709_TO_BT2020[row * 3..row * 3 + 3].iter().sum();
+            assert!((sum - 1.0).abs() < 1e-4, "row {row} sums to {sum}");
+            let sum: f64 = BT2020_TO_BT709[row * 3..row * 3 + 3].iter().sum();
+            assert!((sum - 1.0).abs() < 1e-4, "row {row} sums to {sum}");
+        }
     }
 
     #[test]
