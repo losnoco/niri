@@ -2263,7 +2263,7 @@ impl Tty {
         // The connector state is only *staged* here; smithay applies it inside its own commit
         // as a single atomic modeset together with mode, CRTC and plane state (committing
         // connector color properties standalone hangs some drivers, notably nvidia).
-        let (blend_hdr, hdr_content, reference_luminance) = {
+        let (blend_hdr, reference_luminance) = {
             let config = self.config.borrow();
             let output_config = config.outputs.find(&surface.name);
             let hdr_config = output_config.and_then(|o| o.hdr.clone());
@@ -2332,8 +2332,24 @@ impl Tty {
                 }
             }
 
-            (blend_hdr, hdr_desc.is_some(), reference_luminance)
+            (blend_hdr, reference_luminance)
         };
+
+        // Per-element scanout color transforms: reproduce the blend shaders' conversions in
+        // the plane color pipeline (kernel 6.19+ drm_colorop) so color-mismatched fullscreen
+        // content can still be scanned out directly. On HDR outputs, unlisted elements are
+        // denied scanout entirely so raw values can never bypass the blend space. On SDR
+        // outputs the shaders assume the default reference white regardless of config.
+        let scanout_ref_lum = if blend_hdr {
+            reference_luminance
+        } else {
+            DEFAULT_REFERENCE_LUMINANCE
+        };
+        #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
+        let transforms = niri.scanout_color_transforms(output, blend_hdr, scanout_ref_lum);
+        surface
+            .compositor
+            .use_color_transforms(transforms, blend_hdr);
 
         // A blend-space change alters what every shader outputs without any element damage;
         // force a full redraw.
@@ -2409,11 +2425,10 @@ impl Tty {
                 // bypass the blend transform; render the cursor on the primary plane instead.
                 flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
                 flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
-                if !hdr_content {
-                    // SDR content must go through the blend shader.
-                    flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT);
-                    flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY);
-                }
+                // Primary-plane scanout stays allowed: every window surface has a scanout
+                // color transform (see use_color_transforms above), so mismatched content is
+                // converted by the plane's color pipeline, composited when the hardware can't
+                // express the conversion, and unlisted elements are denied scanout.
             }
 
             (flags, presentation_mode)

@@ -20,6 +20,7 @@ use niri_config::{
     WorkspaceReference, Xkb,
 };
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::drm::ScanoutColorTransform;
 use smithay::backend::input::Keycode;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
@@ -150,18 +151,14 @@ use crate::layout::{
 use crate::niri_render_elements;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
-use smithay::wayland::color::management::{
-    ColorManagementState, ColorManagementSurfaceCachedState, Feature, ImageDescription,
-    Primaries as CmPrimaries, PrimariesOption as CmPrimariesOption, RenderIntent,
-    TransferFunction as CmTransferFunction,
-};
 use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blend::{
-    set_sdr_capture_blend, BlendSurfaceRenderElement, DEFAULT_REFERENCE_LUMINANCE,
+    scanout_color_transform, set_sdr_capture_blend, BlendSurfaceRenderElement, ContentColor,
+    DEFAULT_REFERENCE_LUMINANCE,
 };
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
@@ -195,6 +192,11 @@ use crate::utils::{
 };
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
+use smithay::wayland::color::management::{
+    ColorManagementState, ColorManagementSurfaceCachedState, Feature, ImageDescription,
+    Primaries as CmPrimaries, PrimariesOption as CmPrimariesOption, RenderIntent,
+    TransferFunction as CmTransferFunction,
+};
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 
@@ -2323,6 +2325,49 @@ impl Niri {
             return None;
         }
         surface_tree_hdr_description(window.toplevel().wl_surface())
+    }
+
+    /// The per-element color transforms for direct scanout on this output, mapping every
+    /// window surface to the plane color pipeline configuration that reproduces what the
+    /// blend shaders would do to it during composition.
+    ///
+    /// The TTY backend hands these to the `DrmCompositor` each frame; on HDR outputs it also
+    /// denies scanout for elements *not* in the map, so nothing can bypass the blend space
+    /// with raw values. Layer-shell and other non-window surfaces are not listed: they simply
+    /// stay composited on HDR outputs and scan out unconverted (correct, they are SDR) on SDR
+    /// outputs.
+    #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
+    pub fn scanout_color_transforms(
+        &self,
+        output: &Output,
+        blend_hdr: bool,
+        reference_luminance: f64,
+    ) -> HashMap<Id, ScanoutColorTransform> {
+        let mut transforms = HashMap::new();
+        for mapped in self.layout.windows_for_output(output) {
+            with_surface_tree_downward(
+                mapped.toplevel().wl_surface(),
+                (),
+                |_, _, _| TraversalAction::DoChildren(()),
+                |surface, states, _| {
+                    // The traversal already locks the surface states; read the cached state
+                    // through them rather than via get_surface_description() (which would
+                    // re-lock and deadlock).
+                    let desc = states
+                        .cached_state
+                        .get::<ColorManagementSurfaceCachedState>()
+                        .current()
+                        .description;
+                    let content = ContentColor::from_description(desc);
+                    transforms.insert(
+                        Id::from_wayland_resource(surface),
+                        scanout_color_transform(content, blend_hdr, reference_luminance),
+                    );
+                },
+                |_, _, _| true,
+            );
+        }
+        transforms
     }
 
     /// Returns the HDR config of an output, but only if the output can actually do HDR
