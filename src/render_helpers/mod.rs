@@ -32,6 +32,7 @@ pub mod blend;
 pub mod blur;
 pub mod border;
 pub mod clipped_surface;
+pub mod colorimetry;
 pub mod damage;
 pub mod debug;
 pub mod effect_buffer;
