@@ -9,8 +9,11 @@ use atomic::Ordering;
 use calloop::ping::{make_ping, Ping};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::LoopHandle;
-use smithay::reexports::wayland_server::Client;
-use smithay::wayland::compositor::{Blocker, BlockerState};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::{Client, DisplayHandle};
+use smithay::wayland::compositor::{
+    add_blocker, Blocker, BlockerState, CompositorHandler, SurfaceBarrier,
+};
 
 /// Default time limit, after which the transaction completes.
 ///
@@ -33,6 +36,69 @@ const TIME_LIMIT: Duration = Duration::from_millis(300);
 pub struct Transaction {
     inner: Arc<Inner>,
     deadline: Rc<RefCell<Deadline>>,
+    barrier: Rc<RefCell<Option<SurfaceBarrier>>>,
+}
+
+/// Registry of in-flight [`SurfaceBarrier`]s.
+///
+/// Surfaces committing in response to a transaction's configure are registered into the
+/// transaction's barrier ([`Transaction::register_surface()`]). The barrier becomes ready once
+/// every registered surface is only waiting on the barrier itself, i.e. the niri transaction
+/// completed and all per-surface readiness blockers (dmabuf / syncobj acquire point) cleared.
+///
+/// The barrier's notifier merely wakes the event loop; [`SurfaceBarriers::release_ready()`] is
+/// called at the start of every refresh cycle and releases the ready barriers, applying all
+/// their pending surface states atomically within that same cycle.
+#[derive(Debug, Clone)]
+pub struct SurfaceBarriers {
+    ping: Ping,
+    barriers: Rc<RefCell<Vec<SurfaceBarrier>>>,
+}
+
+impl SurfaceBarriers {
+    /// Creates the registry.
+    ///
+    /// `ping` must wake the main event loop so that a becoming-ready barrier triggers a refresh
+    /// cycle promptly.
+    pub fn new(ping: Ping) -> Self {
+        Self {
+            ping,
+            barriers: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    fn create_barrier(&self) -> SurfaceBarrier {
+        let ping = self.ping.clone();
+        let barrier = SurfaceBarrier::new(move || ping.ping());
+        self.barriers.borrow_mut().push(barrier.clone());
+        barrier
+    }
+
+    /// Releases all barriers that became ready, applying their pending surface states.
+    pub fn release_ready<D: CompositorHandler + 'static>(&self, dh: &DisplayHandle, state: &mut D) {
+        // Applying a released barrier's states can complete further transactions and make more
+        // barriers ready, so loop until a pass finds nothing to release. The borrow must not be
+        // held across release(): applying states runs commit handlers which can register new
+        // barriers.
+        loop {
+            let ready: Vec<SurfaceBarrier> = {
+                let mut barriers = self.barriers.borrow_mut();
+                barriers.retain(|barrier| !barrier.is_released());
+                barriers
+                    .iter()
+                    .filter(|barrier| barrier.is_ready())
+                    .cloned()
+                    .collect()
+            };
+            if ready.is_empty() {
+                return;
+            }
+            for barrier in ready {
+                trace!("releasing ready surface barrier");
+                barrier.release(dh, state);
+            }
+        }
+    }
 }
 
 /// Blocker for a [`Transaction`].
@@ -62,7 +128,23 @@ impl Transaction {
             deadline: Rc::new(RefCell::new(Deadline::NotRegistered(
                 Instant::now() + TIME_LIMIT,
             ))),
+            barrier: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// Registers a surface's pending commit into this transaction's surface barrier.
+    ///
+    /// This adds a [`TransactionBlocker`] gating the commit on the completion of this
+    /// transaction, and a barrier blocker delaying the application of the committed state until
+    /// every surface registered into the barrier is ready, at which point they all apply
+    /// atomically (see [`SurfaceBarriers`]).
+    ///
+    /// Must be called from the surface's pre-commit hook.
+    pub fn register_surface(&self, surface: &WlSurface, barriers: &SurfaceBarriers) {
+        let mut barrier = self.barrier.borrow_mut();
+        let barrier = barrier.get_or_insert_with(|| barriers.create_barrier());
+        barrier.register_surfaces([surface]);
+        add_blocker(surface, self.blocker());
     }
 
     /// Gets a blocker for this transaction.
@@ -83,15 +165,22 @@ impl Transaction {
     }
 
     /// Registers this transaction's deadline timer on an event loop.
-    pub fn register_deadline_timer<T: 'static>(&self, event_loop: &LoopHandle<'static, T>) {
+    pub fn register_deadline_timer<T: CompositorHandler + 'static>(
+        &self,
+        event_loop: &LoopHandle<'static, T>,
+        dh: &DisplayHandle,
+    ) {
         let mut cell = self.deadline.borrow_mut();
         if let Deadline::NotRegistered(deadline) = *cell {
             let timer = Timer::from_deadline(deadline);
             let inner = Arc::downgrade(&self.inner);
+            let barrier = self.barrier.clone();
+            let dh = dh.clone();
             let token = event_loop
-                .insert_source(timer, move |_, _, _| {
+                .insert_source(timer, move |_, _, state| {
                     let _span = trace_span!("deadline timer", transaction = ?Weak::as_ptr(&inner))
                         .entered();
+                    let _ = &state;
 
                     // FIXME: come up with some way to control the deadline timer from tests.
                     #[cfg(not(test))]
@@ -104,6 +193,16 @@ impl Transaction {
                         // branch being legitimately taken.
                         trace!("transaction completed without removing the timer");
                     }
+
+                    // Also force-release the surface barrier: past the deadline we no longer
+                    // wait for every participant to become ready.
+                    #[cfg(not(test))]
+                    if let Some(barrier) = barrier.borrow_mut().take() {
+                        trace!("deadline reached, releasing surface barrier");
+                        barrier.release(&dh, state);
+                    }
+                    #[cfg(test)]
+                    let _ = (&barrier, &dh);
 
                     TimeoutAction::Drop
                 })
