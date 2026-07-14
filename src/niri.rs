@@ -73,13 +73,16 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
 use smithay::utils::{
     Buffer as BufferCoords, ClockSource, IsAlive as _, Logical, Monotonic, Physical, Point,
-    Rectangle, Scale, Size, Transform, SERIAL_COUNTER,
+    Rectangle, Scale, Size, Time, Transform, SERIAL_COUNTER,
 };
 use smithay::wayland::background_effect::BackgroundEffectState;
 use smithay::wayland::color::management::{
     get_surface_description, ColorManagementState, ColorManagementSurfaceCachedState, Feature,
     ImageDescription, Primaries as CmPrimaries, PrimariesOption as CmPrimariesOption, RenderIntent,
     TransferFunction as CmTransferFunction,
+};
+use smithay::wayland::commit_timing::{
+    CommitTimerBarrierStateUserData, CommitTimingManagerState, Timestamp,
 };
 use smithay::wayland::compositor::{
     get_parent, with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
@@ -350,6 +353,7 @@ pub struct Niri {
     pub activation_state: XdgActivationState,
     pub mutter_x11_interop_state: MutterX11InteropManagerState,
     pub fifo_manager_state: FifoManagerState,
+    pub commit_timing_manager_state: CommitTimingManagerState,
 
     // This will not work as is outside of tests, so it is gated with #[cfg(test)] for now. In
     // particular, shaders will need to learn about the single pixel buffer. Also, it must be
@@ -367,6 +371,9 @@ pub struct Niri {
     pub suppressed_buttons: HashSet<u32>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
+    // Timer waking up the event loop at the vblank where the earliest pending commit-timer
+    // deadline falls, so that queued commit timers are signaled even when nothing else wakes us.
+    pub commit_timing_wakeup_timer: Option<RegistrationToken>,
     pub keyboard_focus: KeyboardFocus,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
@@ -800,6 +807,62 @@ impl State {
     pub fn refresh_and_flush_clients(&mut self) {
         let _span = tracy_client::span!("State::refresh_and_flush_clients");
 
+        // Signal commit timers that are due at each output's next presentation time. This
+        // happens before refresh() so that the unblocked commits are handled by
+        // layout.refresh() within this same cycle. Collect the earliest still-pending deadline
+        // to schedule a wakeup for it.
+        if let Some(token) = self.niri.commit_timing_wakeup_timer.take() {
+            self.niri.event_loop.remove(token);
+        }
+
+        let mut min_next_schedule: Option<Duration> = None;
+        for output in self.niri.queued_outputs() {
+            let Some(output_state) = self.niri.output_state.get(&output) else {
+                continue;
+            };
+            let target_presentation_time = output_state.frame_clock.next_presentation_time();
+            let refresh_interval = output_state.frame_clock.refresh_interval();
+
+            if let Some(next_deadline) =
+                self.signal_commit_timing(&output, target_presentation_time)
+            {
+                // Align the wakeup to the refresh cycle on whose target presentation time the
+                // deadline falls.
+                let refresh_interval =
+                    refresh_interval.unwrap_or_else(|| Duration::from_millis(16));
+                let steps = next_deadline
+                    .saturating_sub(target_presentation_time)
+                    .div_duration_f64(refresh_interval) as u32;
+                let mut next_schedule = refresh_interval
+                    .saturating_mul(steps)
+                    .saturating_add(target_presentation_time);
+
+                // On idle/VRR outputs the target presentation time can be "now", making the
+                // quantized wakeup already due; wake at the deadline itself instead of spinning.
+                if next_schedule <= get_monotonic_time() {
+                    next_schedule = next_deadline;
+                }
+
+                min_next_schedule = min_next_schedule
+                    .filter(|min| *min <= next_schedule)
+                    .or(Some(next_schedule));
+            }
+        }
+
+        if let Some(min_next_schedule) = min_next_schedule {
+            let duration = min_next_schedule.saturating_sub(get_monotonic_time());
+            let token = self
+                .niri
+                .event_loop
+                .insert_source(Timer::from_duration(duration), |_, _, _| {
+                    // Waking up the event loop is enough: refresh_and_flush_clients() runs after
+                    // dispatch and signals the due commit timers.
+                    TimeoutAction::Drop
+                })
+                .unwrap();
+            self.niri.commit_timing_wakeup_timer = Some(token);
+        }
+
         self.refresh();
 
         // Advance animations to the current time (not target render time) before rendering outputs
@@ -997,6 +1060,86 @@ impl State {
             trace!("calling blocker_cleared");
             self.client_compositor_state(&client)
                 .blocker_cleared(self, &dh);
+        }
+    }
+
+    /// Signals all commit timers on this output that are due at `target_presentation_time`.
+    ///
+    /// Returns the earliest still-pending commit-timer deadline for this output, if any.
+    pub fn signal_commit_timing(
+        &mut self,
+        output: &Output,
+        target_presentation_time: Duration,
+    ) -> Option<Duration> {
+        let target: Timestamp = Time::<Monotonic>::from(target_presentation_time).into();
+        let mut min_next_deadline: Option<Timestamp> = None;
+
+        #[allow(clippy::mutable_key_type)]
+        let mut clients = HashMap::new();
+
+        self.niri
+            .for_each_output_surface(output, |surface, states| {
+                let primary_scanout_output = surface_primary_scanout_output(surface, states);
+                if primary_scanout_output.as_ref().is_some_and(|o| o != output) {
+                    return;
+                }
+
+                Self::signal_commit_timing_surface(
+                    surface,
+                    states,
+                    target,
+                    &mut min_next_deadline,
+                    &mut clients,
+                );
+            });
+
+        for unmapped in self.niri.unmapped_windows.values() {
+            unmapped.window.with_surfaces(|surface, states| {
+                Self::signal_commit_timing_surface(
+                    surface,
+                    states,
+                    target,
+                    &mut min_next_deadline,
+                    &mut clients,
+                );
+            });
+        }
+
+        let display_handle = self.niri.display_handle.clone();
+        for client in clients.into_values() {
+            self.client_compositor_state(&client)
+                .blocker_cleared(self, &display_handle);
+        }
+
+        min_next_deadline.map(|timestamp| Time::<Monotonic>::from(timestamp).into())
+    }
+
+    fn signal_commit_timing_surface(
+        surface: &WlSurface,
+        states: &SurfaceData,
+        target: Timestamp,
+        min_next_deadline: &mut Option<Timestamp>,
+        clients: &mut HashMap<ClientId, Client>,
+    ) {
+        let Some(mut commit_timer_state) = states
+            .data_map
+            .get::<CommitTimerBarrierStateUserData>()
+            .map(|commit_timer| commit_timer.lock().unwrap())
+        else {
+            return;
+        };
+
+        if commit_timer_state.signal_until(target) {
+            if let Some(client) = surface.client() {
+                clients.insert(client.id(), client);
+            }
+        }
+
+        if let Some(next_deadline) = commit_timer_state.next_deadline() {
+            *min_next_deadline = Some(match min_next_deadline.take() {
+                Some(min) if min <= next_deadline => min,
+                _ => next_deadline,
+            });
         }
     }
 
@@ -2891,6 +3034,7 @@ impl Niri {
         let mutter_x11_interop_state =
             MutterX11InteropManagerState::new::<State, _>(&display_handle, move |_| true);
         let fifo_manager_state = FifoManagerState::new::<State>(&display_handle);
+        let commit_timing_manager_state = CommitTimingManagerState::new::<State>(&display_handle);
 
         #[cfg(test)]
         let single_pixel_buffer_state = SinglePixelBufferState::new::<State>(&display_handle);
@@ -3088,6 +3232,7 @@ impl Niri {
             suppressed_buttons: HashSet::new(),
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
+            commit_timing_wakeup_timer: None,
             presentation_state,
             tearing_control_state,
             security_context_state,
@@ -3096,6 +3241,7 @@ impl Niri {
             activation_state,
             mutter_x11_interop_state,
             fifo_manager_state,
+            commit_timing_manager_state,
             #[cfg(test)]
             single_pixel_buffer_state,
 
