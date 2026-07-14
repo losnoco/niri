@@ -1,6 +1,5 @@
 use std::cell::Cell;
 
-use calloop::Interest;
 use niri_config::PresetSize;
 use smithay::desktop::{
     find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output, utils, LayerSurface,
@@ -19,11 +18,8 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{self, Resource, WEnum};
 use smithay::utils::{Logical, Rectangle, Serial};
 use smithay::wayland::compositor::{
-    add_blocker, add_pre_commit_hook, with_states, BufferAssignment, CompositorHandler as _,
-    HookId, SurfaceAttributes,
+    add_pre_commit_hook, with_states, BufferAssignment, HookId, SurfaceAttributes,
 };
-use smithay::wayland::dmabuf::get_dmabuf;
-use smithay::wayland::drm_syncobj::DrmSyncobjCachedState;
 use smithay::wayland::input_method::InputMethodSeat;
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::wayland::shell::wlr_layer::{self, Layer};
@@ -872,7 +868,7 @@ impl XdgShellHandler for State {
         // If this is the only instance, then this transaction will complete immediately, so no
         // need to set the timer.
         if !transaction.is_last() {
-            transaction.register_deadline_timer(&self.niri.event_loop);
+            transaction.register_deadline_timer(&self.niri.event_loop, &self.niri.display_handle);
         }
 
         if was_active {
@@ -1432,34 +1428,6 @@ fn unconstrain_with_padding(
 
 pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId {
     add_pre_commit_hook::<State, _>(toplevel.wl_surface(), move |state, _dh, surface| {
-        macro_rules! try_add_pre_commit_blocker {
-            ($state:expr, $surface:expr, $client:expr, $blocker:expr, $source:expr, $tx:expr, $label:expr) => {{
-                let mut tx = $tx.clone();
-                let client = $client.clone();
-                let res = $state
-                    .niri
-                    .event_loop
-                    .insert_source($source, move |_, _, state| {
-                        // This surface is now ready for the transaction.
-                        drop(tx.take());
-
-                        let display_handle = state.niri.display_handle.clone();
-                        state
-                            .client_compositor_state(&client)
-                            .blocker_cleared(state, &display_handle);
-
-                        Ok(())
-                    });
-                if res.is_ok() {
-                    add_blocker($surface, $blocker);
-                    trace!("added {} blocker", $label);
-                    true
-                } else {
-                    false
-                }
-            }};
-        }
-
         let _span = tracy_client::span!("mapped toplevel pre-commit");
         let span =
             trace_span!("toplevel pre-commit", surface = %surface.id(), serial = Empty).entered();
@@ -1469,16 +1437,13 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
             return;
         };
 
-        let (got_unmapped, acquire_point, dmabuf, commit_serial) = with_states(surface, |states| {
-            let (got_unmapped, dmabuf) = {
+        let (got_unmapped, commit_serial) = with_states(surface, |states| {
+            let got_unmapped = {
                 let mut guard = states.cached_state.get::<SurfaceAttributes>();
                 match guard.pending().buffer.as_ref() {
-                    Some(BufferAssignment::NewBuffer(buffer)) => {
-                        let dmabuf = get_dmabuf(buffer).cloned().ok();
-                        (false, dmabuf)
-                    }
-                    Some(BufferAssignment::Removed) => (true, None),
-                    None => (false, None),
+                    Some(BufferAssignment::NewBuffer(_)) => false,
+                    Some(BufferAssignment::Removed) => true,
+                    None => false,
                 }
             };
 
@@ -1490,17 +1455,9 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
                 .unwrap();
             let serial = role.last_acked.as_ref().map(|c| c.serial);
 
-            let acquire_point = states
-                .cached_state
-                .get::<DrmSyncobjCachedState>()
-                .pending()
-                .acquire_point
-                .clone();
-
-            (got_unmapped, acquire_point, dmabuf, serial)
+            (got_unmapped, serial)
         });
 
-        let mut transaction_for_dmabuf = None;
         let mut animate = false;
         if let Some(serial) = commit_serial {
             if !span.is_disabled() {
@@ -1512,32 +1469,36 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
                 // Transaction can be already completed if it ran past the deadline.
                 let disable = state.niri.config.borrow().debug.disable_transactions;
                 if !transaction.is_completed() && !disable {
-                    // Register the deadline even if this is the last pending, since dmabuf
-                    // rendering can still run over the deadline.
-                    transaction.register_deadline_timer(&state.niri.event_loop);
+                    // Register the deadline even if this is the last pending, since buffer
+                    // readiness (dmabuf / syncobj) can still run over the deadline.
+                    transaction.register_deadline_timer(
+                        &state.niri.event_loop,
+                        &state.niri.display_handle,
+                    );
 
-                    let is_last = transaction.is_last();
-
-                    // If this is the last transaction, we don't need to add a separate
-                    // notification, because the transaction will complete in our dmabuf blocker
-                    // callback, which already calls blocker_cleared(), or by the end of this
-                    // function, in which case there would be no blocker in the first place.
-                    if !is_last {
-                        // Waiting for some other surface; register a notification and add a
-                        // transaction blocker.
-                        if let Some(client) = surface.client() {
+                    if let Some(client) = surface.client() {
+                        // If this is the last pending, the transaction will complete by the end
+                        // of this pre-commit hook, so the completion notification is not needed.
+                        if !transaction.is_last() {
                             transaction.add_notification(
                                 state.niri.blocker_cleared_tx.clone(),
                                 client.clone(),
                             );
-                            add_blocker(surface, transaction.blocker());
                         }
+
+                        // Register this commit into the transaction's surface barrier. This adds
+                        // a blocker gating the commit on the transaction's completion, plus a
+                        // delayed barrier blocker that applies the states of all registered
+                        // surfaces atomically once each of them is ready. Buffer readiness is
+                        // handled by the per-surface blockers from the default dmabuf pre-commit
+                        // hook.
+                        transaction.register_surface(surface, &state.niri.surface_barriers);
                     }
 
-                    // Delay dropping (and completing) the transaction until the dmabuf is ready.
-                    // If there's no dmabuf, this will be dropped by the end of this pre-commit
-                    // hook.
-                    transaction_for_dmabuf = Some(transaction);
+                    // The transaction drops (and possibly completes) by the end of this
+                    // pre-commit hook; the surface barrier takes care of delaying the state
+                    // application until every participant is ready.
+                    drop(transaction);
                 }
             }
 
@@ -1545,39 +1506,6 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
         } else if !got_unmapped {
             error!("commit on a mapped surface without a configured serial");
         };
-
-        if let Some(client) = surface.client() {
-            if let Some(dmabuf) = dmabuf {
-                let mut blocker_added = false;
-                if let Some(acquire_point) = acquire_point {
-                    if let Ok((blocker, source)) = acquire_point.generate_blocker() {
-                        blocker_added = try_add_pre_commit_blocker!(
-                            state,
-                            surface,
-                            client,
-                            blocker,
-                            source,
-                            transaction_for_dmabuf,
-                            "syncobj"
-                        );
-                    }
-                }
-
-                if !blocker_added {
-                    if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
-                        let _ = try_add_pre_commit_blocker!(
-                            state,
-                            surface,
-                            client,
-                            blocker,
-                            source,
-                            transaction_for_dmabuf,
-                            "dmabuf"
-                        );
-                    }
-                }
-            }
-        }
 
         let window = mapped.window.clone();
         if got_unmapped {

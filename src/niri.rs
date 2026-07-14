@@ -13,6 +13,7 @@ use std::{env, mem, thread};
 use _server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as KdeDecorationsMode;
 use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
+use calloop::ping::make_ping;
 use niri_config::debug::PreviewRender;
 use niri_config::output::{HdrMode, MaxBpc};
 use niri_config::{
@@ -150,11 +151,6 @@ use crate::layout::{
 use crate::niri_render_elements;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
-use smithay::wayland::color::management::{
-    ColorManagementState, ColorManagementSurfaceCachedState, Feature, ImageDescription,
-    Primaries as CmPrimaries, PrimariesOption as CmPrimariesOption, RenderIntent,
-    TransferFunction as CmTransferFunction,
-};
 use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
@@ -185,6 +181,7 @@ use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
+use crate::utils::transaction::SurfaceBarriers;
 use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
@@ -195,6 +192,11 @@ use crate::utils::{
 };
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
+use smithay::wayland::color::management::{
+    ColorManagementState, ColorManagementSurfaceCachedState, Feature, ImageDescription,
+    Primaries as CmPrimaries, PrimariesOption as CmPrimariesOption, RenderIntent,
+    TransferFunction as CmTransferFunction,
+};
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 
@@ -266,6 +268,7 @@ pub struct Niri {
     /// Clients to notify about their blockers being cleared.
     pub blocker_cleared_tx: Sender<Client>,
     pub blocker_cleared_rx: Receiver<Client>,
+    pub surface_barriers: SurfaceBarriers,
 
     pub output_state: HashMap<Output, OutputState>,
 
@@ -825,6 +828,16 @@ impl State {
         // Handle commits for surfaces whose blockers cleared this cycle. This should happen before
         // layout.refresh() since this is where these surfaces handle commits.
         self.notify_blocker_cleared();
+
+        // Release surface barriers whose every surface became ready, applying their pending
+        // states atomically. Processing the notifications above can complete transactions and
+        // thereby make barriers ready, so this comes right after, and before layout.refresh()
+        // which handles the resulting commits.
+        {
+            let display_handle = self.niri.display_handle.clone();
+            let surface_barriers = self.niri.surface_barriers.clone();
+            surface_barriers.release_ready(&display_handle, self);
+        }
 
         // These should be called periodically, before flushing the clients.
         self.niri.popups.cleanup();
@@ -2525,6 +2538,14 @@ impl Niri {
 
         let (blocker_cleared_tx, blocker_cleared_rx) = mpsc::channel();
 
+        let (barrier_ping, barrier_ping_source) = make_ping().unwrap();
+        // The ping only needs to wake the event loop; the barriers are polled and released in
+        // State::refresh().
+        event_loop
+            .insert_source(barrier_ping_source, |_, _, _| ())
+            .unwrap();
+        let surface_barriers = SurfaceBarriers::new(barrier_ping);
+
         fn client_is_unrestricted(client: &Client) -> bool {
             !client.get_data::<ClientState>().unwrap().restricted
         }
@@ -2822,6 +2843,7 @@ impl Niri {
             dmabuf_pre_commit_hook: HashMap::new(),
             blocker_cleared_tx,
             blocker_cleared_rx,
+            surface_barriers,
             monitors_active: true,
             is_lid_closed: false,
 

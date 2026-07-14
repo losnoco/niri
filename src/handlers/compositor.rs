@@ -192,8 +192,6 @@ impl CompositorHandler for State {
                         })
                         .map(|(mapped, _)| mapped.window.clone());
 
-                    // The mapped pre-commit hook deals with dma-bufs on its own.
-                    self.remove_default_dmabuf_pre_commit_hook(surface);
                     let hook = add_mapped_toplevel_pre_commit_hook(toplevel);
                     let mapped = {
                         let config = self.niri.config.borrow();
@@ -296,12 +294,14 @@ impl CompositorHandler for State {
 
                     self.niri.window_mru_ui.remove_window(id);
                     self.niri.layout.remove_window(&window, transaction.clone());
-                    self.add_default_dmabuf_pre_commit_hook(surface);
 
                     // If this is the only instance, then this transaction will complete
                     // immediately, so no need to set the timer.
                     if !transaction.is_last() {
-                        transaction.register_deadline_timer(&self.niri.event_loop);
+                        transaction.register_deadline_timer(
+                            &self.niri.event_loop,
+                            &self.niri.display_handle,
+                        );
                     }
 
                     if was_active {
@@ -600,14 +600,6 @@ impl State {
         if let Some(prev) = self.niri.dmabuf_pre_commit_hook.insert(s, hook) {
             error!("tried to add dmabuf pre-commit hook when there was already one");
             remove_pre_commit_hook(surface, &prev);
-        }
-    }
-
-    pub fn remove_default_dmabuf_pre_commit_hook(&mut self, surface: &WlSurface) {
-        if let Some(hook) = self.niri.dmabuf_pre_commit_hook.remove(surface) {
-            remove_pre_commit_hook(surface, &hook);
-        } else {
-            error!("tried to remove dmabuf pre-commit hook but there was none");
         }
     }
 }
