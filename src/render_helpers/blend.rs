@@ -33,6 +33,52 @@ use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 /// Default SDR reference white in cd/m² (BT.2408).
 pub const DEFAULT_REFERENCE_LUMINANCE: f64 = 203.;
 
+/// Relative headroom below which tone mapping is skipped and clipping suffices (KWin uses the
+/// same epsilon).
+const TONEMAP_ETA: f64 = 1.001;
+
+/// Whether tone mapping is enabled at all; `NIRI_DISABLE_TONEMAPPING=1` restores the previous
+/// clip-at-the-output-volume behavior (mirroring `KWIN_DISABLE_TONEMAPPING`).
+fn tonemapping_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NIRI_DISABLE_TONEMAPPING").is_none_or(|v| v != "1"))
+}
+
+/// Whether content peaking at `content_max` cd/m² needs tone mapping into an output peaking
+/// at `output_max` cd/m² (with a little headroom slack, like KWin, so clipping handles
+/// near-misses).
+fn tonemap_needed(content_max: Option<u32>, output_max: f64) -> bool {
+    tonemapping_enabled()
+        && output_max > 0.
+        && content_max.is_some_and(|max| f64::from(max) > output_max * TONEMAP_ETA)
+}
+
+/// The parameter `v` of the modified Reinhard curve `f(l) = l * (1 + l*v) / (1 + l)` (KWin's
+/// `ColorTonemapper`), solved so that `f(input_range) = output_range`, with the ranges
+/// relative to the reference white. The curve satisfies `f(0) = 0` and `f(x) <= x`, and with
+/// `input_range -> infinity`, `f(1) = 0.5`: reference-white content dims by at most half.
+fn tonemap_curve_v(input_range: f64, output_range: f64) -> f64 {
+    (output_range * (1. + input_range) - input_range) / (input_range * input_range)
+}
+
+/// The peak luminance in cd/m² an output can represent, for tone mapping decisions.
+///
+/// HDR outputs peak at the sink's EDID desired-content-max-luminance; without that
+/// information the PQ ceiling is used, which disables tone mapping (the sink then maps
+/// internally, as before). SDR outputs peak at the reference white: everything brighter is
+/// HDR headroom the signal cannot carry.
+pub fn output_peak_luminance(blend_hdr: bool, reference_luminance: f64, edid_max: u16) -> f64 {
+    if blend_hdr {
+        if edid_max > 0 {
+            f64::from(edid_max)
+        } else {
+            10000.
+        }
+    } else {
+        reference_luminance
+    }
+}
+
 /// The container gamut of content, relative to the two spaces niri blends in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ContentGamut {
@@ -100,9 +146,19 @@ pub enum ContentColor {
     /// Client content encoded as HDR PQ (or HLG, which niri passes through like PQ).
     /// BT.2020-container content passes through numerically on HDR frames; other containers
     /// are decoded, converted and re-encoded. Converted back to SDR for capture.
+    ///
+    /// Content whose peak luminance exceeds what the output can represent is tone mapped
+    /// during composition (a modified Reinhard curve on the ICtCp intensity, like KWin):
+    /// on SDR frames the headroom above reference white is compressed instead of clipped,
+    /// and on HDR outputs the content peak is compressed into the sink's EDID peak.
     HdrPq {
         /// The container primaries of the content.
         gamut: ContentGamut,
+        /// Peak luminance of the content in cd/m² (max CLL, else the mastering display max,
+        /// else the transfer function default — 10,000 for PQ, 1,000 for HLG), or `None` for
+        /// display-referred content (the Windows-BT.2100 stimulus encoding), which is exempt
+        /// from tone mapping by definition and only ever clamped.
+        max_lum: Option<u32>,
     },
     /// Extended-linear content: Windows scRGB or a parametric `ext_linear` image description
     /// (what Mesa's Vulkan WSI attaches for `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`
@@ -150,7 +206,12 @@ impl ContentColor {
         // the same way) is blend-space-encoded content, everything else is SDR. Notably an
         // SDR transfer in a BT.2020 container is *wide-gamut SDR*, not HDR.
         match desc.transfer {
-            CmTransferFunction::St2084Pq | CmTransferFunction::Hlg => ContentColor::HdrPq { gamut },
+            CmTransferFunction::St2084Pq | CmTransferFunction::Hlg => ContentColor::HdrPq {
+                gamut,
+                // Windows-BT.2100 content is display-referred for a PQ-mode screen and thus
+                // exempt from tone mapping, like Windows-scRGB.
+                max_lum: (!desc.windows_bt2100).then(|| desc.max_luminance().max(1)),
+            },
             _ => ContentColor::Sdr { gamut },
         }
     }
@@ -212,7 +273,11 @@ fn gamut_uniforms(enabled: bool, matrix: Option<Mat3>) -> [Uniform<'static>; 2] 
 ///
 /// `blend_hdr` and `reference_luminance` describe the output: an HDR (PQ/BT.2020) blend space
 /// with the configured SDR reference white, or an SDR output (where the shaders assume the
-/// default 203 cd/m² reference, so callers should pass that).
+/// default 203 cd/m² reference, so callers should pass that). `peak_luminance` is the
+/// output's peak in cd/m² (see [`output_peak_luminance`]): content the shaders would *tone
+/// map* into that peak returns `None`, since the parametric decode/multiply/matrix/encode
+/// pipeline cannot express the tone mapping curve — the element must stay composited so the
+/// shaders can apply it.
 ///
 /// The math mirrors `niri_blend` in `shaders/hdr.frag` stage by stage; the kernel's named
 /// `PQ 125` curves use a linear scale of 1.0 = 80 cd/m², hence the /80 in the multipliers
@@ -225,8 +290,15 @@ pub fn scanout_color_transform(
     content: ContentColor,
     blend_hdr: bool,
     reference_luminance: f64,
-) -> ScanoutColorTransform {
-    if blend_hdr {
+    peak_luminance: f64,
+) -> Option<ScanoutColorTransform> {
+    if let ContentColor::HdrPq { max_lum, .. } = content {
+        if tonemap_needed(max_lum, peak_luminance) {
+            return None;
+        }
+    }
+
+    Some(if blend_hdr {
         match content {
             // Pure 2.2 decode, scale reference white to its luminance, convert the gamut,
             // encode as PQ.
@@ -239,7 +311,7 @@ pub fn scanout_color_transform(
             // BT.2020-container PQ is already encoded in the blend space; other containers
             // are decoded, gamut-converted in linear light and re-encoded (matching the
             // shaders' niri_pq_gamut path).
-            ContentColor::HdrPq { gamut } => match gamut.matrix_to(true) {
+            ContentColor::HdrPq { gamut, .. } => match gamut.matrix_to(true) {
                 None => ScanoutColorTransform::IDENTITY,
                 Some(m) => ScanoutColorTransform {
                     decode: Some(Curve1DType::Pq125Eotf),
@@ -267,8 +339,10 @@ pub fn scanout_color_transform(
             // (the shaders don't convert wide-gamut SDR on SDR outputs either).
             ContentColor::Sdr { .. } => ScanoutColorTransform::IDENTITY,
             // PQ decode, anchor the reference white to display white (clamping the headroom
-            // away at the encode), convert the gamut, gamma-encode.
-            ContentColor::HdrPq { gamut } => ScanoutColorTransform {
+            // away at the encode), convert the gamut, gamma-encode. Only reachable with tone
+            // mapping disabled (or display-referred content): PQ content above the reference
+            // white otherwise tone maps and returns `None` above.
+            ContentColor::HdrPq { gamut, .. } => ScanoutColorTransform {
                 decode: Some(Curve1DType::Pq125Eotf),
                 multiplier: 80. / reference_luminance,
                 ctm: gamut.matrix_to(false).map(mat3_to_ctm),
@@ -287,7 +361,7 @@ pub fn scanout_color_transform(
                 encode: Some(Curve1DType::Gamma22Inv),
             },
         }
-    }
+    })
 }
 
 /// The blend state of the frame currently being rendered, stored in the renderer's EGL user
@@ -299,6 +373,9 @@ pub fn scanout_color_transform(
 pub struct FrameBlendState {
     hdr_pq: Cell<bool>,
     ref_lum_scale: Cell<f32>,
+    /// The output's peak luminance in cd/m² (SDR frames: the reference white), for tone
+    /// mapping decisions; 0 = unknown, tone mapping disabled.
+    max_luminance: Cell<f32>,
 }
 
 impl FrameBlendState {
@@ -315,16 +392,26 @@ impl FrameBlendState {
             .expect("FrameBlendState::init() must be called when creating the renderer")
     }
 
-    /// Marks the frames rendered from now on as HDR with the given SDR reference luminance,
-    /// or as SDR (`None`).
-    pub fn set(renderer: &mut GlesRenderer, reference_luminance: Option<f64>) {
+    /// Marks the frames rendered from now on as HDR with the given SDR reference luminance
+    /// and output peak luminance (both cd/m²), or as SDR (`None`).
+    ///
+    /// SDR frames tone map HDR content into the reference white the shaders assume for them
+    /// (the BT.2408 default, matching the scanout transforms for SDR outputs).
+    pub fn set(renderer: &mut GlesRenderer, blend: Option<(f64, f64)>) {
         let state = Self::get(renderer);
-        match reference_luminance {
-            Some(lum) => {
+        match blend {
+            Some((ref_lum, max_lum)) => {
                 state.hdr_pq.set(true);
-                state.ref_lum_scale.set((lum / 10000.) as f32);
+                state.ref_lum_scale.set((ref_lum / 10000.) as f32);
+                state.max_luminance.set(max_lum as f32);
             }
-            None => state.hdr_pq.set(false),
+            None => {
+                state.hdr_pq.set(false);
+                state
+                    .ref_lum_scale
+                    .set((DEFAULT_REFERENCE_LUMINANCE / 10000.) as f32);
+                state.max_luminance.set(DEFAULT_REFERENCE_LUMINANCE as f32);
+            }
         }
     }
 
@@ -334,15 +421,20 @@ impl FrameBlendState {
         state
             .ref_lum_scale
             .set((reference_luminance / 10000.) as f32);
+        state.max_luminance.set(reference_luminance as f32);
     }
 
-    fn values_from_frame(frame: &GlesFrame) -> (bool, f32) {
+    fn values_from_frame(frame: &GlesFrame) -> (bool, f32, f32) {
         let state: &Self = frame
             .egl_context()
             .user_data()
             .get()
             .expect("FrameBlendState::init() must be called when creating the renderer");
-        (state.hdr_pq.get(), state.ref_lum_scale.get())
+        (
+            state.hdr_pq.get(),
+            state.ref_lum_scale.get(),
+            state.max_luminance.get(),
+        )
     }
 
     pub fn is_hdr_frame(frame: &GlesFrame) -> bool {
@@ -362,7 +454,7 @@ impl FrameBlendState {
     /// declared when the program was compiled. Over-declaring is harmless (names the GLSL does
     /// not use resolve to location -1, which GL ignores), so programs declare the full set
     /// even when they only use a subset.
-    pub fn uniform_names() -> [UniformName<'static>; 9] {
+    pub fn uniform_names() -> [UniformName<'static>; 13] {
         [
             UniformName::new("niri_hdr_pq", UniformType::_1f),
             UniformName::new("niri_ref_lum_scale", UniformType::_1f),
@@ -373,12 +465,48 @@ impl FrameBlendState {
             UniformName::new("niri_pq_gamut", UniformType::_1f),
             UniformName::new("niri_use_gamut", UniformType::_1f),
             UniformName::new("niri_gamut", UniformType::Matrix3x3),
+            UniformName::new("niri_tonemap", UniformType::_1f),
+            UniformName::new("niri_tm_v", UniformType::_1f),
+            UniformName::new("niri_tm_ref_scale", UniformType::_1f),
+            UniformName::new("niri_tm_out_scale", UniformType::_1f),
+        ]
+    }
+
+    /// The tone mapping uniforms for a draw of content peaking at `max_in` cd/m² into an
+    /// output peaking at `max_out` cd/m² with reference white `ref_lum` cd/m², or the
+    /// disabled state when tone mapping does not apply.
+    ///
+    /// The curve parameter `v` is derived like KWin's `ColorTonemapper` so that
+    /// `f(input_range) = output_range` (ranges relative to the reference white); the shader
+    /// applies `f(l) = l * (1 + l*v) / (1 + l)` to the ICtCp intensity.
+    fn tonemap_uniforms(
+        enabled: bool,
+        max_in: f64,
+        ref_lum: f64,
+        max_out: f64,
+    ) -> [Uniform<'static>; 4] {
+        if !enabled || ref_lum <= 0. || max_out <= 0. {
+            return [
+                Uniform::new("niri_tonemap", 0.0f32),
+                Uniform::new("niri_tm_v", 0.0f32),
+                Uniform::new("niri_tm_ref_scale", 0.0f32),
+                Uniform::new("niri_tm_out_scale", 0.0f32),
+            ];
+        }
+        let input_range = max_in / ref_lum;
+        let output_range = max_out / ref_lum;
+        let v = tonemap_curve_v(input_range, output_range);
+        [
+            Uniform::new("niri_tonemap", 1.0f32),
+            Uniform::new("niri_tm_v", v as f32),
+            Uniform::new("niri_tm_ref_scale", (ref_lum / 10000.) as f32),
+            Uniform::new("niri_tm_out_scale", (max_out / 10000.) as f32),
         ]
     }
 
     /// The `niri_blend` uniform values for content already rendered in the frame blend space.
     pub fn uniforms_for_blend_space(frame: &GlesFrame) -> Vec<Uniform<'static>> {
-        let (_, scale) = Self::values_from_frame(frame);
+        let (_, scale, _) = Self::values_from_frame(frame);
         let mut uniforms = vec![
             Uniform::new("niri_hdr_pq", 0.0f32),
             Uniform::new("niri_ref_lum_scale", scale),
@@ -389,6 +517,7 @@ impl FrameBlendState {
             Uniform::new("niri_pq_gamut", 0.0f32),
         ];
         uniforms.extend(gamut_uniforms(false, None));
+        uniforms.extend(Self::tonemap_uniforms(false, 0., 0., 0.));
         uniforms
     }
 
@@ -403,21 +532,32 @@ impl FrameBlendState {
     /// extended-linear encode. HDR PQ content is converted back to SDR when drawn into SDR
     /// capture buffers.
     pub fn uniforms_for_content(frame: &GlesFrame, content: ContentColor) -> Vec<Uniform<'static>> {
-        let (hdr_pq, scale) = Self::values_from_frame(frame);
+        let (hdr_pq, scale, max_luminance) = Self::values_from_frame(frame);
 
         let is_pq = matches!(content, ContentColor::HdrPq { .. });
         let sdr_to_hdr = hdr_pq && !is_pq;
         let hdr_to_sdr = !hdr_pq && is_pq;
+
+        // Tone mapping applies to PQ content whose peak exceeds the frame's output peak:
+        // the reference white of the frame anchors the curve, so on SDR frames (peak =
+        // reference white) the headroom compresses into the SDR range.
+        let tonemap = match content {
+            ContentColor::HdrPq { max_lum, .. } => {
+                tonemap_needed(max_lum, f64::from(max_luminance))
+            }
+            _ => false,
+        };
 
         // The gamut conversion into the frame's blend space, when the draw transforms the
         // content at all (SDR content on SDR frames passes through untouched).
         let gamut = match content {
             ContentColor::Sdr { .. } if !hdr_pq => None,
             ContentColor::Sdr { gamut } => Some(gamut.matrix_to(true)),
-            ContentColor::HdrPq { gamut } => {
+            ContentColor::HdrPq { gamut, .. } => {
                 let matrix = gamut.matrix_to(hdr_pq);
-                // On HDR frames, BT.2020-container PQ passes through without any transform.
-                if hdr_pq && matrix.is_none() {
+                // On HDR frames, BT.2020-container PQ passes through without any transform
+                // (unless it needs tone mapping, which forces the decode/re-encode path).
+                if hdr_pq && matrix.is_none() && !tonemap {
                     None
                 } else {
                     Some(matrix)
@@ -448,22 +588,33 @@ impl FrameBlendState {
             Uniform::new("niri_pq_gamut", if pq_gamut { 1.0f32 } else { 0.0 }),
         ];
         uniforms.extend(gamut_uniforms(gamut.is_some(), gamut.flatten()));
+        let max_in = match content {
+            ContentColor::HdrPq { max_lum, .. } => f64::from(max_lum.unwrap_or(0)),
+            _ => 0.,
+        };
+        uniforms.extend(Self::tonemap_uniforms(
+            tonemap,
+            max_in,
+            f64::from(scale) * 10000.,
+            f64::from(max_luminance),
+        ));
         uniforms
     }
 }
 
-/// Configures the renderer for rendering frames in the given blend space: `Some(reference
-/// luminance)` = HDR (PQ/BT.2020), `None` = SDR.
+/// Configures the renderer for rendering frames in the given blend space: `Some((reference
+/// luminance, output peak luminance))` = HDR (PQ/BT.2020), `None` = SDR.
 ///
 /// In HDR, texture draws using the default program go through the blend-space texture shader,
 /// solid colors are encoded on the CPU, and niri's own shader programs read the frame blend
-/// state for their `niri_blend` stage. Call with `None` after rendering the output so
-/// screencasts, screenshots and other outputs stay SDR.
-pub fn set_frame_blend(renderer: &mut GlesRenderer, reference_luminance: Option<f64>) {
-    FrameBlendState::set(renderer, reference_luminance);
+/// state for their `niri_blend` stage. PQ content brighter than the output peak is tone
+/// mapped at draw time. Call with `None` after rendering the output so screencasts,
+/// screenshots and other outputs stay SDR.
+pub fn set_frame_blend(renderer: &mut GlesRenderer, blend: Option<(f64, f64)>) {
+    FrameBlendState::set(renderer, blend);
 
-    match reference_luminance {
-        Some(lum) => {
+    match blend {
+        Some((lum, _)) => {
             let scale = (lum / 10000.) as f32;
             let program = Shaders::get(renderer).texture_hdr.clone();
             if let Some(program) = program {
@@ -483,6 +634,8 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, reference_luminance: Option<
                         // Plain sRGB content on the default path uses the shader's built-in
                         // constants.
                         Uniform::new("niri_use_gamut", 0.0f32),
+                        // ... and never needs tone mapping (reference white fits the output).
+                        Uniform::new("niri_tonemap", 0.0f32),
                     ],
                 )));
             } else {
@@ -637,14 +790,18 @@ fn adjust_tex_program_for_content(
             frame.set_tex_program_override(Some((program, uniforms)));
             Some(saved)
         }
-        ContentColor::HdrPq { gamut } => {
+        ContentColor::HdrPq { gamut, max_lum } => {
             let saved = frame.take_tex_program_override();
             if FrameBlendState::is_hdr_frame(frame) {
+                let (_, _, frame_max_lum) = FrameBlendState::values_from_frame(frame);
+                let tonemap = tonemap_needed(max_lum, f64::from(frame_max_lum));
                 match gamut.matrix_to(true) {
-                    // BT.2020-container PQ passes through numerically.
-                    None => saved.is_some().then_some(saved),
-                    // Other containers are decoded, converted and re-encoded.
-                    Some(_) => {
+                    // BT.2020-container PQ within the output's peak passes through
+                    // numerically.
+                    None if !tonemap => saved.is_some().then_some(saved),
+                    // Other containers are decoded, converted and re-encoded; content
+                    // brighter than the output peak is additionally tone mapped.
+                    _ => {
                         let program = Shaders::get_from_frame(frame).texture_hdr.clone();
                         let Some(program) = saved.as_ref().map(|(p, _)| p.clone()).or(program)
                         else {
@@ -657,11 +814,19 @@ fn adjust_tex_program_for_content(
                 }
             } else if let Some(program) = Shaders::get_from_frame(frame).texture_hdr_to_sdr.clone()
             {
-                let ref_lum_scale = FrameBlendState::ref_lum_scale(frame);
+                let (_, ref_lum_scale, frame_max_lum) = FrameBlendState::values_from_frame(frame);
                 let mut uniforms = vec![Uniform::new("niri_ref_lum_scale", ref_lum_scale)];
                 // Convert the container gamut to BT.709; the uniform (rather than the
                 // shader's built-in 2020 constant) also covers non-2020 containers.
                 uniforms.extend(gamut_uniforms(true, gamut.matrix_to(false)));
+                // Compress the headroom above the SDR reference white instead of clipping
+                // it (uniform values persist in the program, so always set the state).
+                uniforms.extend(FrameBlendState::tonemap_uniforms(
+                    tonemap_needed(max_lum, f64::from(frame_max_lum)),
+                    f64::from(max_lum.unwrap_or(0)),
+                    f64::from(ref_lum_scale) * 10000.,
+                    f64::from(frame_max_lum),
+                ));
                 frame.override_default_tex_program(program, uniforms);
                 Some(saved)
             } else {
@@ -874,13 +1039,42 @@ mod tests {
         assert_eq!(
             ContentColor::from_description(Some(pq)),
             ContentColor::HdrPq {
-                gamut: ContentGamut::Bt2020
+                gamut: ContentGamut::Bt2020,
+                // No explicit luminance information: the PQ ceiling.
+                max_lum: Some(10_000),
             }
         );
+        // Windows-BT.2100 content is display-referred and exempt from tone mapping.
         assert_eq!(
             ContentColor::from_description(Some(ImageDescription::WINDOWS_BT2100)),
             ContentColor::HdrPq {
-                gamut: ContentGamut::Bt2020
+                gamut: ContentGamut::Bt2020,
+                max_lum: None,
+            }
+        );
+
+        // Explicit content light level information tightens the tone mapping bound.
+        let pq_mastered = ImageDescription {
+            max_cll: Some(1_000),
+            mastering_luminance: Some((0, 4_000)),
+            ..pq
+        };
+        assert_eq!(
+            ContentColor::from_description(Some(pq_mastered)),
+            ContentColor::HdrPq {
+                gamut: ContentGamut::Bt2020,
+                max_lum: Some(1_000),
+            }
+        );
+        let pq_mastered_no_cll = ImageDescription {
+            mastering_luminance: Some((0, 4_000)),
+            ..pq
+        };
+        assert_eq!(
+            ContentColor::from_description(Some(pq_mastered_no_cll)),
+            ContentColor::HdrPq {
+                gamut: ContentGamut::Bt2020,
+                max_lum: Some(4_000),
             }
         );
 
@@ -897,7 +1091,8 @@ mod tests {
         assert_eq!(
             ContentColor::from_description(Some(pq_p3)),
             ContentColor::HdrPq {
-                gamut: ContentGamut::Custom(p3_chroma)
+                gamut: ContentGamut::Custom(p3_chroma),
+                max_lum: Some(10_000),
             }
         );
 
@@ -939,27 +1134,45 @@ mod tests {
         let srgb = ContentGamut::Srgb;
         let bt2020 = ContentGamut::Bt2020;
 
+        // An output without EDID luminance information: the PQ ceiling, no tone mapping.
+        let peak = 10_000.;
+
         // SDR on an HDR output: gamma 2.2 decode, reference white at 203 cd/m² = a gain of
         // 203/80 on the PQ-125 linear scale, 709 -> 2020, PQ encode.
-        let sdr = scanout_color_transform(ContentColor::Sdr { gamut: srgb }, true, 203.);
+        let sdr =
+            scanout_color_transform(ContentColor::Sdr { gamut: srgb }, true, 203., peak).unwrap();
         assert_eq!(sdr.decode, Some(Curve1DType::Gamma22));
         assert!((sdr.multiplier - 2.5375).abs() < 1e-9);
         assert_eq!(sdr.ctm, Some(mat3_to_ctm(BT709_TO_BT2020)));
         assert_eq!(sdr.encode, Some(Curve1DType::Pq125InvEotf));
 
         // BT.2020-container PQ on an HDR output passes through numerically, like the shaders.
-        assert!(
-            scanout_color_transform(ContentColor::HdrPq { gamut: bt2020 }, true, 203.)
-                .is_identity()
-        );
+        let pq_2020 = ContentColor::HdrPq {
+            gamut: bt2020,
+            max_lum: Some(10_000),
+        };
+        assert!(scanout_color_transform(pq_2020, true, 203., peak)
+            .unwrap()
+            .is_identity());
         // ... and anything on an SDR output that is already SDR needs no transform.
         assert!(
-            scanout_color_transform(ContentColor::Sdr { gamut: srgb }, false, 203.).is_identity()
+            scanout_color_transform(ContentColor::Sdr { gamut: srgb }, false, 203., 203.)
+                .unwrap()
+                .is_identity()
         );
 
         // PQ in a Display-P3 container on an HDR output: decode, convert, re-encode.
         let p3 = ContentGamut::Custom(Chromaticities::from_named(CmPrimaries::DisplayP3));
-        let pq_p3 = scanout_color_transform(ContentColor::HdrPq { gamut: p3 }, true, 203.);
+        let pq_p3 = scanout_color_transform(
+            ContentColor::HdrPq {
+                gamut: p3,
+                max_lum: Some(10_000),
+            },
+            true,
+            203.,
+            peak,
+        )
+        .unwrap();
         assert_eq!(pq_p3.decode, Some(Curve1DType::Pq125Eotf));
         assert_eq!(pq_p3.multiplier, 1.0);
         assert_eq!(pq_p3.encode, Some(Curve1DType::Pq125InvEotf));
@@ -981,7 +1194,9 @@ mod tests {
             },
             true,
             203.,
-        );
+            peak,
+        )
+        .unwrap();
         assert_eq!(scrgb.decode, None);
         assert_eq!(scrgb.multiplier, 1.0);
         assert_eq!(scrgb.ctm, Some(mat3_to_ctm(BT709_TO_BT2020)));
@@ -996,12 +1211,24 @@ mod tests {
             },
             true,
             203.,
-        );
+            peak,
+        )
+        .unwrap();
         assert_eq!(linear_2020.ctm, None);
 
-        // PQ content on an SDR output: decode, anchor 203 cd/m² to display white,
-        // 2020 -> 709, gamma encode (clamping the headroom away).
-        let pq_on_sdr = scanout_color_transform(ContentColor::HdrPq { gamut: bt2020 }, false, 203.);
+        // Display-referred PQ content on an SDR output (exempt from tone mapping): decode,
+        // anchor 203 cd/m² to display white, 2020 -> 709, gamma encode (clamping the
+        // headroom away).
+        let pq_on_sdr = scanout_color_transform(
+            ContentColor::HdrPq {
+                gamut: bt2020,
+                max_lum: None,
+            },
+            false,
+            203.,
+            203.,
+        )
+        .unwrap();
         assert_eq!(pq_on_sdr.decode, Some(Curve1DType::Pq125Eotf));
         assert!((pq_on_sdr.multiplier - 80. / 203.).abs() < 1e-9);
         assert_eq!(pq_on_sdr.ctm, Some(mat3_to_ctm(BT2020_TO_BT709)));
@@ -1016,7 +1243,9 @@ mod tests {
             },
             false,
             203.,
-        );
+            203.,
+        )
+        .unwrap();
         assert_eq!(scrgb_on_sdr.decode, None);
         assert!((scrgb_on_sdr.multiplier - 80. / 203.).abs() < 1e-9);
         assert_eq!(scrgb_on_sdr.ctm, None);
@@ -1028,6 +1257,90 @@ mod tests {
             assert!((sum - 1.0).abs() < 1e-4, "row {row} sums to {sum}");
             let sum: f64 = BT2020_TO_BT709[row * 3..row * 3 + 3].iter().sum();
             assert!((sum - 1.0).abs() < 1e-4, "row {row} sums to {sum}");
+        }
+    }
+
+    #[test]
+    fn tone_mapped_content_is_denied_scanout() {
+        let bt2020 = ContentGamut::Bt2020;
+        let pq = |max_lum| ContentColor::HdrPq {
+            gamut: bt2020,
+            max_lum,
+        };
+
+        // PQ content brighter than the sink's EDID peak is tone mapped during composition;
+        // no parametric plane pipeline can express the curve, so scanout must be denied.
+        assert_eq!(
+            scanout_color_transform(pq(Some(10_000)), true, 203., 800.),
+            None
+        );
+        assert_eq!(
+            scanout_color_transform(pq(Some(1_000)), true, 203., 800.),
+            None
+        );
+        // Content within the peak scans out.
+        assert!(scanout_color_transform(pq(Some(750)), true, 203., 800.)
+            .unwrap()
+            .is_identity());
+        // A tiny overshoot is clipping territory, not tone mapping (the eta slack).
+        assert!(scanout_color_transform(pq(Some(800)), true, 203., 800.)
+            .unwrap()
+            .is_identity());
+        // Display-referred (Windows-BT.2100) content is exempt.
+        assert!(scanout_color_transform(pq(None), true, 203., 800.)
+            .unwrap()
+            .is_identity());
+
+        // On SDR outputs the peak is the reference white, so regular PQ content is always
+        // tone mapped (and composited).
+        assert_eq!(
+            scanout_color_transform(pq(Some(10_000)), false, 203., 203.),
+            None
+        );
+
+        // SDR and extended-linear content is never tone mapped.
+        assert!(
+            scanout_color_transform(ContentColor::Sdr { gamut: bt2020 }, true, 203., 800.)
+                .is_some()
+        );
+        assert!(scanout_color_transform(
+            ContentColor::Linear {
+                gamut: bt2020,
+                max_lum: 1_000,
+                ref_lum: 203,
+            },
+            true,
+            203.,
+            800.,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn tonemap_curve_hits_the_output_range() {
+        // f(l) = l * (1 + l*v) / (1 + l) with v solved for f(input_range) = output_range.
+        let f = |l: f64, v: f64| l * (1. + l * v) / (1. + l);
+
+        for (max_in, ref_lum, max_out) in [
+            (10_000., 203., 203.),  // HDR -> SDR
+            (10_000., 203., 800.),  // PQ ceiling -> 800-nit sink
+            (4_000., 203., 1_000.), // mastered content -> capable sink
+            (1_000., 100., 400.),   // dim reference white
+        ] {
+            let input_range = max_in / ref_lum;
+            let output_range = max_out / ref_lum;
+            let v = tonemap_curve_v(input_range, output_range);
+
+            // The peak maps exactly onto the output peak.
+            assert!((f(input_range, v) - output_range).abs() < 1e-9);
+            // Black stays black and the curve never brightens.
+            assert_eq!(f(0., v), 0.);
+            for i in 1..=100 {
+                let l = input_range * f64::from(i) / 100.;
+                assert!(f(l, v) <= l * (1. + 1e-9), "f({l}) = {} > {l}", f(l, v));
+            }
+            // Reference white dims by at most half.
+            assert!(f(1., v) >= 0.5 - 1e-9);
         }
     }
 

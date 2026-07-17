@@ -2625,7 +2625,9 @@ impl Niri {
 
     /// The per-element color transforms for direct scanout on this output, mapping every
     /// window surface to the plane color pipeline configuration that reproduces what the
-    /// blend shaders would do to it during composition.
+    /// blend shaders would do to it during composition, or `None` when no pipeline can (the
+    /// shaders tone map the content, which the parametric pipeline cannot express — the
+    /// element must stay composited).
     ///
     /// The TTY backend hands these to the `DrmCompositor` each frame; on HDR outputs it also
     /// denies scanout for elements *not* in the map, so nothing can bypass the blend space
@@ -2638,7 +2640,8 @@ impl Niri {
         output: &Output,
         blend_hdr: bool,
         reference_luminance: f64,
-    ) -> HashMap<Id, ScanoutColorTransform> {
+        peak_luminance: f64,
+    ) -> HashMap<Id, Option<ScanoutColorTransform>> {
         let mut transforms = HashMap::new();
         for mapped in self.layout.windows_for_output(output) {
             with_surface_tree_downward(
@@ -2657,7 +2660,12 @@ impl Niri {
                     let content = ContentColor::from_description(desc);
                     transforms.insert(
                         Id::from_wayland_resource(surface),
-                        scanout_color_transform(content, blend_hdr, reference_luminance),
+                        scanout_color_transform(
+                            content,
+                            blend_hdr,
+                            reference_luminance,
+                            peak_luminance,
+                        ),
                     );
                 },
                 |_, _, _| true,

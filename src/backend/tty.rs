@@ -412,10 +412,10 @@ struct Surface {
     /// The last color state we tried to stage and the driver rejected. Tracked so a rejected
     /// state isn't re-tested every frame (each test is an atomic TEST_ONLY commit).
     failed_color_state: Option<ConnectorColorState>,
-    /// The blend space of the last rendered frame: `Some(reference luminance)` = HDR, `None`
-    /// = SDR. Blend changes alter shader output without damaging anything, so a change forces
-    /// a full redraw.
-    last_blend: Option<Option<f64>>,
+    /// The blend space of the last rendered frame: `Some((reference luminance, peak
+    /// luminance))` = HDR, `None` = SDR. Blend changes alter shader output without damaging
+    /// anything, so a change forces a full redraw.
+    last_blend: Option<Option<(f64, f64)>>,
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     gamma_props: Option<GammaProps>,
     /// Gamma change to apply upon session resume.
@@ -2338,13 +2338,21 @@ impl Tty {
         // content can still be scanned out directly. On HDR outputs, unlisted elements are
         // denied scanout entirely so raw values can never bypass the blend space. On SDR
         // outputs the shaders assume the default reference white regardless of config.
+        // Content the shaders would tone map is denied scanout too (the parametric pipeline
+        // cannot express the curve), so composition and scanout never disagree.
         let scanout_ref_lum = if blend_hdr {
             reference_luminance
         } else {
             DEFAULT_REFERENCE_LUMINANCE
         };
+        let peak_luminance = blend::output_peak_luminance(
+            blend_hdr,
+            scanout_ref_lum,
+            surface.edid_hdr.max_luminance,
+        );
         #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
-        let transforms = niri.scanout_color_transforms(output, blend_hdr, scanout_ref_lum);
+        let transforms =
+            niri.scanout_color_transforms(output, blend_hdr, scanout_ref_lum, peak_luminance);
         surface
             .compositor
             .use_color_transforms(transforms, blend_hdr);
@@ -2352,13 +2360,13 @@ impl Tty {
         // A blend-space change alters what every shader outputs without any element damage;
         // force a full redraw. The cursor plane's contents bypass the renderer entirely, so
         // they get the equivalent sRGB-to-PQ encode on the CPU instead.
-        let blend = blend_hdr.then_some(reference_luminance);
+        let blend = blend_hdr.then_some((reference_luminance, peak_luminance));
         if surface.last_blend != Some(blend) {
             surface.last_blend = Some(blend);
             surface.compositor.reset_buffers();
             surface
                 .compositor
-                .set_cursor_buffer_transform(blend.map(|ref_lum| {
+                .set_cursor_buffer_transform(blend.map(|(ref_lum, _)| {
                     let scale = (ref_lum / 10000.) as f32;
                     Box::new(move |data: &mut [u8], stride: u32, size: (u32, u32)| {
                         blend::srgb_to_pq_argb8888(data, stride, size, scale);
