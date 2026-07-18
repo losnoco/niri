@@ -3885,23 +3885,32 @@ fn build_hdr_metadata(desc: &ImageDescription, edid: &EdidHdrInfo) -> HdrOutputM
     // Clamps a client-provided value to the sink's EDID capability, when the EDID has one.
     let clamp_to = |v: u16, edid_cap: u16| if edid_cap > 0 { v.min(edid_cap) } else { v };
 
+    // CTA-861.3 defines 0 as "unknown" for the luminance fields, and clients do send explicit
+    // zeros. Treat them as absent so they fall back to the EDID values: forwarding a 0 tells
+    // the sink nothing, but the resulting metadata change forces a connector commit (a
+    // seconds-long blank resync on some driver/sink combinations) every time fullscreen HDR
+    // content appears or disappears.
     let max_luminance = desc
         .mastering_luminance
+        .filter(|(_, max)| *max > 0)
         .map(|(_, max)| clamp_to(to_u16(max), edid.max_luminance))
         .or((edid.max_luminance > 0).then_some(edid.max_luminance))
         .unwrap_or(500);
     let min_luminance = desc
         .mastering_luminance
+        .filter(|(_, max)| *max > 0)
         .map(|(min, _)| to_u16(min).max(edid.min_luminance))
         .or((edid.min_luminance > 0).then_some(edid.min_luminance))
         .unwrap_or(50);
     let max_cll = desc
         .max_cll
+        .filter(|v| *v > 0)
         .map(|v| clamp_to(to_u16(v), edid.max_luminance))
         .or((edid.max_luminance > 0).then_some(edid.max_luminance))
         .unwrap_or(500);
     let max_fall = desc
         .max_fall
+        .filter(|v| *v > 0)
         .map(|v| clamp_to(to_u16(v), edid.max_frame_avg_luminance))
         .or((edid.max_frame_avg_luminance > 0).then_some(edid.max_frame_avg_luminance))
         .unwrap_or(500);
