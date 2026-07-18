@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::os::unix::io::BorrowedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -35,6 +36,7 @@ use smithay::backend::renderer::element::{
 };
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
+use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::backend::renderer::Color32F;
 use smithay::desktop::utils::{
     bbox_from_surface_tree, output_update, send_dmabuf_feedback_surface_tree,
@@ -5680,6 +5682,24 @@ impl Niri {
                 |_, _, _| true,
             );
         }
+    }
+
+    /// Stamps the frame's render fence onto the buffers of all surfaces on this output.
+    ///
+    /// Explicit-sync release points then signal on GPU completion of the frame that last
+    /// sampled the buffer, rather than immediately when the buffer is replaced. Stamping is
+    /// deliberately unfiltered: for surfaces that were direct scanned out or skipped this
+    /// frame, the fence is merely conservative (this frame's rendering finishes no earlier
+    /// than any previous read on the same context), and buffers without a release point
+    /// ignore it.
+    pub fn stamp_release_fences(&self, output: &Output, fence: BorrowedFd<'_>) {
+        self.for_each_output_surface(output, |_, states| {
+            if let Some(state) = states.data_map.get::<RendererSurfaceStateUserData>() {
+                if let Some(buffer) = state.lock().unwrap().buffer() {
+                    buffer.set_release_fence(fence);
+                }
+            }
+        });
     }
 
     pub fn add_syncobj_state(&mut self, device_fd: smithay::backend::drm::DrmDeviceFd) {

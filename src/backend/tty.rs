@@ -2473,10 +2473,21 @@ impl Tty {
                         .debug
                         .wait_for_frame_completion_before_queueing;
                 if needs_sync {
-                    if let PrimaryPlaneElement::Swapchain(element) = res.primary_element {
+                    if let PrimaryPlaneElement::Swapchain(element) = &res.primary_element {
                         let _span = tracy_client::span!("wait for completion");
                         if let Err(err) = element.sync.wait() {
                             warn!("error waiting for frame completion: {err:?}");
+                        }
+                    }
+                }
+
+                // Stamp the frame's render fence onto the sampled buffers, so explicit-sync
+                // release points signal on GPU completion rather than on buffer replacement.
+                if niri.syncobj_state.is_some() && !res.is_empty {
+                    if let PrimaryPlaneElement::Swapchain(element) = &res.primary_element {
+                        let _span = tracy_client::span!("export release fence");
+                        if let Some(fence) = element.sync.export() {
+                            niri.stamp_release_fences(output, fence.as_fd());
                         }
                     }
                 }
