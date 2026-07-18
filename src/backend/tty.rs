@@ -2367,9 +2367,9 @@ impl Tty {
             surface
                 .compositor
                 .set_cursor_buffer_transform(blend.map(|(ref_lum, _)| {
-                    let scale = (ref_lum / 10000.) as f32;
+                    let encoder = blend::SrgbToPqEncoder::new((ref_lum / 10000.) as f32);
                     Box::new(move |data: &mut [u8], stride: u32, size: (u32, u32)| {
-                        blend::srgb_to_pq_argb8888(data, stride, size, scale);
+                        encoder.apply(data, stride, size);
                     }) as Box<_>
                 }));
         }
@@ -2436,11 +2436,17 @@ impl Tty {
             }
 
             if blend_hdr {
-                // The cursor plane is filled without going through GLES; its contents are
-                // encoded into the blend space on the CPU instead (see
-                // set_cursor_buffer_transform above), which assumes plain sRGB content. The
-                // rare non-SDR client cursor falls back to primary-plane composition.
-                if !niri.cursor_content_is_plain_sdr() {
+                // The cursor plane is filled without going through GLES; its contents get a
+                // CPU blend-space encode on every cursor image change instead (see
+                // set_cursor_buffer_transform above). That's still main-thread work per
+                // change, so composite the cursor by default and keep the plane opt-in.
+                if debug.enable_cursor_plane_on_hdr {
+                    // The CPU encode assumes plain sRGB content; the rare non-SDR client
+                    // cursor falls back to primary-plane composition.
+                    if !niri.cursor_content_is_plain_sdr() {
+                        flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
+                    }
+                } else {
                     flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
                 }
                 // Primary- and overlay-plane scanout stay allowed: every window surface has a

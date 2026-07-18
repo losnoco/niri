@@ -2301,6 +2301,7 @@ mod tests {
                 wait_for_frame_completion_before_queueing: false,
                 enable_overlay_planes: false,
                 disable_cursor_plane: false,
+                enable_cursor_plane_on_hdr: false,
                 disable_direct_scanout: false,
                 restrict_primary_scanout_to_matching_format: false,
                 force_disable_connectors_on_resume: false,

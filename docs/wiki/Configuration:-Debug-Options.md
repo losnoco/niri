@@ -15,6 +15,7 @@ debug {
     // preview-render "screen-capture"
     enable-overlay-planes
     disable-cursor-plane
+    enable-cursor-plane-on-hdr
     disable-direct-scanout
     restrict-primary-scanout-to-matching-format
     force-disable-connectors-on-resume
@@ -81,6 +82,20 @@ Useful to work around driver bugs on specific hardware.
 ```kdl
 debug {
     disable-cursor-plane
+}
+```
+
+### `enable-cursor-plane-on-hdr`
+
+Use the cursor plane on outputs composited in an HDR blend space, where niri normally composites the cursor on the primary plane instead.
+
+The cursor plane bypasses the renderer, so its contents need a CPU sRGB-to-PQ encode on every cursor image change; with this flag the encode runs (LUT-accelerated), and cursors whose content isn't plain SDR still fall back to compositing.
+
+Overridden by `disable-cursor-plane`.
+
+```kdl
+debug {
+    enable-cursor-plane-on-hdr
 }
 ```
 

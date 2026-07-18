@@ -659,61 +659,160 @@ pub fn set_sdr_capture_blend(renderer: &mut GlesRenderer, reference_luminance: f
     renderer.set_solid_color_transform(None);
 }
 
+/// The ST 2084 PQ inverse EOTF over clamped linear light.
+fn pq_encode(lin: f32) -> f32 {
+    const M1: f32 = 0.1593017578125;
+    const M2: f32 = 78.84375;
+    const C1: f32 = 0.8359375;
+    const C2: f32 = 18.8515625;
+    const C3: f32 = 18.6875;
+    let y = lin.clamp(0., 1.).powf(M1);
+    ((C1 + C2 * y) / (1. + C3 * y)).powf(M2)
+}
+
+/// BT.709 -> BT.2020, linear light, D65.
+fn bt709_to_bt2020(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    (
+        0.627404 * r + 0.329283 * g + 0.043313 * b,
+        0.069097 * r + 0.919540 * g + 0.011362 * b,
+        0.016391 * r + 0.088013 * g + 0.895595 * b,
+    )
+}
+
 /// CPU counterpart of the shaders' `niri_blend`: encodes an electrical sRGB premultiplied
 /// color into PQ/BT.2020 for the given SDR reference luminance scale (reference / 10000).
 pub fn srgb_to_pq(color: Color32F, ref_lum_scale: f32) -> Color32F {
     let a = color.a();
     let unpremul = |c: f32| if a > 0. { c / a } else { c };
 
-    let pq = |lin: f32| {
-        const M1: f32 = 0.1593017578125;
-        const M2: f32 = 78.84375;
-        const C1: f32 = 0.8359375;
-        const C2: f32 = 18.8515625;
-        const C3: f32 = 18.6875;
-        let y = lin.clamp(0., 1.).powf(M1);
-        ((C1 + C2 * y) / (1. + C3 * y)).powf(M2)
-    };
-
     let r = unpremul(color.r()).max(0.).powf(2.2);
     let g = unpremul(color.g()).max(0.).powf(2.2);
     let b = unpremul(color.b()).max(0.).powf(2.2);
 
-    // BT.709 -> BT.2020, linear light, D65.
-    let r2020 = 0.627404 * r + 0.329283 * g + 0.043313 * b;
-    let g2020 = 0.069097 * r + 0.919540 * g + 0.011362 * b;
-    let b2020 = 0.016391 * r + 0.088013 * g + 0.895595 * b;
+    let (r2020, g2020, b2020) = bt709_to_bt2020(r, g, b);
 
     Color32F::new(
-        pq(r2020 * ref_lum_scale) * a,
-        pq(g2020 * ref_lum_scale) * a,
-        pq(b2020 * ref_lum_scale) * a,
+        pq_encode(r2020 * ref_lum_scale) * a,
+        pq_encode(g2020 * ref_lum_scale) * a,
+        pq_encode(b2020 * ref_lum_scale) * a,
         a,
     )
 }
 
-/// CPU encode of a premultiplied ARGB8888 buffer (little-endian, so B,G,R,A bytes) from
-/// electrical sRGB into PQ/BT.2020, for the cursor plane on HDR outputs: its contents bypass
-/// the renderer, so the conversion the blend shaders would do runs here instead.
+/// LUT-accelerated CPU encode of a premultiplied ARGB8888 buffer (little-endian, so B,G,R,A
+/// bytes) from electrical sRGB into PQ/BT.2020, for the cursor plane on HDR outputs: its
+/// contents bypass the renderer, so the conversion the blend shaders would do runs here
+/// instead.
 ///
-/// Runs only when the cursor *image* changes (cursor movement reuses the buffer), so the
-/// per-pixel `powf` cost is acceptable.
-pub fn srgb_to_pq_argb8888(data: &mut [u8], stride: u32, size: (u32, u32), ref_lum_scale: f32) {
-    let (width, height) = size;
-    for row in 0..height as usize {
-        let start = row * stride as usize;
-        let row_data = &mut data[start..start + width as usize * 4];
-        for px in row_data.chunks_exact_mut(4) {
-            let color = Color32F::new(
-                f32::from(px[2]) / 255.,
-                f32::from(px[1]) / 255.,
-                f32::from(px[0]) / 255.,
-                f32::from(px[3]) / 255.,
-            );
-            let color = srgb_to_pq(color, ref_lum_scale);
-            px[2] = (color.r() * 255.).round().clamp(0., 255.) as u8;
-            px[1] = (color.g() * 255.).round().clamp(0., 255.) as u8;
-            px[0] = (color.b() * 255.).round().clamp(0., 255.) as u8;
+/// This runs inside `render_frame` every time the cursor *image* changes, which an animated
+/// cursor does many times per second; the per-pixel `powf` version of this encode took
+/// 12-46 ms per change on a 256x256 cursor plane and dropped frames whenever the pointer
+/// showed an animated or frequently-changing cursor.
+pub struct SrgbToPqEncoder {
+    ref_lum_scale: f32,
+    /// sRGB EOTF sampled at every 8-bit electrical value (exact for opaque pixels,
+    /// interpolated after unpremultiplication otherwise).
+    eotf: [f32; 256],
+    /// `pq_encode` with the reference-luminance scale folded in, sampled on a quartic
+    /// domain so the near-black region (where PQ is steepest) gets most of the samples:
+    /// `pq[i] = pq_encode((i / (N - 1))^4 * ref_lum_scale)`.
+    pq: Box<[f32; Self::PQ_SAMPLES]>,
+}
+
+impl SrgbToPqEncoder {
+    const PQ_SAMPLES: usize = 4096;
+
+    pub fn new(ref_lum_scale: f32) -> Self {
+        let mut eotf = [0f32; 256];
+        for (i, v) in eotf.iter_mut().enumerate() {
+            *v = (i as f32 / 255.).powf(2.2);
+        }
+
+        let mut pq = Box::new([0f32; Self::PQ_SAMPLES]);
+        for (i, v) in pq.iter_mut().enumerate() {
+            let t = i as f32 / (Self::PQ_SAMPLES - 1) as f32;
+            let lin = (t * t) * (t * t);
+            *v = pq_encode(lin * ref_lum_scale);
+        }
+
+        Self {
+            ref_lum_scale,
+            eotf,
+            pq,
+        }
+    }
+
+    /// sRGB EOTF for an unpremultiplied electrical value in [0, 1] (or above, for buffers
+    /// violating the premultiplication invariant).
+    fn eotf_lookup(&self, x: f32) -> f32 {
+        if x >= 1. {
+            return x.powf(2.2);
+        }
+        let pos = x.max(0.) * 255.;
+        let i = pos as usize;
+        let frac = pos - i as f32;
+        self.eotf[i] + (self.eotf[i + 1] - self.eotf[i]) * frac
+    }
+
+    /// PQ encode of a linear-light value in [0, 1], pre-scaled by the reference luminance.
+    fn pq_lookup(&self, lin: f32) -> f32 {
+        if lin >= 1. {
+            // Out-of-range linear light from invalid premultiplied input; match the exact
+            // path, whose clamp only applies after the reference-luminance scale.
+            return pq_encode(lin * self.ref_lum_scale);
+        }
+        let t = lin.max(0.).sqrt().sqrt();
+        let pos = t * (Self::PQ_SAMPLES - 1) as f32;
+        let i = pos as usize;
+        let frac = pos - i as f32;
+        self.pq[i] + (self.pq[i + 1] - self.pq[i]) * frac
+    }
+
+    pub fn apply(&self, data: &mut [u8], stride: u32, size: (u32, u32)) {
+        let _span = tracy_client::span!("SrgbToPqEncoder::apply");
+
+        let (width, height) = size;
+        let row_len = width as usize * 4;
+        // The data is typically a mapping of the cursor buffer object, which may be
+        // uncached; do the per-byte work in a regular allocation and copy back.
+        let mut row_buf = vec![0u8; row_len];
+        for row in 0..height as usize {
+            let start = row * stride as usize;
+            let row_data = &mut data[start..start + row_len];
+            row_buf.copy_from_slice(row_data);
+            for px in row_buf.chunks_exact_mut(4) {
+                let a = px[3];
+                if a == 0 {
+                    // Premultiplied: fully transparent pixels encode to zero.
+                    px[0] = 0;
+                    px[1] = 0;
+                    px[2] = 0;
+                    continue;
+                }
+
+                let (r, g, b) = if a == 255 {
+                    (
+                        self.eotf[px[2] as usize],
+                        self.eotf[px[1] as usize],
+                        self.eotf[px[0] as usize],
+                    )
+                } else {
+                    let a_f = f32::from(a);
+                    (
+                        self.eotf_lookup(f32::from(px[2]) / a_f),
+                        self.eotf_lookup(f32::from(px[1]) / a_f),
+                        self.eotf_lookup(f32::from(px[0]) / a_f),
+                    )
+                };
+
+                let (r2020, g2020, b2020) = bt709_to_bt2020(r, g, b);
+
+                let a_scale = f32::from(a);
+                px[2] = (self.pq_lookup(r2020) * a_scale).round().clamp(0., 255.) as u8;
+                px[1] = (self.pq_lookup(g2020) * a_scale).round().clamp(0., 255.) as u8;
+                px[0] = (self.pq_lookup(b2020) * a_scale).round().clamp(0., 255.) as u8;
+            }
+            row_data.copy_from_slice(&row_buf);
         }
     }
 }
@@ -1364,5 +1463,74 @@ mod tests {
         // the white point rescaled by alpha.
         let half = srgb_to_pq(Color32F::new(0.5, 0.5, 0.5, 0.5), scale);
         assert!((half.r() - white.r() * 0.5).abs() < 0.0005);
+    }
+
+    #[test]
+    fn srgb_to_pq_encoder_matches_exact_encode() {
+        // The exact per-pixel encode the LUTs replace.
+        fn reference(px: [u8; 4], scale: f32) -> [u8; 4] {
+            let color = Color32F::new(
+                f32::from(px[2]) / 255.,
+                f32::from(px[1]) / 255.,
+                f32::from(px[0]) / 255.,
+                f32::from(px[3]) / 255.,
+            );
+            let color = srgb_to_pq(color, scale);
+            [
+                (color.b() * 255.).round().clamp(0., 255.) as u8,
+                (color.g() * 255.).round().clamp(0., 255.) as u8,
+                (color.r() * 255.).round().clamp(0., 255.) as u8,
+                px[3],
+            ]
+        }
+
+        for scale in [(203. / 10000.) as f32, (600. / 10000.) as f32, 1.] {
+            let encoder = SrgbToPqEncoder::new(scale);
+
+            // A sweep of channel values and alphas, including invalid premultiplied pixels
+            // (channel > alpha) and a stride larger than the row.
+            let alphas = [0u8, 1, 3, 17, 64, 128, 200, 254, 255];
+            let values = (0u16..=255).step_by(5).map(|v| v as u8);
+            let mut pixels = Vec::new();
+            for a in alphas {
+                for v in values.clone() {
+                    pixels.push([v, v.wrapping_mul(3), v / 2, a]);
+                    pixels.push([v, 255 - v, v.wrapping_add(97), a]);
+                }
+            }
+
+            let width = 16;
+            let stride = width * 4 + 12;
+            let height = pixels.len().div_ceil(width);
+            pixels.resize(height * width, [0; 4]);
+            let mut buf = vec![0u8; height * stride];
+            for (i, px) in pixels.iter().enumerate() {
+                let off = (i / width) * stride + (i % width) * 4;
+                buf[off..off + 4].copy_from_slice(px);
+            }
+
+            let mut encoded = buf.clone();
+            encoder.apply(&mut encoded, stride as u32, (width as u32, height as u32));
+
+            for (i, px) in pixels.iter().enumerate() {
+                let off = (i / width) * stride + (i % width) * 4;
+                let got: [u8; 4] = encoded[off..off + 4].try_into().unwrap();
+                let want = reference(*px, scale);
+                for c in 0..4 {
+                    assert!(
+                        got[c].abs_diff(want[c]) <= 1,
+                        "scale {scale}: pixel {px:?} channel {c}: got {}, want {}",
+                        got[c],
+                        want[c],
+                    );
+                }
+            }
+
+            // Padding between rows is untouched.
+            for row in 0..height {
+                let pad = &encoded[row * stride + width * 4..(row + 1) * stride];
+                assert!(pad.iter().all(|&b| b == 0));
+            }
+        }
     }
 }
