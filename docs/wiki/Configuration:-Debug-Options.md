@@ -15,7 +15,7 @@ debug {
     // preview-render "screen-capture"
     enable-overlay-planes
     disable-cursor-plane
-    enable-cursor-plane-on-hdr
+    disable-cursor-plane-on-hdr
     disable-direct-scanout
     restrict-primary-scanout-to-matching-format
     force-disable-connectors-on-resume
@@ -85,17 +85,22 @@ debug {
 }
 ```
 
-### `enable-cursor-plane-on-hdr`
+### `disable-cursor-plane-on-hdr`
 
-Use the cursor plane on outputs composited in an HDR blend space, where niri normally composites the cursor on the primary plane instead.
+Composite the cursor on the primary plane instead of using the cursor plane on outputs composited in an HDR blend space.
 
-The cursor plane bypasses the renderer, so its contents need a CPU sRGB-to-PQ encode on every cursor image change; with this flag the encode runs (LUT-accelerated), and cursors whose content isn't plain SDR still fall back to compositing.
+By default niri uses the cursor plane on HDR outputs too.
+The plane bypasses the renderer, so its contents get a LUT-accelerated CPU sRGB-to-PQ encode on every cursor image change, and cursors whose content isn't plain SDR still fall back to compositing.
+Keeping the cursor on its plane also keeps direct scanout of fullscreen content working while the cursor is visible: a composited cursor is an extra element on top of the fullscreen surface, which forces the whole frame through the renderer.
 
-Overridden by `disable-cursor-plane`.
+The encode still runs on the main thread once per cursor image change.
+No performance issues were observed on AMD even with frequently-changing cursors, but AMD also has a smaller cursor plane size limit; on Nvidia, whose cursor planes can be larger, it may be worth setting this flag if you notice stutter with rapidly animating cursors.
+
+Overridden by `disable-cursor-plane`, which disables the cursor plane everywhere.
 
 ```kdl
 debug {
-    enable-cursor-plane-on-hdr
+    disable-cursor-plane-on-hdr
 }
 ```
 

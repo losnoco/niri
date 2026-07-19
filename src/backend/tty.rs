@@ -2443,15 +2443,15 @@ impl Tty {
             if blend_hdr {
                 // The cursor plane is filled without going through GLES; its contents get a
                 // CPU blend-space encode on every cursor image change instead (see
-                // set_cursor_buffer_transform above). That's still main-thread work per
-                // change, so composite the cursor by default and keep the plane opt-in.
-                if debug.enable_cursor_plane_on_hdr {
+                // set_cursor_buffer_transform above). A composited cursor is an extra
+                // element on top of fullscreen content, blocking primary-plane direct
+                // scan-out whenever it's visible, so the plane stays on by default (the
+                // LUT-accelerated encode is cheap) with a debug opt-out.
+                if debug.disable_cursor_plane_on_hdr {
+                    flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
+                } else if !niri.cursor_content_is_plain_sdr() {
                     // The CPU encode assumes plain sRGB content; the rare non-SDR client
                     // cursor falls back to primary-plane composition.
-                    if !niri.cursor_content_is_plain_sdr() {
-                        flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
-                    }
-                } else {
                     flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
                 }
                 // Primary- and overlay-plane scanout stay allowed: every window surface has a
