@@ -43,7 +43,7 @@ impl GradientFadeTextureRenderElement {
     }
 
     pub fn shader(renderer: &mut GlesRenderer) -> Option<GradientFadeShader> {
-        let program = Shaders::get(renderer).gradient_fade.clone();
+        let program = Shaders::get(renderer).and_then(|s| s.gradient_fade.clone());
         program.map(GradientFadeShader)
     }
 }
@@ -134,7 +134,9 @@ impl<'render> RenderElement<TtyRenderer<'render>> for GradientFadeTextureRenderE
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
-        let gles_frame = frame.as_gles_frame();
+        let Some(gles_frame) = frame.as_gles_frame() else {
+            return Ok(());
+        };
         RenderElement::<GlesRenderer>::draw(
             &self,
             gles_frame,

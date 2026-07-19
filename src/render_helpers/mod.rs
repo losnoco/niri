@@ -76,12 +76,12 @@ impl<'a, R> RenderCtx<'a, R> {
 }
 
 impl<'a, R: AsGlesRenderer> RenderCtx<'a, R> {
-    pub fn as_gles<'b>(&'b mut self) -> RenderCtx<'b, GlesRenderer> {
-        RenderCtx {
-            renderer: self.renderer.as_gles_renderer(),
+    pub fn as_gles<'b>(&'b mut self) -> Option<RenderCtx<'b, GlesRenderer>> {
+        Some(RenderCtx {
+            renderer: self.renderer.as_gles_renderer()?,
             target: self.target,
             xray: self.xray,
-        }
+        })
     }
 }
 

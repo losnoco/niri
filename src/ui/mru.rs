@@ -462,7 +462,9 @@ impl Thumbnail {
         });
 
         let mut title_size = None;
-        let title_texture = self.title_texture(ctx.as_gles().renderer, mapped, scale);
+        let title_texture = ctx
+            .as_gles()
+            .and_then(|gles_ctx| self.title_texture(gles_ctx.renderer, mapped, scale));
         let title_texture = title_texture.map(|texture| {
             let mut size = texture.logical_size();
             size.w = f64::min(size.w, preview_geo.size.w);
@@ -495,8 +497,10 @@ impl Thumbnail {
                 Kind::Unspecified,
             );
 
-            let ctx = ctx.as_gles();
-            if let Some(program) = GradientFadeTextureRenderElement::shader(ctx.renderer) {
+            let program = ctx
+                .as_gles()
+                .and_then(|gles_ctx| GradientFadeTextureRenderElement::shader(gles_ctx.renderer));
+            if let Some(program) = program {
                 let elem = GradientFadeTextureRenderElement::new(texture, program);
                 push(WindowMruUiRenderElement::GradientFadeElem(elem));
             } else {
@@ -1142,33 +1146,37 @@ impl WindowMruUi {
         // During the closing fade, use an offscreen to avoid transparent compositing artifacts.
         let mut pushed_offscreen = false;
         if *output == inner.output && alpha < 1. {
-            let mut ctx = ctx.as_gles();
+            'offscreen: {
+                let Some(mut ctx) = ctx.as_gles() else {
+                    break 'offscreen;
+                };
 
-            let mut elems = Vec::new();
-            inner.render(niri, ctx.r(), &mut |elem| elems.push(elem));
-            elems.push(WindowMruUiRenderElement::SolidColor(render_backdrop(1.)));
+                let mut elems = Vec::new();
+                inner.render(niri, ctx.r(), &mut |elem| elems.push(elem));
+                elems.push(WindowMruUiRenderElement::SolidColor(render_backdrop(1.)));
 
-            let scale = output.current_scale().fractional_scale();
-            match inner
-                .offscreen
-                .render(ctx.renderer, Scale::from(scale), &elems)
-            {
-                Ok((elem, _sync, _data)) => {
-                    // FIXME: would be good to passthrough offscreen data to visible windows here.
-                    // As is, during the closing fade, windows from other workspaces stop receiving
-                    // frame callbacks.
-                    //
-                    // However, we need to refactor our offscreen data a bit to make this nicer.
-                    // Currently it supports a stack of offscreens, but not a several unrelated
-                    // offscreens showing the same window (possibly in addition to the window
-                    // itself).
-                    //
-                    // Anyhow, this is not very noticeable since Alt-Tab closing happens quickly.
-                    push(WindowMruUiRenderElement::Offscreen(elem.with_alpha(alpha)));
-                    pushed_offscreen = true;
-                }
-                Err(err) => {
-                    warn!("error rendering MRU to offscreen for fade-out: {err:?}");
+                let scale = output.current_scale().fractional_scale();
+                match inner
+                    .offscreen
+                    .render(ctx.renderer, Scale::from(scale), &elems)
+                {
+                    Ok((elem, _sync, _data)) => {
+                        // FIXME: would be good to passthrough offscreen data to visible windows here.
+                        // As is, during the closing fade, windows from other workspaces stop receiving
+                        // frame callbacks.
+                        //
+                        // However, we need to refactor our offscreen data a bit to make this nicer.
+                        // Currently it supports a stack of offscreens, but not a several unrelated
+                        // offscreens showing the same window (possibly in addition to the window
+                        // itself).
+                        //
+                        // Anyhow, this is not very noticeable since Alt-Tab closing happens quickly.
+                        push(WindowMruUiRenderElement::Offscreen(elem.with_alpha(alpha)));
+                        pushed_offscreen = true;
+                    }
+                    Err(err) => {
+                        warn!("error rendering MRU to offscreen for fade-out: {err:?}");
+                    }
                 }
             }
         }
@@ -1566,10 +1574,11 @@ impl Inner {
         let output_size = output_size(&self.output);
         let scale = self.output.current_scale().fractional_scale();
 
-        let panel_texture =
+        let panel_texture = ctx.as_gles().and_then(|gles_ctx| {
             self.scope_panel
                 .borrow_mut()
-                .get(ctx.as_gles().renderer, scale, self.wmru.scope);
+                .get(gles_ctx.renderer, scale, self.wmru.scope)
+        });
         if let Some(texture) = panel_texture {
             let padding = round_logical_in_physical(scale, f64::from(PANEL_PADDING));
 

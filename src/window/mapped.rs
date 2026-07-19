@@ -719,7 +719,7 @@ impl LayoutElement for Mapped {
             }
             let xray_pos = xray_pos.offset(offset.to_f64());
             background_effect::render_for_tile(
-                ctx.as_gles(),
+                ctx.r(),
                 None,
                 geometry,
                 scale.x,
@@ -737,9 +737,9 @@ impl LayoutElement for Mapped {
         }
     }
 
-    fn render_background_effect(
+    fn render_background_effect<R: NiriRenderer>(
         &self,
-        ctx: RenderCtx<GlesRenderer>,
+        ctx: RenderCtx<R>,
         geometry: Rectangle<f64, Logical>,
         scale: f64,
         clip_to_geometry: bool,

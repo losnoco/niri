@@ -1126,7 +1126,9 @@ impl<W: LayoutElement> Tile<W> {
         let mut pushed_resize = false;
         if let Some(resize) = &self.resize_animation {
             if ResizeRenderElement::has_shader(ctx.renderer) {
-                let mut ctx = ctx.as_gles();
+                let Some(mut ctx) = ctx.as_gles() else {
+                    unreachable!("resize shader implies the GLES renderer");
+                };
 
                 if let Some(texture_from) = resize.snapshot.texture(ctx.r(), scale) {
                     let mut window_elements = Vec::new();
@@ -1348,7 +1350,7 @@ impl<W: LayoutElement> Tile<W> {
 
         let surface_anim_scale = animated_window_size / window_size;
         self.window.render_background_effect(
-            ctx.as_gles(),
+            ctx.r(),
             area,
             self.scale,
             clip_to_geometry,
@@ -1379,8 +1381,7 @@ impl<W: LayoutElement> Tile<W> {
         let mut pushed = false;
         self.window().set_offscreen_data(None);
 
-        if let Some(open) = &self.open_animation {
-            let mut ctx = ctx.as_gles();
+        if let (Some(open), Some(mut ctx)) = (&self.open_animation, ctx.as_gles()) {
             let mut elements = Vec::new();
             self.render_inner(
                 ctx.r(),
@@ -1406,8 +1407,7 @@ impl<W: LayoutElement> Tile<W> {
                     warn!("error rendering window opening animation: {err:?}");
                 }
             }
-        } else if let Some(alpha) = &self.alpha_animation {
-            let mut ctx = ctx.as_gles();
+        } else if let (Some(alpha), Some(mut ctx)) = (&self.alpha_animation, ctx.as_gles()) {
             let mut elements = Vec::new();
             self.render_inner(
                 ctx.r(),

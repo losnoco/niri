@@ -105,7 +105,7 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
     }
 
     pub fn shader(renderer: &mut R) -> Option<&GlesTexProgram> {
-        Shaders::get(renderer).clipped_surface.as_ref()
+        Shaders::get(renderer)?.clipped_surface.as_ref()
     }
 
     pub fn will_clip(
@@ -279,16 +279,24 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
-        let gles_frame = frame.as_gles_frame();
-        let mut uniforms = self.compute_uniforms();
-        uniforms.extend(FrameBlendState::uniforms_for_content(
-            gles_frame,
-            self.content,
-        ));
-        let saved = gles_frame.take_tex_program_override();
-        gles_frame.override_default_tex_program(self.program.clone(), uniforms);
+        let saved = if let Some(gles_frame) = frame.as_gles_frame() {
+            let mut uniforms = self.compute_uniforms();
+            uniforms.extend(FrameBlendState::uniforms_for_content(
+                gles_frame,
+                self.content,
+            ));
+            let saved = gles_frame.take_tex_program_override();
+            gles_frame.override_default_tex_program(self.program.clone(), uniforms);
+            Some(saved)
+        } else {
+            None
+        };
         let res = RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache);
-        frame.as_gles_frame().set_tex_program_override(saved);
+        if let Some(saved) = saved {
+            if let Some(gles_frame) = frame.as_gles_frame() {
+                gles_frame.set_tex_program_override(saved);
+            }
+        }
         res
     }
 

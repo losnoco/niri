@@ -15,6 +15,8 @@ use crate::utils::id::IdCounter;
 pub mod tty;
 pub use tty::Tty;
 
+pub mod tty_renderer;
+
 pub mod winit;
 pub use winit::Winit;
 

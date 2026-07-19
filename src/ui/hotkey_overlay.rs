@@ -101,9 +101,12 @@ impl HotkeyOverlay {
         }
 
         let rendered = buffers.entry(weak).or_insert_with(|| {
-            let renderer = renderer.as_gles_renderer();
-            render(renderer, &self.config.borrow(), self.mod_key, scale)
-                .unwrap_or_else(|_| RenderedOverlay { buffer: None })
+            renderer
+                .as_gles_renderer()
+                .and_then(|renderer| {
+                    render(renderer, &self.config.borrow(), self.mod_key, scale).ok()
+                })
+                .unwrap_or_else(|| RenderedOverlay { buffer: None })
         });
         let buffer = rendered.buffer.as_ref()?;
 

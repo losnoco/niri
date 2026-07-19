@@ -392,6 +392,18 @@ debug {
 }
 ```
 
+### `vulkan-renderer`
+
+Renders using Vulkan instead of OpenGL ES on the TTY backend.
+
+This is experimental. Effects requiring custom shaders (borders, shadows, rounded corners, blur, window animations, custom animation shaders, HDR tone mapping) are not implemented on the Vulkan renderer yet and will not render.
+
+```kdl
+debug {
+    vulkan-renderer
+}
+```
+
 ### Key Bindings
 
 These are not debug options, but rather key bindings.

@@ -224,7 +224,7 @@ impl ClosingWindow {
         let clamped_progress = anim.clamped_value().clamp(0., 1.);
 
         if Shaders::get(ctx.renderer)
-            .program(ProgramType::Close)
+            .and_then(|s| s.program(ProgramType::Close))
             .is_some()
         {
             let area_loc = Vec2::new(view_rect.loc.x as f32, view_rect.loc.y as f32);

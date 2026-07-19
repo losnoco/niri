@@ -238,7 +238,7 @@ impl MappedLayer {
         let surface_anim_scale = Scale::from(1.);
         let radius = self.rules.geometry_corner_radius.unwrap_or_default();
         background_effect::render_for_tile(
-            ctx.as_gles(),
+            ctx.r(),
             ns,
             geometry,
             self.scale,
@@ -307,7 +307,7 @@ impl MappedLayer {
             }
             let xray_pos = xray_pos.offset(offset.to_f64());
             background_effect::render_for_tile(
-                ctx.as_gles(),
+                ctx.r(),
                 ns,
                 geometry,
                 self.scale,

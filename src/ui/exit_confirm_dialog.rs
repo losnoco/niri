@@ -177,8 +177,10 @@ impl ExitConfirmDialog {
         let buffer = buffer.as_ref().unwrap_or(&fallback);
 
         let size = buffer.logical_size();
-        let Ok(buffer) = TextureBuffer::from_memory_buffer(renderer.as_gles_renderer(), buffer)
-        else {
+        let Some(gles_renderer) = renderer.as_gles_renderer() else {
+            return;
+        };
+        let Ok(buffer) = TextureBuffer::from_memory_buffer(gles_renderer, buffer) else {
             return;
         };
 

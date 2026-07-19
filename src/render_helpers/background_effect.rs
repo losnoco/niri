@@ -6,6 +6,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale};
 use smithay::wayland::compositor::{with_states, SurfaceData};
 use wayland_server::protocol::wl_surface::WlSurface;
 
+use super::renderer::NiriRenderer;
 use crate::handlers::background_effect::get_cached_blur_region;
 use crate::niri_render_elements;
 use crate::render_helpers::blur::BlurOptions;
@@ -281,8 +282,8 @@ pub fn damage_surface(states: &SurfaceData) {
 // Silence, Clippy
 // A Smithay user is talking
 #[allow(clippy::too_many_arguments)]
-pub fn render_for_tile(
-    ctx: RenderCtx<GlesRenderer>,
+pub fn render_for_tile<R: NiriRenderer>(
+    mut ctx: RenderCtx<R>,
     ns: Option<usize>,
     geometry: Rectangle<f64, Logical>,
     scale: f64,
@@ -297,6 +298,10 @@ pub fn render_for_tile(
     xray_pos: XrayPos,
     push: &mut dyn FnMut(BackgroundEffectElement),
 ) {
+    // Background effects need the GLES blur/shader stack.
+    let Some(ctx) = ctx.as_gles() else {
+        return;
+    };
     with_states(surface, |states| {
         let background_effect = SurfaceBackgroundEffect::get(states);
         let mut background_effect = background_effect.0.lock().unwrap();

@@ -186,7 +186,7 @@ impl ShadowRenderElement {
 
     pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
         Shaders::get(renderer)
-            .program(ProgramType::Shadow)
+            .and_then(|s| s.program(ProgramType::Shadow))
             .is_some()
     }
 }
@@ -278,7 +278,9 @@ impl<'render> RenderElement<TtyRenderer<'render>> for ShadowRenderElement {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
-        let frame = frame.as_gles_frame();
+        let Some(frame) = frame.as_gles_frame() else {
+            return Ok(());
+        };
         RenderElement::<GlesRenderer>::draw(self, frame, src, dst, damage, opaque_regions, cache)?;
         Ok(())
     }

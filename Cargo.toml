@@ -111,6 +111,7 @@ features = [
     "renderer_gl",
     "renderer_pixman",
     "renderer_multi",
+    "renderer_vulkan",
     "use_system_lib",
     "wayland_frontend",
 ]

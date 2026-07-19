@@ -616,7 +616,7 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, blend: Option<(f64, f64)>) {
     match blend {
         Some((lum, _)) => {
             let scale = (lum / 10000.) as f32;
-            let program = Shaders::get(renderer).texture_hdr.clone();
+            let program = Shaders::get(renderer).and_then(|s| s.texture_hdr.clone());
             if let Some(program) = program {
                 renderer.set_default_tex_program_override(Some((
                     program,
@@ -1046,11 +1046,14 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
-        let gles_frame = frame.as_gles_frame();
-        let saved = adjust_tex_program_for_content(gles_frame, self.content);
+        let saved = frame
+            .as_gles_frame()
+            .and_then(|gles_frame| adjust_tex_program_for_content(gles_frame, self.content));
         let res = RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache);
         if let Some(saved) = saved {
-            frame.as_gles_frame().set_tex_program_override(saved);
+            if let Some(gles_frame) = frame.as_gles_frame() {
+                gles_frame.set_tex_program_override(saved);
+            }
         }
         res
     }

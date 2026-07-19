@@ -146,7 +146,10 @@ impl ConfigErrorNotification {
         let mut buffers = self.buffers.borrow_mut();
         let buffer = buffers
             .entry(NotNan::new(scale).unwrap())
-            .or_insert_with(move || render(renderer.as_gles_renderer(), scale, path).ok());
+            .or_insert_with(move || {
+                let renderer = renderer.as_gles_renderer()?;
+                render(renderer, scale, path).ok()
+            });
         let buffer = buffer.clone()?;
 
         let size = buffer.logical_size();

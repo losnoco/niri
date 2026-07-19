@@ -2325,6 +2325,7 @@ mod tests {
                 skip_cursor_only_updates_during_vrr: false,
                 disable_10bit_output: false,
                 force_tearing: false,
+                vulkan_renderer: false,
             },
             workspaces: [
                 Workspace {
