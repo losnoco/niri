@@ -12,7 +12,7 @@ use smithay::backend::renderer::vulkan::{
 use super::blend::FrameBlendState;
 use super::renderer::NiriRenderer;
 use super::shader_element::ShaderProgram;
-use crate::render_helpers::blur::BlurProgram;
+use crate::render_helpers::blur::{BlurProgram, VulkanBlurProgram};
 
 /// A custom texture shader program for either renderer.
 #[derive(Debug, Clone)]
@@ -27,10 +27,11 @@ pub struct Shaders {
     pub border: Option<ShaderProgram>,
     pub shadow: Option<ShaderProgram>,
     pub clipped_surface: Option<NiriTexProgram>,
-    pub postprocess_and_clip: Option<GlesTexProgram>,
+    pub postprocess_and_clip: Option<NiriTexProgram>,
     pub resize: Option<ShaderProgram>,
     pub gradient_fade: Option<NiriTexProgram>,
     pub blur: Option<BlurProgram>,
+    pub blur_vulkan: Option<VulkanBlurProgram>,
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
     pub custom_open: RefCell<Option<ShaderProgram>>,
@@ -171,7 +172,8 @@ impl Shaders {
             .map_err(|err| {
                 warn!("error compiling postprocess_and_clip shader: {err:?}");
             })
-            .ok();
+            .ok()
+            .map(NiriTexProgram::Gles);
 
         let resize = compile_resize_program(renderer, include_str!("resize.frag"))
             .map_err(|err| {
@@ -206,6 +208,7 @@ impl Shaders {
             resize,
             gradient_fade,
             blur,
+            blur_vulkan: None,
             custom_resize: RefCell::new(None),
             custom_close: RefCell::new(None),
             custom_open: RefCell::new(None),
@@ -216,6 +219,12 @@ impl Shaders {
         let data = frame.egl_context().user_data();
         data.get()
             .expect("shaders::init() must be called when creating the renderer")
+    }
+
+    pub fn get_from_vulkan_frame<'a>(
+        frame: &'a smithay::backend::renderer::vulkan::VulkanFrame<'_, '_>,
+    ) -> Option<&'a Self> {
+        frame.user_data().get()
     }
 
     pub fn get(renderer: &mut impl NiriRenderer) -> Option<&Self> {
@@ -467,16 +476,72 @@ impl Shaders {
                 .ok()
         };
 
+        let postprocess_and_clip = {
+            let src = concat!(
+                include_str!("clipped_surface.frag"),
+                include_str!("rounding_alpha.frag"),
+                include_str!("postprocess.frag"),
+                include_str!("hdr.frag"),
+            );
+            let uniforms = with_blend_uniform_names(&[
+                UniformName::new("niri_scale", UniformType::_1f),
+                UniformName::new("geo_size", UniformType::_2f),
+                UniformName::new("corner_radius", UniformType::_4f),
+                UniformName::new("input_to_geo", UniformType::Matrix3x3),
+                UniformName::new("noise", UniformType::_1f),
+                UniformName::new("saturation", UniformType::_1f),
+                UniformName::new("bg_color", UniformType::_4f),
+                // The GLES texture shader interface, injected by the renderer per draw.
+                UniformName::new("alpha", UniformType::_1f),
+                UniformName::new("tint", UniformType::_1f),
+            ]);
+            compile_vulkan_program(renderer, src, &uniforms, &["tex"])
+                .map_err(|err| {
+                    warn!("error compiling vulkan postprocess_and_clip shader: {err:?}");
+                })
+                .ok()
+                .map(NiriTexProgram::Vulkan)
+        };
+
+        let blur_vulkan = {
+            let blur_uniforms = [
+                UniformName::new("half_pixel", UniformType::_2f),
+                UniformName::new("offset", UniformType::_1f),
+            ];
+            let down = compile_vulkan_program(
+                renderer,
+                include_str!("blur_down.frag"),
+                &blur_uniforms,
+                &["tex"],
+            )
+            .map_err(|err| {
+                warn!("error compiling vulkan blur down shader: {err:?}");
+            })
+            .ok();
+            let up = compile_vulkan_program(
+                renderer,
+                include_str!("blur_up.frag"),
+                &blur_uniforms,
+                &["tex"],
+            )
+            .map_err(|err| {
+                warn!("error compiling vulkan blur up shader: {err:?}");
+            })
+            .ok();
+            Option::zip(down, up).map(|(down, up)| VulkanBlurProgram { down, up })
+        };
+
         Shaders {
             texture_hdr: None,
             texture_hdr_to_sdr: None,
             border,
             shadow,
             clipped_surface,
-            postprocess_and_clip: None,
+            postprocess_and_clip,
             resize,
             gradient_fade,
             blur: None,
+            blur_vulkan,
             custom_resize: RefCell::new(None),
             custom_close: RefCell::new(None),
             custom_open: RefCell::new(None),
@@ -720,6 +785,18 @@ mod tests {
         assert!(
             shaders.clipped_surface.is_some(),
             "vulkan clipped surface shader failed to compile"
+        );
+        assert!(
+            shaders.gradient_fade.is_some(),
+            "vulkan gradient fade shader failed to compile"
+        );
+        assert!(
+            shaders.postprocess_and_clip.is_some(),
+            "vulkan postprocess_and_clip shader failed to compile"
+        );
+        assert!(
+            shaders.blur_vulkan.is_some(),
+            "vulkan blur shaders failed to compile"
         );
         assert!(
             shaders.resize.is_some(),

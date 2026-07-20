@@ -755,9 +755,28 @@ pub fn vulkan_blend_custom_uniforms(
     frame: &VulkanFrame,
     content: ContentColor,
 ) -> Vec<smithay::backend::renderer::vulkan::CustomUniform<'static>> {
+    vulkan_params_custom_uniforms(FrameBlendState::vulkan_params_for_content(frame, content))
+}
+
+/// The `niri_blend` values for content already rendered in the frame blend space, as custom
+/// shader uniforms; the Vulkan counterpart of [`FrameBlendState::uniforms_for_blend_space`].
+pub fn vulkan_blend_space_custom_uniforms(
+    frame: &VulkanFrame,
+) -> Vec<smithay::backend::renderer::vulkan::CustomUniform<'static>> {
+    let p = FrameBlendState::vulkan_params_for_content(frame, ContentColor::default());
+    let p = ColorBlendParams {
+        hdr_pq: 0.0,
+        ref_lum_scale: p.ref_lum_scale,
+        ..Default::default()
+    };
+    vulkan_params_custom_uniforms(p)
+}
+
+fn vulkan_params_custom_uniforms(
+    p: ColorBlendParams,
+) -> Vec<smithay::backend::renderer::vulkan::CustomUniform<'static>> {
     use smithay::backend::renderer::vulkan::{CustomUniform, CustomUniformValue};
 
-    let p = FrameBlendState::vulkan_params_for_content(frame, content);
     vec![
         CustomUniform {
             name: "niri_hdr_pq",

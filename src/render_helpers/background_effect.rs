@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 
 use niri_config::CornerRadius;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale};
 use smithay::wayland::compositor::{with_states, SurfaceData};
 use wayland_server::protocol::wl_surface::WlSurface;
@@ -149,9 +148,9 @@ impl BackgroundEffect {
         self.options.is_visible()
     }
 
-    pub fn render(
+    pub fn render<R: NiriRenderer>(
         &self,
-        ctx: RenderCtx<GlesRenderer>,
+        mut ctx: RenderCtx<R>,
         ns: Option<usize>,
         mut params: RenderParams,
         xray_pos: XrayPos,
@@ -182,6 +181,10 @@ impl BackgroundEffect {
         let saturation = self.options.saturation.unwrap_or(saturation) as f32;
 
         if self.options.xray {
+            // The xray effect buffers are still GLES-only.
+            let Some(ctx) = ctx.as_gles() else {
+                return;
+            };
             let Some(xray) = ctx.xray else {
                 return;
             };
@@ -283,7 +286,7 @@ pub fn damage_surface(states: &SurfaceData) {
 // A Smithay user is talking
 #[allow(clippy::too_many_arguments)]
 pub fn render_for_tile<R: NiriRenderer>(
-    mut ctx: RenderCtx<R>,
+    ctx: RenderCtx<R>,
     ns: Option<usize>,
     geometry: Rectangle<f64, Logical>,
     scale: f64,
@@ -298,10 +301,6 @@ pub fn render_for_tile<R: NiriRenderer>(
     xray_pos: XrayPos,
     push: &mut dyn FnMut(BackgroundEffectElement),
 ) {
-    // Background effects need the GLES blur/shader stack.
-    let Some(ctx) = ctx.as_gles() else {
-        return;
-    };
     with_states(surface, |states| {
         let background_effect = SurfaceBackgroundEffect::get(states);
         let mut background_effect = background_effect.0.lock().unwrap();

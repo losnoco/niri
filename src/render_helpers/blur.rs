@@ -5,7 +5,11 @@ use std::rc::Rc;
 use anyhow::{ensure, Context as _};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{ffi, link_program, GlesError, GlesRenderer, GlesTexture};
-use smithay::backend::renderer::{ContextId, Renderer as _, Texture as _};
+use smithay::backend::renderer::vulkan::{
+    CustomPass, CustomUniform, CustomUniformValue, VulkanFrame, VulkanPixelProgram, VulkanRenderer,
+    VulkanTexture,
+};
+use smithay::backend::renderer::{ContextId, Offscreen as _, Renderer as _, Texture as _};
 use smithay::gpu_span_location;
 use smithay::utils::{Buffer, Size};
 
@@ -336,6 +340,186 @@ impl Blur {
             gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
             gl.DeleteFramebuffers(fbos.len() as _, fbos.as_ptr());
         })?;
+
+        Ok(self.textures[0].clone())
+    }
+}
+
+/// Compiled Vulkan dual-Kawase blur programs.
+#[derive(Debug, Clone)]
+pub struct VulkanBlurProgram {
+    pub down: VulkanPixelProgram,
+    pub up: VulkanPixelProgram,
+}
+
+/// Vulkan variant of [`Blur`], rendering the ping-pong passes into the frame's command
+/// buffer via [`VulkanFrame::render_custom_passes`].
+#[derive(Debug)]
+pub struct VulkanBlur {
+    program: VulkanBlurProgram,
+    /// Output texture followed by intermediate textures, large to small.
+    textures: Vec<VulkanTexture>,
+}
+
+impl VulkanBlur {
+    pub fn new(renderer: &mut VulkanRenderer) -> Option<Self> {
+        let program = renderer.user_data().get::<Shaders>()?.blur_vulkan.clone()?;
+        Some(Self {
+            program,
+            textures: Vec::new(),
+        })
+    }
+
+    pub fn prepare_textures(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        source: &VulkanTexture,
+        options: BlurOptions,
+    ) -> anyhow::Result<()> {
+        let _span = tracy_client::span!("VulkanBlur::prepare_textures");
+
+        let passes = options.passes.clamp(1, 31) as usize;
+        let size = source.size();
+
+        if let Some(output) = self.textures.first_mut() {
+            let old_size = output.size();
+            if old_size != size {
+                trace!(
+                    "recreating textures: output size changed from {} × {} to {} × {}",
+                    old_size.w,
+                    old_size.h,
+                    size.w,
+                    size.h
+                );
+                self.textures.clear();
+            } else if !output.is_unique_reference() {
+                debug!("recreating textures: not unique");
+                self.textures.clear();
+            }
+        }
+
+        // Create any missing textures.
+        let mut w = size.w;
+        let mut h = size.h;
+        for i in 0..=passes {
+            let size = Size::new(w, h);
+            w = max(1, w / 2);
+            h = max(1, h / 2);
+
+            if self.textures.len() > i {
+                continue;
+            }
+
+            let texture: VulkanTexture = renderer
+                .create_buffer(Fourcc::Abgr8888, size)
+                .context("error creating texture")?;
+            self.textures.push(texture);
+        }
+
+        // Drop any no longer needed textures.
+        self.textures.drain(passes + 1..);
+
+        Ok(())
+    }
+
+    pub fn render(
+        &mut self,
+        frame: &mut VulkanFrame<'_, '_>,
+        source: &VulkanTexture,
+        options: BlurOptions,
+    ) -> anyhow::Result<VulkanTexture> {
+        let _span = tracy_client::span!("VulkanBlur::render");
+        trace!("rendering vulkan blur");
+
+        let passes = options.passes.clamp(1, 31) as usize;
+        let size = source.size();
+
+        ensure!(
+            self.textures.len() == passes + 1,
+            "wrong textures len: expected {}, got {}",
+            passes + 1,
+            self.textures.len()
+        );
+
+        let output = &self.textures[0];
+        ensure!(
+            output.size() == size,
+            "wrong output texture size: expected {size:?}, got {:?}",
+            output.size()
+        );
+
+        let offset = options.offset as f32;
+
+        // Per-pass uniform storage must outlive the pass descriptors.
+        let mut uniforms = Vec::with_capacity(passes * 2);
+        // Down: during downsampling, half_pixel is half of the destination pixel.
+        for dst in &self.textures[1..] {
+            let dst_size = dst.size();
+            uniforms.push([
+                CustomUniform {
+                    name: "half_pixel",
+                    value: CustomUniformValue::Vec2([
+                        0.5 / dst_size.w as f32,
+                        0.5 / dst_size.h as f32,
+                    ]),
+                },
+                CustomUniform {
+                    name: "offset",
+                    value: CustomUniformValue::Float(offset),
+                },
+            ]);
+        }
+        // Up: during upsampling, half_pixel is half of the source pixel.
+        for src in self.textures.iter().rev().take(passes) {
+            let src_size = src.size();
+            uniforms.push([
+                CustomUniform {
+                    name: "half_pixel",
+                    value: CustomUniformValue::Vec2([
+                        0.5 / src_size.w as f32,
+                        0.5 / src_size.h as f32,
+                    ]),
+                },
+                CustomUniform {
+                    name: "offset",
+                    value: CustomUniformValue::Float(offset),
+                },
+            ]);
+        }
+
+        let mut textures = Vec::with_capacity(passes * 2);
+        let down_src = once(source).chain(&self.textures[1..]);
+        let down_dst = &self.textures[1..];
+        for (src, dst) in zip(down_src, down_dst) {
+            textures.push((dst, src));
+        }
+        let up_src = self.textures.iter().rev();
+        let up_dst = self.textures.iter().rev().skip(1);
+        for (src, dst) in zip(up_src, up_dst) {
+            textures.push((dst, src));
+        }
+
+        let tex_bindings: Vec<[(&str, &VulkanTexture); 1]> =
+            textures.iter().map(|(_, src)| [("tex", *src)]).collect();
+
+        let mut pass_descs = Vec::with_capacity(textures.len());
+        for (i, (dst, _)) in textures.iter().enumerate() {
+            let program = if i < passes {
+                &self.program.down
+            } else {
+                &self.program.up
+            };
+            pass_descs.push(CustomPass {
+                dst,
+                program,
+                uniforms: &uniforms[i],
+                textures: &tex_bindings[i],
+            });
+        }
+
+        frame
+            .render_custom_passes(&pass_descs)
+            .context("error rendering blur passes")?;
 
         Ok(self.textures[0].clone())
     }

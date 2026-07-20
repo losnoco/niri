@@ -105,7 +105,14 @@ impl Xray {
         saturation: f32,
         push: &mut dyn FnMut(XrayElement),
     ) {
-        let program = Shaders::get(ctx.renderer).and_then(|s| s.postprocess_and_clip.clone());
+        let program = Shaders::get(ctx.renderer)
+            .and_then(|s| s.postprocess_and_clip.as_ref())
+            .and_then(|program| match program {
+                crate::render_helpers::shaders::NiriTexProgram::Gles(program) => {
+                    Some(program.clone())
+                }
+                _ => None,
+            });
 
         let zoom = xray_pos.zoom;
         let pos_in_backdrop = xray_pos.pos_in_backdrop.upscale(zoom);

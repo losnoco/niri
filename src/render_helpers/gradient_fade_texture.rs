@@ -150,7 +150,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for GradientFadeTextureRenderE
             (NiriTexProgram::Vulkan(program), TtyFrame::Vulkan(multi)) => {
                 let vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_> =
                     multi.as_mut();
-                let uniforms_src = vec![Uniform::new("cutoff", self.cutoff)];
+                let uniforms_src = [Uniform::new("cutoff", self.cutoff)];
                 let mut uniforms: Vec<_> = uniforms_src
                     .iter()
                     .filter_map(super::shader_element::uniform_to_custom_owned)

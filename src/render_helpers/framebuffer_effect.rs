@@ -8,15 +8,16 @@ use smithay::backend::renderer::gles::{
     ffi, GlesError, GlesFrame, GlesRenderer, GlesTexture, Uniform,
 };
 use smithay::backend::renderer::utils::CommitCounter;
+use smithay::backend::renderer::vulkan::{VulkanRenderer, VulkanTexture};
 use smithay::backend::renderer::{Frame as _, FrameContext, Offscreen, Texture as _};
 use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Size, Transform};
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::blend::FrameBlendState;
-use crate::render_helpers::blur::{Blur, BlurOptions};
+use crate::render_helpers::blur::{Blur, BlurOptions, VulkanBlur};
 use crate::render_helpers::renderer::AsGlesFrame as _;
 use crate::render_helpers::shaders::{mat3_uniform, Shaders};
 use crate::utils::region::TransformedRegion;
@@ -389,7 +390,15 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             clamped_dst.size.to_f64().upscale(dst_to_src).to_logical(1.),
         );
 
-        let program = Shaders::get_from_frame(frame).postprocess_and_clip.clone();
+        let program = Shaders::get_from_frame(frame)
+            .postprocess_and_clip
+            .as_ref()
+            .and_then(|program| match program {
+                crate::render_helpers::shaders::NiriTexProgram::Gles(program) => {
+                    Some(program.clone())
+                }
+                _ => None,
+            });
         let uniforms = program.is_some().then(|| {
             let mut uniforms = self.compute_uniforms(crop, frame.transformation()).to_vec();
             // The sampled framebuffer content is already in the frame blend space.
@@ -413,6 +422,226 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
     }
 }
 
+impl FramebufferEffectElement {
+    fn capture_framebuffer_vulkan(
+        &self,
+        vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        cache: &UserDataMap,
+    ) -> Result<(), smithay::backend::renderer::vulkan::VulkanError> {
+        let _span = tracy_client::span!("FramebufferEffectElement::capture_framebuffer_vulkan");
+
+        let output_rect = Rectangle::from_size(vk_frame.output_size());
+        let transform = vk_frame.transformation();
+
+        let mut guard = vk_frame.renderer();
+
+        let inner = cache.get_or_insert::<RefCell<VulkanInner>, _>(|| {
+            RefCell::new(VulkanInner::new(guard.as_mut()))
+        });
+        let mut inner = inner.borrow_mut();
+        let inner = &mut *inner;
+
+        inner.intermediate = None;
+
+        // Clamp dst to the framebuffer bounds, mirroring the GLES implementation.
+        let clamped_dst = match dst.intersection(output_rect) {
+            Some(clamped) => clamped,
+            None => return Ok(()),
+        };
+        let clamp_scale = clamped_dst.size.to_f64() / dst.size.to_f64();
+
+        let dst = transform.transform_rect_in(clamped_dst, &output_rect.size);
+
+        // See the GLES implementation for the reasoning behind this size computation.
+        let size = src
+            .size
+            .to_logical(1., Transform::Normal)
+            .upscale(clamp_scale)
+            .to_physical_precise_round(self.scale);
+        let size = transform.transform_size(size);
+
+        let size = size.to_logical(1).to_buffer(1, Transform::Normal);
+
+        // Recreate framebuffer if needed.
+        if inner
+            .framebuffer
+            .as_ref()
+            .is_some_and(|fb| fb.size() != size)
+        {
+            inner.framebuffer = None;
+        }
+        let framebuffer = if let Some(fb) = &inner.framebuffer {
+            fb
+        } else {
+            trace!("creating framebuffer texture sized {} × {}", size.w, size.h);
+            let renderer = guard.as_mut();
+            let texture =
+                Offscreen::<smithay::backend::renderer::vulkan::VulkanTexture>::create_buffer(
+                    renderer,
+                    Fourcc::Abgr8888,
+                    size,
+                )?;
+            inner.framebuffer.insert(texture)
+        };
+
+        // Prepare blur textures.
+        let mut blur = Option::zip(inner.blur.as_mut(), self.blur_options);
+        if let Some((b, options)) = &mut blur {
+            let renderer = guard.as_mut();
+            if let Err(err) = b.prepare_textures(renderer, framebuffer, *options) {
+                warn!("error preparing blur textures: {err:?}");
+                blur = None;
+            }
+        }
+
+        // Blit the framebuffer contents; the texture is left shader-readable.
+        let size_phys: Size<i32, Physical> = Size::from((size.w, size.h));
+        vk_frame.blit_framebuffer_to_texture(
+            framebuffer,
+            dst,
+            Rectangle::from_size(size_phys),
+            smithay::backend::renderer::TextureFilter::Linear,
+        )?;
+
+        // If blur is off, use the unblurred texture.
+        if self.blur_options.is_none() {
+            inner.intermediate = Some(framebuffer.clone());
+            return Ok(());
+        }
+
+        if let Some((blur, options)) = blur {
+            match blur.render(vk_frame, framebuffer, options) {
+                Ok(blurred) => inner.intermediate = Some(blurred),
+                Err(err) => {
+                    warn!("error rendering blur: {err:?}");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn draw_vulkan(
+        &self,
+        vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), smithay::backend::renderer::vulkan::VulkanError> {
+        let Some(cache) = cache else {
+            return Ok(());
+        };
+        let Some(inner) = cache.get::<RefCell<VulkanInner>>() else {
+            return Ok(());
+        };
+        let mut inner = inner.borrow_mut();
+        let inner = &mut *inner;
+
+        let Some(texture) = &inner.intermediate else {
+            return Ok(());
+        };
+
+        // Clamp the same way as in capture_framebuffer().
+        let output_rect = Rectangle::from_size(vk_frame.output_size());
+        let clamped_dst = match dst.intersection(output_rect) {
+            Some(clamped) => clamped,
+            None => return Ok(()),
+        };
+        let clamp_offset = clamped_dst.loc - dst.loc;
+
+        // Filter damage by subregion, reusing the stored Vec to avoid allocation.
+        let filtered = &mut inner.subregion_damage;
+        filtered.clear();
+
+        if let Some(subregion) = &self.subregion {
+            // Convert to subregion coordinates.
+            let mut crop = src.to_logical(1., Transform::Normal, &src.size);
+            crop.loc += self.geometry.loc;
+            subregion.filter_damage(crop, dst, damage, filtered);
+        } else {
+            filtered.extend(damage.iter());
+        };
+
+        // Adjust for clamped dst.
+        if clamped_dst != dst {
+            let r = Rectangle::new(clamp_offset, clamped_dst.size);
+            filtered.retain_mut(|d| {
+                if let Some(mut crop) = d.intersection(r) {
+                    crop.loc -= clamp_offset;
+                    *d = crop;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+
+        if filtered.is_empty() {
+            return Ok(());
+        }
+        let damage = &filtered[..];
+
+        // Adjust src proportionally to the dst clamping.
+        let src_loc = src.loc.to_logical(1., Transform::Normal, &src.size);
+        let dst_to_src = src.size / dst.size.to_f64();
+        let crop = Rectangle::new(
+            src_loc + clamp_offset.to_f64().upscale(dst_to_src).to_logical(1.),
+            clamped_dst.size.to_f64().upscale(dst_to_src).to_logical(1.),
+        );
+
+        let program = crate::render_helpers::shaders::Shaders::get_from_vulkan_frame(vk_frame)
+            .and_then(|s| s.postprocess_and_clip.as_ref())
+            .and_then(|program| match program {
+                crate::render_helpers::shaders::NiriTexProgram::Vulkan(program) => {
+                    Some(program.clone())
+                }
+                _ => None,
+            });
+
+        let saved = if let Some(program) = program {
+            let mut uniforms: Vec<_> = self
+                .compute_uniforms(crop, vk_frame.transformation())
+                .iter()
+                .filter_map(crate::render_helpers::shader_element::uniform_to_custom_owned)
+                .collect();
+            // The sampled framebuffer content is already in the frame blend space.
+            uniforms.extend(
+                crate::render_helpers::blend::vulkan_blend_space_custom_uniforms(vk_frame)
+                    .into_iter()
+                    .map(|u| smithay::backend::renderer::vulkan::OwnedCustomUniform {
+                        name: u.name.to_owned(),
+                        value: u.value,
+                    }),
+            );
+            let saved = vk_frame.take_tex_program_override();
+            vk_frame.set_tex_program_override(Some((program, uniforms)));
+            Some(saved)
+        } else {
+            None
+        };
+
+        let res = vk_frame.render_texture_from_to(
+            texture,
+            Rectangle::from_size(texture.size().to_f64()),
+            clamped_dst,
+            damage,
+            &[],
+            // The intermediate texture has the same transform as the frame.
+            vk_frame.transformation().invert(),
+            1.,
+        );
+
+        if let Some(saved) = saved {
+            vk_frame.set_tex_program_override(saved);
+        }
+
+        res
+    }
+}
+
 impl<'render> RenderElement<TtyRenderer<'render>> for FramebufferEffectElement {
     fn capture_framebuffer(
         &self,
@@ -421,6 +650,18 @@ impl<'render> RenderElement<TtyRenderer<'render>> for FramebufferEffectElement {
         dst: Rectangle<i32, Physical>,
         cache: &UserDataMap,
     ) -> Result<(), TtyRendererError<'render>> {
+        if let TtyFrame::Vulkan(multi) = frame {
+            let vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_> =
+                multi.as_mut();
+            return self
+                .capture_framebuffer_vulkan(vk_frame, src, dst, cache)
+                .map_err(|err| {
+                    TtyRendererError::Vulkan(smithay::backend::renderer::multigpu::Error::Render(
+                        err,
+                    ))
+                });
+        }
+
         let Some(gles_frame) = frame.as_gles_frame() else {
             return Ok(());
         };
@@ -437,6 +678,18 @@ impl<'render> RenderElement<TtyRenderer<'render>> for FramebufferEffectElement {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
+        if let TtyFrame::Vulkan(multi) = frame {
+            let vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_> =
+                multi.as_mut();
+            return self
+                .draw_vulkan(vk_frame, src, dst, damage, cache)
+                .map_err(|err| {
+                    TtyRendererError::Vulkan(smithay::backend::renderer::multigpu::Error::Render(
+                        err,
+                    ))
+                });
+        }
+
         let Some(gles_frame) = frame.as_gles_frame() else {
             return Ok(());
         };
@@ -458,6 +711,26 @@ impl Inner {
         Inner {
             framebuffer: None,
             blur: Blur::new(renderer),
+            intermediate: None,
+            subregion_damage: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct VulkanInner {
+    framebuffer: Option<VulkanTexture>,
+    blur: Option<VulkanBlur>,
+    intermediate: Option<VulkanTexture>,
+    /// Reusable storage for subregion-filtered damage rects.
+    subregion_damage: Vec<Rectangle<i32, Physical>>,
+}
+
+impl VulkanInner {
+    fn new(renderer: &mut VulkanRenderer) -> Self {
+        VulkanInner {
+            framebuffer: None,
+            blur: VulkanBlur::new(renderer),
             intermediate: None,
             subregion_damage: Vec::new(),
         }
