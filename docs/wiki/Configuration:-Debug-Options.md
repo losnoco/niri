@@ -396,7 +396,7 @@ debug {
 
 Renders using Vulkan instead of OpenGL ES on the TTY backend.
 
-This is experimental. Effects requiring custom shaders (borders, shadows, rounded corners, blur, window animations, custom animation shaders, HDR tone mapping) are not implemented on the Vulkan renderer yet and will not render.
+This is experimental, but feature-complete: custom-shader effects (borders, shadows, rounded corners, blur, xray backgrounds, window animations, custom animation shaders, HDR tone mapping) all render on the Vulkan renderer. wl_drm (legacy EGL buffer sharing) is unavailable; clients use dmabuf.
 
 ```kdl
 debug {

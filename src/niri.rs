@@ -34,7 +34,6 @@ use smithay::backend::renderer::element::{
     default_primary_scanout_output_compare, Element, Id, Kind, PrimaryScanoutOutput, RenderElement,
     RenderElementStates,
 };
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::backend::renderer::Color32F;
@@ -183,7 +182,7 @@ use crate::render_helpers::blend::{
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
-use crate::render_helpers::renderer::{AsGlesRenderer, NiriCaptureRenderer, NiriRenderer};
+use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::texture::{TextureBuffer, UniversalTextureRenderElement};
@@ -2416,33 +2415,36 @@ impl State {
 
         crate::with_primary_renderer_any!(self.backend, |renderer| {
             if let Some(output) = output {
-                // The xray fill machinery is still GLES-only; on the Vulkan renderer the snapshot
-                // background falls back to non-xray rendering.
-                let mut has_blocked_out = false;
-                if let Some(gles) = renderer.as_gles_renderer() {
-                    let mut ctx = RenderCtx {
-                        target: RenderTarget::Output,
-                        renderer: gles,
-                        xray: None,
+                let mut ctx = RenderCtx {
+                    target: RenderTarget::Output,
+                    renderer,
+                    xray: None,
+                };
+
+                if let Some(gles_ctx) = ctx.as_gles() {
+                    self.niri.fill_xray_elements(gles_ctx, output);
+                } else if let Some(vk_ctx) = ctx.as_vulkan() {
+                    self.niri.fill_xray_elements(vk_ctx, output);
+                }
+
+                // If any background layer has block_out_from, also fill the Screencast xray
+                // buffer so the unmap snapshot can render a buffer with blocked-out background.
+                //
+                // This will be used in Tile::render_snapshot().
+                let has_blocked_out = self.niri.has_blocked_out_background_layers(output);
+                if has_blocked_out {
+                    let mut screencast_ctx = RenderCtx {
+                        target: RenderTarget::Screencast,
+                        ..ctx.r()
                     };
-
-                    self.niri.fill_xray_elements(ctx.r(), output);
-
-                    // If any background layer has block_out_from, also fill the Screencast xray
-                    // buffer so the unmap snapshot can render a buffer with blocked-out
-                    // background.
-                    //
-                    // This will be used in Tile::render_snapshot().
-                    has_blocked_out = self.niri.has_blocked_out_background_layers(output);
-                    if has_blocked_out {
-                        let screencast_ctx = RenderCtx {
-                            target: RenderTarget::Screencast,
-                            ..ctx.r()
-                        };
-                        self.niri.fill_xray_elements(screencast_ctx, output);
+                    if let Some(gles_ctx) = screencast_ctx.as_gles() {
+                        self.niri.fill_xray_elements(gles_ctx, output);
+                    } else if let Some(vk_ctx) = screencast_ctx.as_vulkan() {
+                        self.niri.fill_xray_elements(vk_ctx, output);
                     }
                 }
 
+                let renderer = ctx.renderer;
                 let state = self.niri.output_state.get_mut(output).unwrap();
                 self.niri.layout.store_unmap_snapshot(
                     renderer,
@@ -4930,6 +4932,8 @@ impl Niri {
 
         if let Some(gles_ctx) = ctx.as_gles() {
             self.fill_xray_elements(gles_ctx, output);
+        } else if let Some(vk_ctx) = ctx.as_vulkan() {
+            self.fill_xray_elements(vk_ctx, output);
         }
 
         // Reborrow to shorten lifetime to be able to put in xray.
@@ -5193,7 +5197,11 @@ impl Niri {
         push(backdrop);
     }
 
-    pub fn fill_xray_elements(&self, mut ctx: RenderCtx<GlesRenderer>, output: &Output) {
+    pub fn fill_xray_elements<R>(&self, mut ctx: RenderCtx<R>, output: &Output)
+    where
+        R: NiriRenderer + crate::render_helpers::effect_buffer::XrayElementStore,
+        LayerSurfaceRenderElement<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::fill_xray_elements");
 
         // Make sure the xrayed elements themselves cannot use xray by mistake.
@@ -5217,7 +5225,7 @@ impl Niri {
 
         let mut buffer = xray.background[ctx.target as usize].borrow_mut();
         {
-            let elements = buffer.elements();
+            let elements = buffer.elements::<R>();
             elements.clear();
             self.render_layer_normal(
                 ctx.r(),
@@ -5226,7 +5234,7 @@ impl Niri {
                 Layer::Background,
                 XrayPos::default(),
                 false,
-                &mut |elem| elements.push(elem.into()),
+                &mut |elem| elements.push(elem),
             );
             // Avoid unused capacity remaining forever.
             elements.shrink_to_fit();
@@ -5234,7 +5242,7 @@ impl Niri {
 
         let mut buffer = xray.backdrop[ctx.target as usize].borrow_mut();
         {
-            let elements = buffer.elements();
+            let elements = buffer.elements::<R>();
             elements.clear();
             self.render_layer_normal(
                 ctx.r(),
@@ -5243,7 +5251,7 @@ impl Niri {
                 Layer::Background,
                 XrayPos::default(),
                 true,
-                &mut |elem| elements.push(elem.into()),
+                &mut |elem| elements.push(elem),
             );
             // Avoid unused capacity remaining forever.
             elements.shrink_to_fit();
@@ -5257,10 +5265,10 @@ impl Niri {
         // Clear the xray elements for all render targets after all rendering that could use them
         // did so.
         for buf in &xray.background {
-            buf.borrow_mut().elements().clear();
+            buf.borrow_mut().clear_elements();
         }
         for buf in &xray.backdrop {
-            buf.borrow_mut().elements().clear();
+            buf.borrow_mut().clear_elements();
         }
     }
 

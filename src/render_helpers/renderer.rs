@@ -3,7 +3,7 @@ use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
 #[allow(unused_imports)]
 use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::{
-    Bind, ExportMem, ImportAll, ImportMem, Offscreen, Renderer, RendererSuper, Texture,
+    Bind, ExportMem, ImportAll, ImportMem, Offscreen, Renderer, Texture,
 };
 
 use crate::backend::tty::{TtyFrame, TtyRenderer};
@@ -15,7 +15,6 @@ pub trait NiriRenderer:
     + ImportMem
     + ExportMem
     + Bind<Dmabuf>
-    + Offscreen<GlesTexture>
     + Renderer<TextureId = Self::NiriTextureId, Error = Self::NiriError>
     + AsGlesRenderer
     + AsVulkanRenderer
@@ -26,11 +25,7 @@ pub trait NiriRenderer:
 {
     // Associated types to work around the instability of associated type bounds.
     type NiriTextureId: Texture + Clone + Send + 'static;
-    type NiriError: std::error::Error
-        + Send
-        + Sync
-        + From<<GlesRenderer as RendererSuper>::Error>
-        + 'static;
+    type NiriError: std::error::Error + Send + Sync + 'static;
 }
 
 impl<R> NiriRenderer for R
@@ -39,7 +34,6 @@ where
         + ImportMem
         + ExportMem
         + Bind<Dmabuf>
-        + Offscreen<GlesTexture>
         + AsGlesRenderer
         + AsVulkanRenderer
         + HasOffscreen
@@ -47,8 +41,7 @@ where
         + Bind<<R as HasOffscreen>::Offscreen>
         + crate::render_helpers::blend::CaptureBlend,
     R::TextureId: Texture + Clone + Send + 'static,
-    R::Error:
-        std::error::Error + Send + Sync + From<<GlesRenderer as RendererSuper>::Error> + 'static,
+    R::Error: std::error::Error + Send + Sync + 'static,
 {
     type NiriTextureId = R::TextureId;
     type NiriError = R::Error;
@@ -74,6 +67,12 @@ impl AsGlesRenderer for TtyRenderer<'_> {
             TtyRenderer::Gles(renderer) => Some(renderer.as_mut()),
             TtyRenderer::Vulkan(_) => None,
         }
+    }
+}
+
+impl AsGlesRenderer for smithay::backend::renderer::vulkan::VulkanRenderer {
+    fn as_gles_renderer(&mut self) -> Option<&mut GlesRenderer> {
+        None
     }
 }
 
@@ -126,6 +125,14 @@ impl AsVulkanRenderer for TtyRenderer<'_> {
     }
 }
 
+impl AsVulkanRenderer for smithay::backend::renderer::vulkan::VulkanRenderer {
+    fn as_vulkan_renderer(
+        &mut self,
+    ) -> Option<&mut smithay::backend::renderer::vulkan::VulkanRenderer> {
+        Some(self)
+    }
+}
+
 /// The offscreen render target texture type of a renderer.
 pub trait HasOffscreen: Renderer {
     type Offscreen: Texture + Clone + Send + 'static;
@@ -170,6 +177,25 @@ impl HasOffscreen for TtyRenderer<'_> {
 
     fn wrap_texture(texture: Self::TextureId) -> TtyOffscreen {
         TtyOffscreen::Multi(texture)
+    }
+}
+
+impl HasOffscreen for smithay::backend::renderer::vulkan::VulkanRenderer {
+    type Offscreen = smithay::backend::renderer::vulkan::VulkanTexture;
+
+    fn wrap_offscreen(texture: Self::Offscreen) -> TtyOffscreen {
+        TtyOffscreen::Vulkan(texture)
+    }
+
+    fn unwrap_offscreen(texture: &mut TtyOffscreen) -> Option<&mut Self::Offscreen> {
+        match texture {
+            TtyOffscreen::Vulkan(texture) => Some(texture),
+            _ => None,
+        }
+    }
+
+    fn wrap_texture(texture: Self::TextureId) -> TtyOffscreen {
+        TtyOffscreen::Vulkan(texture)
     }
 }
 

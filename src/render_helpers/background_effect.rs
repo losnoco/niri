@@ -1,7 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use niri_config::CornerRadius;
-use smithay::utils::{Logical, Point, Rectangle, Scale};
+use smithay::backend::renderer::element::RenderElement;
+use smithay::backend::renderer::vulkan::{VulkanError, VulkanFrame, VulkanRenderer};
+use smithay::utils::user_data::UserDataMap;
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale};
 use smithay::wayland::compositor::{with_states, SurfaceData};
 use wayland_server::protocol::wl_surface::WlSurface;
 
@@ -81,6 +84,70 @@ niri_render_elements! {
     }
 }
 
+impl RenderElement<VulkanRenderer> for BackgroundEffectElement {
+    fn capture_framebuffer(
+        &self,
+        frame: &mut VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        cache: &UserDataMap,
+    ) -> Result<(), VulkanError> {
+        match self {
+            BackgroundEffectElement::FramebufferEffect(elem) => {
+                RenderElement::<VulkanRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
+            }
+            BackgroundEffectElement::Xray(elem) => {
+                RenderElement::<VulkanRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
+            }
+            BackgroundEffectElement::ExtraDamage(elem) => {
+                RenderElement::<VulkanRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
+            }
+        }
+    }
+
+    fn draw(
+        &self,
+        frame: &mut VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), VulkanError> {
+        match self {
+            BackgroundEffectElement::FramebufferEffect(elem) => {
+                RenderElement::<VulkanRenderer>::draw(
+                    elem,
+                    frame,
+                    src,
+                    dst,
+                    damage,
+                    opaque_regions,
+                    cache,
+                )
+            }
+            BackgroundEffectElement::Xray(elem) => RenderElement::<VulkanRenderer>::draw(
+                elem,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
+            BackgroundEffectElement::ExtraDamage(elem) => RenderElement::<VulkanRenderer>::draw(
+                elem,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
+        }
+    }
+}
+
 impl BackgroundEffect {
     pub fn new() -> Self {
         Self {
@@ -150,7 +217,7 @@ impl BackgroundEffect {
 
     pub fn render<R: NiriRenderer>(
         &self,
-        mut ctx: RenderCtx<R>,
+        ctx: RenderCtx<R>,
         ns: Option<usize>,
         mut params: RenderParams,
         xray_pos: XrayPos,
@@ -181,10 +248,6 @@ impl BackgroundEffect {
         let saturation = self.options.saturation.unwrap_or(saturation) as f32;
 
         if self.options.xray {
-            // The xray effect buffers are still GLES-only.
-            let Some(ctx) = ctx.as_gles() else {
-                return;
-            };
             let Some(xray) = ctx.xray else {
                 return;
             };

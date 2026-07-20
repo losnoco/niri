@@ -21,7 +21,7 @@ use self::texture::{TextureBuffer, TextureRenderElement, UniversalTextureRenderE
 use crate::backend::tty_renderer::TtyOffscreen;
 use crate::render_helpers::blend::set_sdr_capture_blend;
 use crate::render_helpers::renderer::{
-    AsGlesRenderer, HasOffscreen, NiriCaptureRenderer, NiriRenderer,
+    AsGlesRenderer, AsVulkanRenderer, HasOffscreen, NiriCaptureRenderer, NiriRenderer,
 };
 use crate::render_helpers::xray::Xray;
 
@@ -73,10 +73,20 @@ impl<'a, R> RenderCtx<'a, R> {
     }
 }
 
-impl<'a, R: AsGlesRenderer> RenderCtx<'a, R> {
+impl<'a, R: AsGlesRenderer + AsVulkanRenderer> RenderCtx<'a, R> {
     pub fn as_gles<'b>(&'b mut self) -> Option<RenderCtx<'b, GlesRenderer>> {
         Some(RenderCtx {
             renderer: self.renderer.as_gles_renderer()?,
+            target: self.target,
+            xray: self.xray,
+        })
+    }
+
+    pub fn as_vulkan<'b>(
+        &'b mut self,
+    ) -> Option<RenderCtx<'b, smithay::backend::renderer::vulkan::VulkanRenderer>> {
+        Some(RenderCtx {
+            renderer: self.renderer.as_vulkan_renderer()?,
             target: self.target,
             xray: self.xray,
         })

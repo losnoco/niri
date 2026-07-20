@@ -642,6 +642,30 @@ impl FramebufferEffectElement {
     }
 }
 
+impl RenderElement<VulkanRenderer> for FramebufferEffectElement {
+    fn capture_framebuffer(
+        &self,
+        frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        cache: &UserDataMap,
+    ) -> Result<(), smithay::backend::renderer::vulkan::VulkanError> {
+        self.capture_framebuffer_vulkan(frame, src, dst, cache)
+    }
+
+    fn draw(
+        &self,
+        frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), smithay::backend::renderer::vulkan::VulkanError> {
+        self.draw_vulkan(frame, src, dst, damage, cache)
+    }
+}
+
 impl<'render> RenderElement<TtyRenderer<'render>> for FramebufferEffectElement {
     fn capture_framebuffer(
         &self,

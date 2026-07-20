@@ -890,6 +890,18 @@ impl CaptureBlend for GlesRenderer {
     }
 }
 
+impl CaptureBlend for VulkanRenderer {
+    fn set_sdr_capture_blend(&mut self, reference_luminance: f64) {
+        self.user_data().insert_if_missing(FrameBlendState::default);
+        self.user_data()
+            .get::<FrameBlendState>()
+            .unwrap()
+            .set_sdr_capture_values(reference_luminance);
+        self.set_default_color_params(None);
+        self.set_solid_color_transform(None);
+    }
+}
+
 impl CaptureBlend for TtyRenderer<'_> {
     fn set_sdr_capture_blend(&mut self, reference_luminance: f64) {
         match self {
@@ -1281,6 +1293,30 @@ impl RenderElement<GlesRenderer> for BlendSurfaceRenderElement<GlesRenderer> {
         // the TTY backend guards this by handing the DrmCompositor a per-element
         // ScanoutColorTransform for every window surface, which either programs the
         // conversion into the plane's color pipeline or keeps the element composited.
+        self.inner.underlying_storage(renderer)
+    }
+}
+
+impl RenderElement<VulkanRenderer> for BlendSurfaceRenderElement<VulkanRenderer> {
+    fn draw(
+        &self,
+        frame: &mut VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), smithay::backend::renderer::vulkan::VulkanError> {
+        let params = FrameBlendState::vulkan_params_for_content(frame, self.content);
+        let prev = frame.take_color_params_override();
+        frame.set_color_params_override(Some(params));
+        let res = RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache);
+        frame.set_color_params_override(prev);
+        res
+    }
+
+    fn underlying_storage(&self, renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
+        // Only sampled into offscreen xray content; never reaches scanout directly.
         self.inner.underlying_storage(renderer)
     }
 }

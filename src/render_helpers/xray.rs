@@ -5,11 +5,9 @@ use std::rc::Rc;
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
-use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
-};
+use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, Uniform};
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
-use smithay::backend::renderer::Color32F;
+use smithay::backend::renderer::{Color32F, Frame as _};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
@@ -17,8 +15,9 @@ use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::blend::FrameBlendState;
 use crate::render_helpers::effect_buffer::EffectBuffer;
-use crate::render_helpers::renderer::AsGlesFrame as _;
-use crate::render_helpers::shaders::{mat3_uniform, Shaders};
+use crate::render_helpers::renderer::{AsGlesFrame as _, NiriRenderer};
+use crate::render_helpers::shader_element::uniform_to_custom_owned;
+use crate::render_helpers::shaders::{mat3_uniform, NiriTexProgram, Shaders};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::region::TransformedRegion;
 
@@ -81,7 +80,7 @@ pub struct XrayElement {
     noise: f32,
     saturation: f32,
     bg_color: Color32F,
-    program: Option<GlesTexProgram>,
+    program: Option<NiriTexProgram>,
 }
 
 impl Xray {
@@ -95,9 +94,9 @@ impl Xray {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn render(
+    pub fn render<R: NiriRenderer>(
         &self,
-        ctx: RenderCtx<GlesRenderer>,
+        ctx: RenderCtx<R>,
         params: RenderParams,
         xray_pos: XrayPos,
         blur: bool,
@@ -105,14 +104,7 @@ impl Xray {
         saturation: f32,
         push: &mut dyn FnMut(XrayElement),
     ) {
-        let program = Shaders::get(ctx.renderer)
-            .and_then(|s| s.postprocess_and_clip.as_ref())
-            .and_then(|program| match program {
-                crate::render_helpers::shaders::NiriTexProgram::Gles(program) => {
-                    Some(program.clone())
-                }
-                _ => None,
-            });
+        let program = Shaders::get(ctx.renderer).and_then(|s| s.postprocess_and_clip.clone());
 
         let zoom = xray_pos.zoom;
         let pos_in_backdrop = xray_pos.pos_in_backdrop.upscale(zoom);
@@ -314,8 +306,13 @@ impl RenderElement<GlesRenderer> for XrayElement {
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
+        let program = self.program.as_ref().and_then(|program| match program {
+            NiriTexProgram::Gles(program) => Some(program),
+            _ => None,
+        });
+
         let mut buffer = self.buffer.borrow_mut();
-        let texture = match buffer.render(frame, self.blur) {
+        let texture = match buffer.render_gles(frame, self.blur) {
             Ok(x) => x,
             Err(err) => {
                 warn!("error rendering effect buffer: {err:?}");
@@ -347,7 +344,7 @@ impl RenderElement<GlesRenderer> for XrayElement {
             damage
         };
 
-        let uniforms = self.program.is_some().then(|| {
+        let uniforms = program.is_some().then(|| {
             let mut uniforms = self.compute_uniforms().to_vec();
             uniforms.extend(FrameBlendState::uniforms(frame));
             uniforms
@@ -363,9 +360,112 @@ impl RenderElement<GlesRenderer> for XrayElement {
             &[],
             Transform::Normal,
             1.,
-            self.program.as_ref(),
+            program,
             uniforms,
         )
+    }
+}
+
+impl XrayElement {
+    fn draw_vulkan(
+        &self,
+        vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), smithay::backend::renderer::vulkan::VulkanError> {
+        let mut buffer = self.buffer.borrow_mut();
+        let texture = match buffer.render_vulkan(vk_frame, self.blur) {
+            Ok(x) => x,
+            Err(err) => {
+                warn!("error rendering effect buffer: {err:?}");
+                return Ok(());
+            }
+        };
+
+        // FIXME: avoid reallocating a fresh Vec here somehow.
+        let mut filtered_damage = Vec::new();
+        let damage = if let Some(subregion) = &self.subregion {
+            let src_to_geo = self.geometry.size / self.src.size;
+
+            // Compute crop in geometry coordinates.
+            let mut crop = src;
+            crop.loc -= self.src.loc;
+            crop = crop.upscale(src_to_geo);
+            let mut crop = crop.to_logical(1., Transform::Normal, &Size::default());
+
+            // Then convert to subregion coordinates.
+            crop.loc += self.geometry.loc;
+
+            subregion.filter_damage(crop, dst, damage, &mut filtered_damage);
+
+            if filtered_damage.is_empty() {
+                return Ok(());
+            }
+            &filtered_damage[..]
+        } else {
+            damage
+        };
+
+        let program = self.program.as_ref().and_then(|program| match program {
+            NiriTexProgram::Vulkan(program) => Some(program.clone()),
+            _ => None,
+        });
+
+        let saved = if let Some(program) = program {
+            let mut uniforms: Vec<_> = self
+                .compute_uniforms()
+                .iter()
+                .filter_map(uniform_to_custom_owned)
+                .collect();
+            uniforms.extend(
+                crate::render_helpers::blend::vulkan_blend_custom_uniforms(
+                    vk_frame,
+                    crate::render_helpers::blend::ContentColor::default(),
+                )
+                .into_iter()
+                .map(|u| smithay::backend::renderer::vulkan::OwnedCustomUniform {
+                    name: u.name.to_owned(),
+                    value: u.value,
+                }),
+            );
+            let saved = vk_frame.take_tex_program_override();
+            vk_frame.set_tex_program_override(Some((program, uniforms)));
+            Some(saved)
+        } else {
+            None
+        };
+
+        let res = vk_frame.render_texture_from_to(
+            &texture,
+            src,
+            dst,
+            damage,
+            // FIXME: opaque regions need to be filtered like damage.
+            &[],
+            Transform::Normal,
+            1.,
+        );
+
+        if let Some(saved) = saved {
+            vk_frame.set_tex_program_override(saved);
+        }
+
+        res
+    }
+}
+
+impl RenderElement<smithay::backend::renderer::vulkan::VulkanRenderer> for XrayElement {
+    fn draw(
+        &self,
+        frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
+    ) -> Result<(), smithay::backend::renderer::vulkan::VulkanError> {
+        self.draw_vulkan(frame, src, dst, damage)
     }
 }
 
@@ -379,6 +479,14 @@ impl<'render> RenderElement<TtyRenderer<'render>> for XrayElement {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
+        if let TtyFrame::Vulkan(multi) = frame {
+            let vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_> =
+                multi.as_mut();
+            return self.draw_vulkan(vk_frame, src, dst, damage).map_err(|err| {
+                TtyRendererError::Vulkan(smithay::backend::renderer::multigpu::Error::Render(err))
+            });
+        }
+
         let Some(gles_frame) = frame.as_gles_frame() else {
             return Ok(());
         };
