@@ -14,12 +14,19 @@ use super::renderer::NiriRenderer;
 use super::shader_element::ShaderProgram;
 use crate::render_helpers::blur::BlurProgram;
 
+/// A custom texture shader program for either renderer.
+#[derive(Debug, Clone)]
+pub enum NiriTexProgram {
+    Gles(GlesTexProgram),
+    Vulkan(VulkanPixelProgram),
+}
+
 pub struct Shaders {
     pub texture_hdr: Option<GlesTexProgram>,
     pub texture_hdr_to_sdr: Option<GlesTexProgram>,
     pub border: Option<ShaderProgram>,
     pub shadow: Option<ShaderProgram>,
-    pub clipped_surface: Option<GlesTexProgram>,
+    pub clipped_surface: Option<NiriTexProgram>,
     pub postprocess_and_clip: Option<GlesTexProgram>,
     pub resize: Option<ShaderProgram>,
     pub gradient_fade: Option<GlesTexProgram>,
@@ -140,7 +147,8 @@ impl Shaders {
             .map_err(|err| {
                 warn!("error compiling clipped surface shader: {err:?}");
             })
-            .ok();
+            .ok()
+            .map(NiriTexProgram::Gles);
 
         let postprocess_and_clip = renderer
             .compile_custom_texture_shader(
@@ -302,6 +310,7 @@ fn vulkanize_fragment(src: &str, decls: &[CustomUniformDecl], textures: &[&str])
          };
          #define niri_alpha niri_pc2.z
          #define niri_tint niri_pc2.w
+         #define v_coords niri_v_coords
 ",
     );
     for line in src.lines() {
@@ -408,12 +417,36 @@ impl Shaders {
         })
         .ok();
 
+        let clipped_surface = {
+            let src = concat!(
+                include_str!("clipped_surface.frag"),
+                include_str!("rounding_alpha.frag"),
+                include_str!("hdr.frag"),
+                "\nvec4 postprocess(vec4 color) { return color; }",
+            );
+            let uniforms = with_blend_uniform_names(&[
+                UniformName::new("niri_scale", UniformType::_1f),
+                UniformName::new("geo_size", UniformType::_2f),
+                UniformName::new("corner_radius", UniformType::_4f),
+                UniformName::new("input_to_geo", UniformType::Matrix3x3),
+                // The GLES texture shader interface, injected by the renderer per draw.
+                UniformName::new("alpha", UniformType::_1f),
+                UniformName::new("tint", UniformType::_1f),
+            ]);
+            compile_vulkan_program(renderer, src, &uniforms, &["tex"])
+                .map_err(|err| {
+                    warn!("error compiling vulkan clipped surface shader: {err:?}");
+                })
+                .ok()
+                .map(NiriTexProgram::Vulkan)
+        };
+
         Shaders {
             texture_hdr: None,
             texture_hdr_to_sdr: None,
             border,
             shadow,
-            clipped_surface: None,
+            clipped_surface,
             postprocess_and_clip: None,
             resize: None,
             gradient_fade: None,
@@ -647,6 +680,10 @@ mod tests {
         assert!(
             shaders.shadow.is_some(),
             "vulkan shadow shader failed to compile"
+        );
+        assert!(
+            shaders.clipped_surface.is_some(),
+            "vulkan clipped surface shader failed to compile"
         );
 
         // Representative user custom shaders must keep working through the transformer.

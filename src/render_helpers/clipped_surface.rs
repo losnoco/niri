@@ -13,13 +13,13 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 use super::blend::{ContentColor, FrameBlendState};
 use super::damage::ExtraDamage;
 use super::renderer::{AsGlesFrame as _, NiriRenderer};
-use super::shaders::{mat3_uniform, Shaders};
+use super::shaders::{mat3_uniform, NiriTexProgram, Shaders};
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
 #[derive(Debug)]
 pub struct ClippedSurfaceRenderElement<R: NiriRenderer> {
     inner: WaylandSurfaceRenderElement<R>,
-    program: GlesTexProgram,
+    program: NiriTexProgram,
     corner_radius: CornerRadius,
     geometry: Rectangle<f64, Logical>,
     scale: f32,
@@ -38,7 +38,7 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         elem: WaylandSurfaceRenderElement<R>,
         scale: Scale<f64>,
         geometry: Rectangle<f64, Logical>,
-        program: GlesTexProgram,
+        program: NiriTexProgram,
         corner_radius: CornerRadius,
         content: ContentColor,
     ) -> Self {
@@ -104,7 +104,7 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         ]
     }
 
-    pub fn shader(renderer: &mut R) -> Option<&GlesTexProgram> {
+    pub fn shader(renderer: &mut R) -> Option<&NiriTexProgram> {
         Shaders::get(renderer)?.clipped_surface.as_ref()
     }
 
@@ -243,10 +243,13 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
+        let NiriTexProgram::Gles(program) = &self.program else {
+            return Ok(());
+        };
         let mut uniforms = self.compute_uniforms();
         uniforms.extend(FrameBlendState::uniforms_for_content(frame, self.content));
         let saved = frame.take_tex_program_override();
-        frame.override_default_tex_program(self.program.clone(), uniforms);
+        frame.override_default_tex_program(program.clone(), uniforms);
         let res = RenderElement::<GlesRenderer>::draw(
             &self.inner,
             frame,
@@ -279,22 +282,52 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
-        let saved = if let Some(gles_frame) = frame.as_gles_frame() {
-            let mut uniforms = self.compute_uniforms();
-            uniforms.extend(FrameBlendState::uniforms_for_content(
-                gles_frame,
-                self.content,
-            ));
-            let saved = gles_frame.take_tex_program_override();
-            gles_frame.override_default_tex_program(self.program.clone(), uniforms);
-            Some(saved)
-        } else {
-            None
-        };
+        let mut saved = None;
+        let mut saved_vk = None;
+        match (&self.program, &mut *frame) {
+            (NiriTexProgram::Gles(program), _) => {
+                if let Some(gles_frame) = frame.as_gles_frame() {
+                    let mut uniforms = self.compute_uniforms();
+                    uniforms.extend(FrameBlendState::uniforms_for_content(
+                        gles_frame,
+                        self.content,
+                    ));
+                    saved = Some(gles_frame.take_tex_program_override());
+                    gles_frame.override_default_tex_program(program.clone(), uniforms);
+                }
+            }
+            (NiriTexProgram::Vulkan(program), TtyFrame::Vulkan(multi)) => {
+                let vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_> =
+                    multi.as_mut();
+                let mut uniforms: Vec<_> = self
+                    .compute_uniforms()
+                    .iter()
+                    .filter_map(super::shader_element::uniform_to_custom_owned)
+                    .collect();
+                uniforms.extend(
+                    super::blend::vulkan_blend_custom_uniforms(vk_frame, self.content)
+                        .into_iter()
+                        .map(|u| smithay::backend::renderer::vulkan::OwnedCustomUniform {
+                            name: u.name.to_owned(),
+                            value: u.value,
+                        }),
+                );
+                saved_vk = Some(vk_frame.take_tex_program_override());
+                vk_frame.set_tex_program_override(Some((program.clone(), uniforms)));
+            }
+            _ => {}
+        }
         let res = RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache);
         if let Some(saved) = saved {
             if let Some(gles_frame) = frame.as_gles_frame() {
                 gles_frame.set_tex_program_override(saved);
+            }
+        }
+        if let Some(saved) = saved_vk {
+            if let TtyFrame::Vulkan(multi) = frame {
+                let vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_> =
+                    multi.as_mut();
+                vk_frame.set_tex_program_override(saved);
             }
         }
         res
