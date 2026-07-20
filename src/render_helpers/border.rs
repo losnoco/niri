@@ -317,6 +317,17 @@ impl<'render> RenderElement<TtyRenderer<'render>> for BorderRenderElement {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
+        if let TtyFrame::Vulkan(_) = frame {
+            return RenderElement::<TtyRenderer>::draw(
+                &self.inner,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            );
+        }
         let Some(frame) = frame.as_gles_frame() else {
             return Ok(());
         };
