@@ -6,7 +6,6 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{PresetSize, RelativeTo};
 use niri_ipc::{PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::element::RenderElement;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
@@ -17,9 +16,10 @@ use super::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, Options, RemovedTile, SizeFrac,
 };
 use crate::animation::{Animation, Clock};
-use crate::layout::RenderLayer;
+use crate::layout::{LayoutElementRenderElement, RenderLayer};
 use crate::niri_render_elements;
-use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
+use crate::render_helpers::texture::UniversalTextureRenderElement;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::utils::transaction::TransactionBlocker;
@@ -568,12 +568,16 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
     }
 
-    pub fn start_close_animation_for_window(
+    pub fn start_close_animation_for_window<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         id: &W::Id,
         blocker: TransactionBlocker,
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+    {
         let (tile, tile_pos) = self
             .tiles_with_render_positions_mut(false)
             .find(|(tile, _)| tile.window().id() == id)
@@ -618,14 +622,18 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.data.insert(to_idx, data);
     }
 
-    pub fn start_close_animation_for_tile(
+    pub fn start_close_animation_for_tile<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         snapshot: TileRenderSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+    {
         let anim = Animation::new(
             self.clock.clone(),
             0.,
@@ -1091,6 +1099,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
         layer: RenderLayer,
         push: &mut dyn FnMut(FloatingSpaceRenderElement<R>),
     ) where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         TileRenderElement<R>: RenderElement<R>,
     {
@@ -1101,10 +1111,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
         // FIXME: I guess this should rather preserve the stacking order when the window is closed.
         if layer.is_normal() {
             for closing in self.closing_windows.iter().rev() {
-                if let Some(gles_ctx) = ctx.as_gles() {
-                    let elem = closing.render(gles_ctx, view_rect, scale);
-                    push(elem.into());
-                }
+                let elem = closing.render(ctx.r(), view_rect, scale);
+                push(elem.into());
             }
         }
 

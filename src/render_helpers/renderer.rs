@@ -134,6 +134,8 @@ pub trait HasOffscreen: Renderer {
     fn wrap_offscreen(texture: Self::Offscreen) -> TtyOffscreen;
     /// Unwraps the renderer-agnostic enum back into this renderer's texture type.
     fn unwrap_offscreen(texture: &mut TtyOffscreen) -> Option<&mut Self::Offscreen>;
+    /// Wraps the renderer's surface texture into the renderer-agnostic enum.
+    fn wrap_texture(texture: Self::TextureId) -> TtyOffscreen;
 }
 
 impl HasOffscreen for GlesRenderer {
@@ -146,8 +148,12 @@ impl HasOffscreen for GlesRenderer {
     fn unwrap_offscreen(texture: &mut TtyOffscreen) -> Option<&mut GlesTexture> {
         match texture {
             TtyOffscreen::Gles(texture) => Some(texture),
-            TtyOffscreen::Vulkan(_) => None,
+            _ => None,
         }
+    }
+
+    fn wrap_texture(texture: GlesTexture) -> TtyOffscreen {
+        TtyOffscreen::Gles(texture)
     }
 }
 
@@ -160,6 +166,10 @@ impl HasOffscreen for TtyRenderer<'_> {
 
     fn unwrap_offscreen(texture: &mut TtyOffscreen) -> Option<&mut TtyOffscreen> {
         Some(texture)
+    }
+
+    fn wrap_texture(texture: Self::TextureId) -> TtyOffscreen {
+        TtyOffscreen::Multi(texture)
     }
 }
 

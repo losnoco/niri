@@ -22,11 +22,12 @@ use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Optio
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::tile::TileRenderElement;
-use crate::layout::RenderLayer;
+use crate::layout::{LayoutElementRenderElement, RenderLayer};
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
+use crate::render_helpers::texture::UniversalTextureRenderElement;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
@@ -1697,6 +1698,8 @@ impl<W: LayoutElement> Monitor<W> {
         focus_ring: bool,
         push: &mut dyn FnMut(MonitorRenderElement<R>),
     ) where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         TileRenderElement<R>: RenderElement<R>,
     {

@@ -8,7 +8,6 @@ use niri_config::{
 };
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::element::{Kind, RenderElement};
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{layer_map_for_output, Window};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -28,11 +27,12 @@ use super::{
     RemovedTile, SizeFrac,
 };
 use crate::animation::Clock;
-use crate::layout::RenderLayer;
+use crate::layout::{LayoutElementRenderElement, RenderLayer};
 use crate::niri_render_elements;
-use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::texture::UniversalTextureRenderElement;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::utils::id::IdCounter;
@@ -1671,6 +1671,8 @@ impl<W: LayoutElement> Workspace<W> {
         layer: RenderLayer,
         push: &mut dyn FnMut(WorkspaceRenderElement<R>),
     ) where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         TileRenderElement<R>: RenderElement<R>,
     {
@@ -1689,6 +1691,8 @@ impl<W: LayoutElement> Workspace<W> {
         layer: RenderLayer,
         push: &mut dyn FnMut(WorkspaceRenderElement<R>),
     ) where
+        LayoutElementRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         TileRenderElement<R>: RenderElement<R>,
     {
@@ -1737,14 +1741,19 @@ impl<W: LayoutElement> Workspace<W> {
         ) || !self.render_above_top_layer()
     }
 
-    pub fn store_unmap_snapshot_if_empty(
+    pub fn store_unmap_snapshot_if_empty<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         xray_pos: XrayPos,
         window: &W::Id,
-    ) {
+    ) where
+        LayoutElementRenderElement<R>: RenderElement<R>,
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+    {
         let view_size = self.view_size();
         for (tile, tile_pos) in self.tiles_with_render_positions_mut(false) {
             if tile.window().id() == window {
@@ -1772,12 +1781,16 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
-    pub fn start_close_animation_for_window(
+    pub fn start_close_animation_for_window<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         window: &W::Id,
         blocker: TransactionBlocker,
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+    {
         if self.floating.has_window(window) {
             self.floating
                 .start_close_animation_for_window(renderer, window, blocker);
@@ -1787,14 +1800,18 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
-    pub fn start_close_animation_for_tile(
+    pub fn start_close_animation_for_tile<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         snapshot: TileRenderSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+    {
         self.floating
             .start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
     }

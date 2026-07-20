@@ -25,6 +25,8 @@ use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 use crate::window::mapped::{MappedId, WindowCastRenderElements};
 
 mod pw_utils;
+use crate::layout::LayoutElementRenderElement;
+use crate::render_helpers::texture::UniversalTextureRenderElement;
 use crate::ui::mru::WindowMruUiRenderElement;
 use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
 
@@ -545,6 +547,8 @@ impl Niri {
         output: &Output,
         target_presentation_time: Duration,
     ) where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         CastRenderElement<R>: RenderElement<R>,
         OutputRenderElements<R>: RenderElement<R>,

@@ -183,10 +183,10 @@ use crate::render_helpers::blend::{
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
-use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
+use crate::render_helpers::renderer::{AsGlesRenderer, NiriCaptureRenderer, NiriRenderer};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
-use crate::render_helpers::texture::TextureBuffer;
+use crate::render_helpers::texture::{TextureBuffer, UniversalTextureRenderElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
     encompassing_geo, render_to_dmabuf, render_to_encompassing_texture, render_to_shm,
@@ -2415,27 +2415,33 @@ impl State {
         // elements, so they need to be updated.
         self.niri.update_xray_render_elements(output);
 
-        self.backend.with_primary_renderer(|renderer| {
+        crate::with_primary_renderer_any!(self.backend, |renderer| {
             if let Some(output) = output {
-                let mut ctx = RenderCtx {
-                    target: RenderTarget::Output,
-                    renderer,
-                    xray: None,
-                };
-
-                self.niri.fill_xray_elements(ctx.r(), output);
-
-                // If any background layer has block_out_from, also fill the Screencast xray
-                // buffer so the unmap snapshot can render a buffer with blocked-out background.
-                //
-                // This will be used in Tile::render_snapshot().
-                let has_blocked_out = self.niri.has_blocked_out_background_layers(output);
-                if has_blocked_out {
-                    let screencast_ctx = RenderCtx {
-                        target: RenderTarget::Screencast,
-                        ..ctx.r()
+                // The xray fill machinery is still GLES-only; on the Vulkan renderer the snapshot
+                // background falls back to non-xray rendering.
+                let mut has_blocked_out = false;
+                if let Some(gles) = renderer.as_gles_renderer() {
+                    let mut ctx = RenderCtx {
+                        target: RenderTarget::Output,
+                        renderer: gles,
+                        xray: None,
                     };
-                    self.niri.fill_xray_elements(screencast_ctx, output);
+
+                    self.niri.fill_xray_elements(ctx.r(), output);
+
+                    // If any background layer has block_out_from, also fill the Screencast xray
+                    // buffer so the unmap snapshot can render a buffer with blocked-out
+                    // background.
+                    //
+                    // This will be used in Tile::render_snapshot().
+                    has_blocked_out = self.niri.has_blocked_out_background_layers(output);
+                    if has_blocked_out {
+                        let screencast_ctx = RenderCtx {
+                            target: RenderTarget::Screencast,
+                            ..ctx.r()
+                        };
+                        self.niri.fill_xray_elements(screencast_ctx, output);
+                    }
                 }
 
                 let state = self.niri.output_state.get_mut(output).unwrap();
@@ -4886,6 +4892,8 @@ impl Niri {
         include_pointer: bool,
     ) -> Vec<OutputRenderElements<R>>
     where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         WindowMruUiRenderElement<R>: RenderElement<R>,
         TileRenderElement<R>: RenderElement<R>,
@@ -4904,6 +4912,8 @@ impl Niri {
         include_pointer: bool,
         push: &mut dyn FnMut(OutputRenderElements<R>),
     ) where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         WindowMruUiRenderElement<R>: RenderElement<R>,
         TileRenderElement<R>: RenderElement<R>,
@@ -4940,6 +4950,8 @@ impl Niri {
         include_pointer: bool,
         push: &mut dyn FnMut(OutputRenderElements<R>),
     ) where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         WindowMruUiRenderElement<R>: RenderElement<R>,
         TileRenderElement<R>: RenderElement<R>,
@@ -6096,6 +6108,8 @@ impl Niri {
         renderer: &mut R,
         output: &Output,
     ) where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         OutputRenderElements<R>: RenderElement<R>,
         WindowMruUiRenderElement<R>: RenderElement<R>,
@@ -6181,6 +6195,8 @@ impl Niri {
         screencopy: Screencopy,
     ) -> anyhow::Result<()>
     where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         OutputRenderElements<R>: RenderElement<R>,
         WindowMruUiRenderElement<R>: RenderElement<R>,
@@ -6240,8 +6256,12 @@ impl Niri {
         output: &Output,
         target_presentation_time: Duration,
     ) where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         OutputRenderElements<R>: RenderElement<R>,
+        WindowMruUiRenderElement<R>: RenderElement<R>,
+        TileRenderElement<R>: RenderElement<R>,
     {
         let Some(mode) = output.current_mode() else {
             return;
@@ -6790,8 +6810,13 @@ impl Niri {
                     OutputScreenshot::from_textures(
                         renderer,
                         scale,
-                        texture,
-                        res_pointer.map(|(texture, _, geo)| (texture, geo)),
+                        texture.into_gles().expect("screenshot UI runs on GLES"),
+                        res_pointer.map(|(texture, _, geo)| {
+                            (
+                                texture.into_gles().expect("screenshot UI runs on GLES"),
+                                geo,
+                            )
+                        }),
                     )
                 })
             });
@@ -6814,6 +6839,8 @@ impl Niri {
         path: Option<String>,
     ) -> anyhow::Result<()>
     where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         OutputRenderElements<R>: RenderElement<R>,
         WindowMruUiRenderElement<R>: RenderElement<R>,
@@ -7037,6 +7064,8 @@ impl Niri {
         on_done: impl FnOnce(PathBuf) + Send + 'static,
     ) -> anyhow::Result<()>
     where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         OutputRenderElements<R>: RenderElement<R>,
         WindowMruUiRenderElement<R>: RenderElement<R>,
@@ -7603,7 +7632,11 @@ impl Niri {
                 }
 
                 let textures = textures.map(|res| {
-                    let texture = res.unwrap().0;
+                    let texture = res
+                        .unwrap()
+                        .0
+                        .into_gles()
+                        .expect("screen transition runs on GLES");
                     TextureBuffer::from_texture(
                         renderer,
                         texture,

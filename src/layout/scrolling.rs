@@ -8,7 +8,6 @@ use niri_config::{CenterFocusedColumn, PresetSize, Struts};
 use niri_ipc::{ColumnDisplay, SizeChange, WindowLayout};
 use ordered_float::NotNan;
 use smithay::backend::renderer::element::RenderElement;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
@@ -19,9 +18,10 @@ use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, Options, RemovedTile};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
-use crate::layout::{RenderLayer, SizingMode};
+use crate::layout::{LayoutElementRenderElement, RenderLayer, SizingMode};
 use crate::niri_render_elements;
-use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
+use crate::render_helpers::texture::UniversalTextureRenderElement;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::utils::id::IdCounter;
@@ -1476,12 +1476,16 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         true
     }
 
-    pub fn start_close_animation_for_window(
+    pub fn start_close_animation_for_window<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         window: &W::Id,
         blocker: TransactionBlocker,
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+    {
         let (tile, mut tile_pos) = self
             .tiles_with_render_positions_mut(false)
             .find(|(tile, _)| tile.window().id() == window)
@@ -1537,14 +1541,18 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
     }
 
-    fn start_close_animation_for_tile(
+    fn start_close_animation_for_tile<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         snapshot: TileRenderSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+    {
         let anim = Animation::new(
             self.clock.clone(),
             0.,
@@ -2975,6 +2983,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         layer: RenderLayer,
         push: &mut dyn FnMut(ScrollingSpaceRenderElement<R>),
     ) where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         TileRenderElement<R>: RenderElement<R>,
     {
@@ -2984,10 +2994,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         if layer.is_normal() {
             let view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
             for closing in self.closing_windows.iter().rev() {
-                if let Some(gles_ctx) = ctx.as_gles() {
-                    let elem = closing.render(gles_ctx, view_rect, scale);
-                    push(elem.into());
-                }
+                let elem = closing.render(ctx.r(), view_rect, scale);
+                push(elem.into());
             }
         }
 

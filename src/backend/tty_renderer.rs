@@ -735,11 +735,16 @@ impl TtyGpuManager {
     }
 }
 
-/// Offscreen render target texture of the TTY backend renderer.
+/// Universal texture holder of the renderer abstraction.
+///
+/// The `Gles` and `Vulkan` arms hold offscreen render targets of the TTY backend renderer (and
+/// `Gles` also the winit backend's). The `Multi` arm holds surface textures captured for render
+/// snapshots on the TTY backend; it is never an offscreen render target.
 #[derive(Debug, Clone)]
 pub enum TtyOffscreen {
     Gles(GlesTexture),
     Vulkan(smithay::backend::renderer::vulkan::VulkanTexture),
+    Multi(MultiTexture),
 }
 
 impl TtyOffscreen {
@@ -748,6 +753,15 @@ impl TtyOffscreen {
         match self {
             TtyOffscreen::Gles(texture) => texture.is_unique_reference(),
             TtyOffscreen::Vulkan(texture) => texture.is_unique_reference(),
+            TtyOffscreen::Multi(_) => false,
+        }
+    }
+
+    /// Unwraps into the GLES texture, if this is one.
+    pub fn into_gles(self) -> Option<GlesTexture> {
+        match self {
+            TtyOffscreen::Gles(texture) => Some(texture),
+            _ => None,
         }
     }
 }
@@ -757,6 +771,7 @@ impl Texture for TtyOffscreen {
         match self {
             TtyOffscreen::Gles(texture) => texture.width(),
             TtyOffscreen::Vulkan(texture) => texture.width(),
+            TtyOffscreen::Multi(texture) => texture.width(),
         }
     }
 
@@ -764,6 +779,7 @@ impl Texture for TtyOffscreen {
         match self {
             TtyOffscreen::Gles(texture) => texture.height(),
             TtyOffscreen::Vulkan(texture) => texture.height(),
+            TtyOffscreen::Multi(texture) => texture.height(),
         }
     }
 
@@ -771,6 +787,7 @@ impl Texture for TtyOffscreen {
         match self {
             TtyOffscreen::Gles(texture) => texture.size(),
             TtyOffscreen::Vulkan(texture) => texture.size(),
+            TtyOffscreen::Multi(texture) => texture.size(),
         }
     }
 
@@ -778,6 +795,7 @@ impl Texture for TtyOffscreen {
         match self {
             TtyOffscreen::Gles(texture) => Texture::format(texture),
             TtyOffscreen::Vulkan(texture) => Texture::format(texture),
+            TtyOffscreen::Multi(texture) => Texture::format(texture),
         }
     }
 }

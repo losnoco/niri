@@ -7,9 +7,9 @@ use smithay::backend::allocator::{Buffer, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Element, Kind, RenderElement, RenderElementStates};
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Texture as _};
+use smithay::backend::renderer::{Color32F, Frame, Offscreen, Texture as _};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::utils::user_data::UserDataMap;
@@ -17,8 +17,8 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform
 use smithay::wayland::shm;
 use solid_color::{SolidColorBuffer, SolidColorRenderElement};
 
-use self::primary_gpu_texture::PrimaryGpuTextureRenderElement;
-use self::texture::{TextureBuffer, TextureRenderElement};
+use self::texture::{TextureBuffer, TextureRenderElement, UniversalTextureRenderElement};
+use crate::backend::tty_renderer::TtyOffscreen;
 use crate::render_helpers::blend::set_sdr_capture_blend;
 use crate::render_helpers::renderer::{
     AsGlesRenderer, HasOffscreen, NiriCaptureRenderer, NiriRenderer,
@@ -127,8 +127,8 @@ impl RenderTarget {
     }
 }
 
-impl ToRenderElement for BakedBuffer<TextureBuffer<GlesTexture>> {
-    type RenderElement = PrimaryGpuTextureRenderElement;
+impl ToRenderElement for BakedBuffer<TextureBuffer<TtyOffscreen>> {
+    type RenderElement = UniversalTextureRenderElement;
 
     fn to_render_element(
         &self,
@@ -145,7 +145,7 @@ impl ToRenderElement for BakedBuffer<TextureBuffer<GlesTexture>> {
             self.dst.map(|dst| dst.to_f64()),
             kind,
         );
-        PrimaryGpuTextureRenderElement(elem)
+        UniversalTextureRenderElement(elem)
     }
 }
 
@@ -190,13 +190,16 @@ pub fn copy_framebuffer<R: NiriRenderer>(
     renderer.copy_framebuffer(target, Rectangle::from_size(target.size()), fourcc)
 }
 
-pub fn render_to_encompassing_texture(
-    renderer: &mut GlesRenderer,
+pub fn render_to_encompassing_texture<R: NiriCaptureRenderer>(
+    renderer: &mut R,
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: &[impl RenderElement<GlesRenderer>],
-) -> anyhow::Result<(GlesTexture, SyncPoint, Rectangle<i32, Physical>)> {
+    elements: &[impl RenderElement<R>],
+) -> anyhow::Result<(TtyOffscreen, SyncPoint, Rectangle<i32, Physical>)>
+where
+    R::Error: Send + Sync + 'static,
+{
     let geo = encompassing_geo(scale, elements.iter());
     let elements = elements.iter().rev().map(|ele| {
         RelocateRenderElement::from_element(ele, geo.loc.upscale(-1), Relocate::Relative)
@@ -208,14 +211,17 @@ pub fn render_to_encompassing_texture(
     Ok((texture, sync_point, geo))
 }
 
-pub fn render_to_texture(
-    renderer: &mut GlesRenderer,
+pub fn render_to_texture<R: NiriCaptureRenderer>(
+    renderer: &mut R,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
-) -> anyhow::Result<(GlesTexture, SyncPoint)> {
+    elements: impl Iterator<Item = impl RenderElement<R>>,
+) -> anyhow::Result<(TtyOffscreen, SyncPoint)>
+where
+    R::Error: Send + Sync + 'static,
+{
     let _span = tracy_client::span!();
 
     let mut texture = create_texture(renderer, size, fourcc).context("error creating texture")?;
@@ -228,7 +234,7 @@ pub fn render_to_texture(
         render_elements(renderer, &mut target, size, scale, transform, elements)?
     };
 
-    Ok((texture, sync_point))
+    Ok((R::wrap_offscreen(texture), sync_point))
 }
 
 pub fn render_and_download<R: NiriCaptureRenderer>(

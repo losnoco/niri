@@ -1,19 +1,24 @@
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::GlesTexture;
-use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
-use smithay::backend::renderer::{ContextId, Frame as _, ImportMem, Renderer, Texture};
+use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture};
+use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
+use smithay::backend::renderer::{
+    ContextId, ErasedContextId, Frame as _, ImportMem, Renderer, Texture,
+};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::memory::MemoryBuffer;
+use super::renderer::AsGlesFrame as _;
+use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
+use crate::backend::tty_renderer::TtyOffscreen;
 
 /// Smithay's texture buffer, but with fractional scale.
 #[derive(Debug, Clone)]
 pub struct TextureBuffer<T: Texture> {
     id: Id,
     commit_counter: CommitCounter,
-    renderer_context_id: ContextId<T>,
+    renderer_context_id: ErasedContextId,
     texture: T,
     scale: Scale<f64>,
     transform: Transform,
@@ -31,18 +36,21 @@ pub struct TextureRenderElement<T: Texture> {
     kind: Kind,
 }
 
-impl<T: Texture> TextureBuffer<T> {
-    pub fn from_texture<R: Renderer<TextureId = T>>(
+impl<T: Texture + 'static> TextureBuffer<T> {
+    pub fn from_texture<R: Renderer>(
         renderer: &R,
         texture: T,
         scale: impl Into<Scale<f64>>,
         transform: Transform,
         opaque_regions: Vec<Rectangle<i32, Buffer>>,
-    ) -> Self {
+    ) -> Self
+    where
+        R::TextureId: 'static,
+    {
         TextureBuffer {
             id: Id::new(),
             commit_counter: CommitCounter::default(),
-            renderer_context_id: renderer.context_id(),
+            renderer_context_id: ContextId::erased(&renderer.context_id()),
             texture,
             scale: scale.into(),
             transform,
@@ -89,6 +97,19 @@ impl<T: Texture> TextureBuffer<T> {
 
     pub fn texture(&self) -> &T {
         &self.texture
+    }
+
+    /// Converts the texture type, keeping all buffer metadata.
+    pub fn map_texture<U: Texture>(self, f: impl FnOnce(T) -> U) -> TextureBuffer<U> {
+        TextureBuffer {
+            id: self.id,
+            commit_counter: self.commit_counter,
+            renderer_context_id: self.renderer_context_id,
+            texture: f(self.texture),
+            scale: self.scale,
+            transform: self.transform,
+            opaque_regions: self.opaque_regions,
+        }
     }
 
     pub fn texture_scale(&self) -> Scale<f64> {
@@ -222,7 +243,7 @@ impl<T: Texture> Element for TextureRenderElement<T> {
 impl<R, T> RenderElement<R> for TextureRenderElement<T>
 where
     R: Renderer<TextureId = T>,
-    T: Texture,
+    T: Texture + 'static,
 {
     fn draw(
         &self,
@@ -233,7 +254,7 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
-        if frame.context_id() != self.buffer.renderer_context_id {
+        if ContextId::erased(&frame.context_id()) != self.buffer.renderer_context_id {
             warn!("trying to render texture from different renderer");
             return Ok(());
         }
@@ -250,6 +271,166 @@ where
     }
 
     fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
+/// Render element for a [`TextureBuffer`] of the universal [`TtyOffscreen`] texture enum.
+///
+/// Draws into both the winit `GlesRenderer` and either TTY renderer variant, matching the
+/// texture arm to the frame. Mismatched combinations (e.g. a texture captured on a different
+/// backend) skip drawing with a warning.
+#[derive(Debug, Clone)]
+pub struct UniversalTextureRenderElement(pub TextureRenderElement<TtyOffscreen>);
+
+impl Element for UniversalTextureRenderElement {
+    fn id(&self) -> &Id {
+        self.0.id()
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.0.current_commit()
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.0.geometry(scale)
+    }
+
+    fn transform(&self) -> Transform {
+        self.0.transform()
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        self.0.src()
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        self.0.damage_since(scale, commit)
+    }
+
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        self.0.opaque_regions(scale)
+    }
+
+    fn alpha(&self) -> f32 {
+        self.0.alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.0.kind()
+    }
+}
+
+impl RenderElement<GlesRenderer> for UniversalTextureRenderElement {
+    fn draw(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dest: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
+    ) -> Result<(), GlesError> {
+        let buffer = self.0.buffer();
+        let TtyOffscreen::Gles(texture) = buffer.texture() else {
+            warn!("trying to render non-GLES universal texture with the GLES renderer");
+            return Ok(());
+        };
+
+        frame.render_texture_from_to(
+            texture,
+            src,
+            dest,
+            damage,
+            opaque_regions,
+            buffer.texture_transform(),
+            self.0.alpha(),
+            None,
+            &[],
+        )
+    }
+
+    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
+impl<'render> RenderElement<TtyRenderer<'render>> for UniversalTextureRenderElement {
+    fn draw(
+        &self,
+        frame: &mut TtyFrame<'render, '_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dest: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
+    ) -> Result<(), TtyRendererError<'render>> {
+        let buffer = self.0.buffer();
+        let transform = buffer.texture_transform();
+        let alpha = self.0.alpha();
+
+        match (&mut *frame, buffer.texture()) {
+            (frame, TtyOffscreen::Multi(texture)) => frame.render_texture_from_to(
+                texture,
+                src,
+                dest,
+                damage,
+                opaque_regions,
+                transform,
+                alpha,
+            ),
+            (TtyFrame::Gles(_), TtyOffscreen::Gles(texture)) => {
+                let Some(gles_frame) = frame.as_gles_frame() else {
+                    return Ok(());
+                };
+                gles_frame
+                    .render_texture_from_to(
+                        texture,
+                        src,
+                        dest,
+                        damage,
+                        opaque_regions,
+                        transform,
+                        alpha,
+                        None,
+                        &[],
+                    )
+                    .map_err(Into::into)
+            }
+            (TtyFrame::Vulkan(multi), TtyOffscreen::Vulkan(texture)) => {
+                let vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_> =
+                    multi.as_mut();
+                vk_frame
+                    .render_texture_from_to(
+                        texture,
+                        src,
+                        dest,
+                        damage,
+                        opaque_regions,
+                        transform,
+                        alpha,
+                    )
+                    .map_err(|err| {
+                        TtyRendererError::Vulkan(
+                            smithay::backend::renderer::multigpu::Error::Render(err),
+                        )
+                    })
+            }
+            _ => {
+                warn!("universal texture arm does not match the TTY renderer variant");
+                Ok(())
+            }
+        }
+    }
+
+    fn underlying_storage(
+        &self,
+        _renderer: &mut TtyRenderer<'render>,
+    ) -> Option<UnderlyingStorage<'_>> {
         None
     }
 }

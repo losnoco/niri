@@ -1,6 +1,5 @@
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{import_surface, RendererSurfaceStateUserData};
 use smithay::backend::renderer::{ImportAll, Renderer};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -9,15 +8,17 @@ use smithay::wayland::color::management::ColorManagementSurfaceCachedState;
 use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
 
 use super::blend::{BlendSurfaceRenderElement, ContentColor};
+use super::renderer::NiriRenderer;
 use super::texture::TextureBuffer;
 use super::BakedBuffer;
+use crate::backend::tty_renderer::TtyOffscreen;
 
 /// Renders elements from a surface tree as textures into `storage`.
-pub fn render_snapshot_from_surface_tree(
-    renderer: &mut GlesRenderer,
+pub fn render_snapshot_from_surface_tree<R: NiriRenderer>(
+    renderer: &mut R,
     surface: &WlSurface,
     location: Point<f64, Logical>,
-    storage: &mut Vec<BakedBuffer<TextureBuffer<GlesTexture>>>,
+    storage: &mut Vec<BakedBuffer<TextureBuffer<TtyOffscreen>>>,
 ) {
     let _span = tracy_client::span!("render_snapshot_from_surface_tree");
 
@@ -67,7 +68,8 @@ pub fn render_snapshot_from_surface_tree(
                     f64::from(data.buffer_scale()),
                     data.buffer_transform(),
                     Vec::new(),
-                );
+                )
+                .map_texture(R::wrap_texture);
 
                 let baked = BakedBuffer {
                     buffer,

@@ -441,6 +441,15 @@ impl Shaders {
                 .map(NiriTexProgram::Vulkan)
         };
 
+        let resize = {
+            let program = assemble_resize_program(include_str!("resize.frag"));
+            ShaderProgram::compile_vulkan(renderer, &program, &resize_uniforms(), RESIZE_TEXTURES)
+                .map_err(|err| {
+                    warn!("error compiling vulkan resize shader: {err:?}");
+                })
+                .ok()
+        };
+
         Shaders {
             texture_hdr: None,
             texture_hdr_to_sdr: None,
@@ -448,7 +457,7 @@ impl Shaders {
             shadow,
             clipped_surface,
             postprocess_and_clip: None,
-            resize: None,
+            resize,
             gradient_fade: None,
             blur: None,
             custom_resize: RefCell::new(None),
@@ -472,16 +481,16 @@ pub fn init(renderer: &mut GlesRenderer) {
     }
 }
 
-fn compile_resize_program(
-    renderer: &mut impl NiriRenderer,
-    src: &str,
-) -> anyhow::Result<ShaderProgram> {
+fn assemble_resize_program(src: &str) -> String {
     let mut program = include_str!("resize_prelude.frag").to_string();
     program.push_str(src);
     program.push_str(include_str!("resize_epilogue.frag"));
     program.push_str(include_str!("rounding_alpha.frag"));
+    program
+}
 
-    let uniforms = &[
+fn resize_uniforms() -> [UniformName<'static>; 10] {
+    [
         UniformName::new("niri_input_to_curr_geo", UniformType::Matrix3x3),
         UniformName::new("niri_curr_geo_to_prev_geo", UniformType::Matrix3x3),
         UniformName::new("niri_curr_geo_to_next_geo", UniformType::Matrix3x3),
@@ -492,8 +501,18 @@ fn compile_resize_program(
         UniformName::new("niri_clamped_progress", UniformType::_1f),
         UniformName::new("niri_corner_radius", UniformType::_4f),
         UniformName::new("niri_clip_to_geometry", UniformType::_1f),
-    ];
-    let textures: &[&str] = &["niri_tex_prev", "niri_tex_next"];
+    ]
+}
+
+const RESIZE_TEXTURES: &[&str] = &["niri_tex_prev", "niri_tex_next"];
+
+fn compile_resize_program(
+    renderer: &mut impl NiriRenderer,
+    src: &str,
+) -> anyhow::Result<ShaderProgram> {
+    let program = assemble_resize_program(src);
+    let uniforms = &resize_uniforms();
+    let textures = RESIZE_TEXTURES;
 
     if renderer.as_gles_renderer().is_some() {
         let renderer = renderer.as_gles_renderer().unwrap();
@@ -684,6 +703,10 @@ mod tests {
         assert!(
             shaders.clipped_surface.is_some(),
             "vulkan clipped surface shader failed to compile"
+        );
+        assert!(
+            shaders.resize.is_some(),
+            "vulkan resize shader failed to compile"
         );
 
         // Representative user custom shaders must keep working through the transformer.

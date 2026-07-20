@@ -739,6 +739,7 @@ impl ScreenshotUi {
                 );
                 match res {
                     Ok((texture, _)) => {
+                        let texture = texture.into_gles().expect("screenshot UI runs on GLES");
                         tex_rect = Some((texture, Rectangle::from_size(rect.size)));
                     }
                     Err(err) => {

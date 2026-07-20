@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use niri_config::{Color, Config, CornerRadius, GradientInterpolation, WindowRule};
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::space::SpaceElement as _;
 use smithay::desktop::{PopupKind, PopupManager, Window};
 use smithay::output::{self, Output};
@@ -407,7 +406,7 @@ impl Mapped {
     }
 
     /// Renders a snapshot of the window without popups.
-    fn render_snapshot(&self, renderer: &mut GlesRenderer) -> LayoutElementRenderSnapshot {
+    fn render_snapshot<R: NiriRenderer>(&self, renderer: &mut R) -> LayoutElementRenderSnapshot {
         let _span = tracy_client::span!("Mapped::render_snapshot");
 
         let size = self.size().to_f64();
@@ -453,7 +452,7 @@ impl Mapped {
         should_animate
     }
 
-    pub fn store_animation_snapshot(&mut self, renderer: &mut GlesRenderer) {
+    pub fn store_animation_snapshot<R: NiriRenderer>(&mut self, renderer: &mut R) {
         self.animation_snapshot = Some(self.render_snapshot(renderer));
     }
 

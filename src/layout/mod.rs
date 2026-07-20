@@ -45,7 +45,6 @@ use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use scrolling::{Column, ColumnWidth};
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::RenderElement;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
@@ -62,10 +61,10 @@ use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::blend::BlendSurfaceRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
-use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::texture::TextureBuffer;
+use crate::render_helpers::texture::{TextureBuffer, UniversalTextureRenderElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{BakedBuffer, RenderCtx};
 use crate::rubber_band::RubberBand;
@@ -119,8 +118,10 @@ niri_render_elements! {
     }
 }
 
-pub type LayoutElementRenderSnapshot =
-    RenderSnapshot<BakedBuffer<TextureBuffer<GlesTexture>>, BakedBuffer<SolidColorBuffer>>;
+pub type LayoutElementRenderSnapshot = RenderSnapshot<
+    BakedBuffer<TextureBuffer<crate::backend::tty_renderer::TtyOffscreen>>,
+    BakedBuffer<SolidColorBuffer>,
+>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizingMode {
@@ -4682,13 +4683,18 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
-    pub fn store_unmap_snapshot(
+    pub fn store_unmap_snapshot<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         window: &W::Id,
-    ) {
+    ) where
+        LayoutElementRenderElement<R>: RenderElement<R>,
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Layout::store_unmap_snapshot");
 
         let zoom = self.overview_zoom();
@@ -4777,12 +4783,16 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
-    pub fn start_close_animation_for_window(
+    pub fn start_close_animation_for_window<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         window: &W::Id,
         blocker: TransactionBlocker,
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Layout::start_close_animation_for_window");
 
         let zoom = self.overview_zoom();
@@ -4840,6 +4850,8 @@ impl<W: LayoutElement> Layout<W> {
         output: &Output,
         push: &mut dyn FnMut(RescaleRenderElement<TileRenderElement<R>>),
     ) where
+        UniversalTextureRenderElement: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         TileRenderElement<R>: RenderElement<R>,
     {

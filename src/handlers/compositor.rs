@@ -271,7 +271,7 @@ impl CompositorHandler for State {
                 let transaction = Transaction::new();
                 if !is_mapped {
                     let blocker = transaction.blocker();
-                    self.backend.with_primary_renderer(|renderer| {
+                    crate::with_primary_renderer_any!(self.backend, |renderer| {
                         self.niri
                             .layout
                             .start_close_animation_for_window(renderer, &window, blocker);
