@@ -79,7 +79,7 @@ use super::{IpcOutputMap, OutputHdrCaps, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, RedrawState, State};
-use crate::render_helpers::blend::{self, set_frame_blend, DEFAULT_REFERENCE_LUMINANCE};
+use crate::render_helpers::blend::{self, set_frame_blend_tty, DEFAULT_REFERENCE_LUMINANCE};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
@@ -2461,9 +2461,7 @@ impl Tty {
         };
 
         // Hand them over to the DRM.
-        if let Some(gles_renderer) = renderer.as_gles_renderer() {
-            set_frame_blend(gles_renderer, blend);
-        }
+        set_frame_blend_tty(&mut renderer, blend);
         let drm_compositor = &mut surface.compositor;
         let render_frame_result = drm_compositor.render_frame::<_, _>(
             &mut renderer,
@@ -2472,9 +2470,7 @@ impl Tty {
             flags,
             presentation_mode,
         );
-        if let Some(gles_renderer) = renderer.as_gles_renderer() {
-            set_frame_blend(gles_renderer, None);
-        }
+        set_frame_blend_tty(&mut renderer, None);
         match render_frame_result {
             Ok(res) => {
                 // Log primary-plane scan-out transitions with the per-element denial

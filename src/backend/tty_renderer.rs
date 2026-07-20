@@ -48,6 +48,7 @@ pub enum TtyRenderer<'render> {
 }
 
 /// Frame of the TTY backend renderer.
+#[allow(clippy::large_enum_variant)]
 pub enum TtyFrame<'render, 'frame, 'buffer> {
     Gles(GlesMultiFrame<'render, 'frame, 'buffer>),
     Vulkan(VulkanMultiFrame<'render, 'frame, 'buffer>),

@@ -17,6 +17,7 @@ use smithay::backend::renderer::gles::{
     GlesError, GlesFrame, GlesRenderer, Uniform, UniformName, UniformType, UniformValue,
 };
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
+use smithay::backend::renderer::vulkan::{ColorBlendParams, VulkanFrame, VulkanRenderer};
 use smithay::backend::renderer::{Color32F, ImportAll, Renderer};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
@@ -398,7 +399,12 @@ impl FrameBlendState {
     /// SDR frames tone map HDR content into the reference white the shaders assume for them
     /// (the BT.2408 default, matching the scanout transforms for SDR outputs).
     pub fn set(renderer: &mut GlesRenderer, blend: Option<(f64, f64)>) {
-        let state = Self::get(renderer);
+        Self::get(renderer).set_values(blend);
+    }
+
+    /// Sets the frame blend values on this state directly.
+    pub fn set_values(&self, blend: Option<(f64, f64)>) {
+        let state = self;
         match blend {
             Some((ref_lum, max_lum)) => {
                 state.hdr_pq.set(true);
@@ -485,23 +491,34 @@ impl FrameBlendState {
         ref_lum: f64,
         max_out: f64,
     ) -> [Uniform<'static>; 4] {
+        let (tonemap, v, ref_scale, out_scale) =
+            Self::tonemap_values(enabled, max_in, ref_lum, max_out);
+        [
+            Uniform::new("niri_tonemap", tonemap),
+            Uniform::new("niri_tm_v", v),
+            Uniform::new("niri_tm_ref_scale", ref_scale),
+            Uniform::new("niri_tm_out_scale", out_scale),
+        ]
+    }
+
+    fn tonemap_values(
+        enabled: bool,
+        max_in: f64,
+        ref_lum: f64,
+        max_out: f64,
+    ) -> (f32, f32, f32, f32) {
         if !enabled || ref_lum <= 0. || max_out <= 0. {
-            return [
-                Uniform::new("niri_tonemap", 0.0f32),
-                Uniform::new("niri_tm_v", 0.0f32),
-                Uniform::new("niri_tm_ref_scale", 0.0f32),
-                Uniform::new("niri_tm_out_scale", 0.0f32),
-            ];
+            return (0.0, 0.0, 0.0, 0.0);
         }
         let input_range = max_in / ref_lum;
         let output_range = max_out / ref_lum;
         let v = tonemap_curve_v(input_range, output_range);
-        [
-            Uniform::new("niri_tonemap", 1.0f32),
-            Uniform::new("niri_tm_v", v as f32),
-            Uniform::new("niri_tm_ref_scale", (ref_lum / 10000.) as f32),
-            Uniform::new("niri_tm_out_scale", (max_out / 10000.) as f32),
-        ]
+        (
+            1.0,
+            v as f32,
+            (ref_lum / 10000.) as f32,
+            (max_out / 10000.) as f32,
+        )
     }
 
     /// The `niri_blend` uniform values for content already rendered in the frame blend space.
@@ -533,7 +550,71 @@ impl FrameBlendState {
     /// capture buffers.
     pub fn uniforms_for_content(frame: &GlesFrame, content: ContentColor) -> Vec<Uniform<'static>> {
         let (hdr_pq, scale, max_luminance) = Self::values_from_frame(frame);
+        Self::uniforms_for_content_values(hdr_pq, scale, max_luminance, content)
+    }
 
+    /// The `niri_blend` parameter block for a draw in a Vulkan frame; the Vulkan counterpart
+    /// of [`Self::uniforms_for_content`].
+    pub fn vulkan_params_for_content(
+        frame: &VulkanFrame,
+        content: ContentColor,
+    ) -> ColorBlendParams {
+        let (hdr_pq, scale, max_luminance) = frame
+            .user_data()
+            .get::<Self>()
+            .map(|state| {
+                (
+                    state.hdr_pq.get(),
+                    state.ref_lum_scale.get(),
+                    state.max_luminance.get(),
+                )
+            })
+            .unwrap_or((
+                false,
+                (DEFAULT_REFERENCE_LUMINANCE / 10000.) as f32,
+                DEFAULT_REFERENCE_LUMINANCE as f32,
+            ));
+        Self::values_for_content(hdr_pq, scale, max_luminance, content)
+    }
+
+    fn uniforms_for_content_values(
+        hdr_pq: bool,
+        scale: f32,
+        max_luminance: f32,
+        content: ContentColor,
+    ) -> Vec<Uniform<'static>> {
+        let values = Self::values_for_content(hdr_pq, scale, max_luminance, content);
+        let uniforms = vec![
+            Uniform::new("niri_hdr_pq", values.hdr_pq),
+            Uniform::new("niri_ref_lum_scale", values.ref_lum_scale),
+            Uniform::new("niri_linear", values.linear),
+            Uniform::new("niri_linear_scale", values.linear_scale),
+            Uniform::new("niri_linear_to_ref", values.linear_to_ref),
+            Uniform::new("niri_hdr_to_sdr", values.hdr_to_sdr),
+            Uniform::new("niri_pq_gamut", values.pq_gamut),
+            Uniform::new("niri_use_gamut", values.use_gamut),
+            Uniform::new(
+                "niri_gamut",
+                UniformValue::Matrix3x3 {
+                    matrices: vec![values.gamut],
+                    transpose: false,
+                },
+            ),
+            Uniform::new("niri_tonemap", values.tonemap),
+            Uniform::new("niri_tm_v", values.tm_v),
+            Uniform::new("niri_tm_ref_scale", values.tm_ref_scale),
+            Uniform::new("niri_tm_out_scale", values.tm_out_scale),
+        ];
+        uniforms
+    }
+
+    /// Computes the raw `niri_blend` parameter block for a draw.
+    fn values_for_content(
+        hdr_pq: bool,
+        scale: f32,
+        max_luminance: f32,
+        content: ContentColor,
+    ) -> ColorBlendParams {
         let is_pq = matches!(content, ContentColor::HdrPq { .. });
         let sdr_to_hdr = hdr_pq && !is_pq;
         let hdr_to_sdr = !hdr_pq && is_pq;
@@ -578,27 +659,41 @@ impl FrameBlendState {
             _ => (0.0, 0.0, 0.0),
         };
 
-        let mut uniforms = vec![
-            Uniform::new("niri_hdr_pq", if sdr_to_hdr { 1.0f32 } else { 0.0 }),
-            Uniform::new("niri_ref_lum_scale", scale),
-            Uniform::new("niri_linear", linear),
-            Uniform::new("niri_linear_scale", linear_scale),
-            Uniform::new("niri_linear_to_ref", linear_to_ref),
-            Uniform::new("niri_hdr_to_sdr", if hdr_to_sdr { 1.0f32 } else { 0.0 }),
-            Uniform::new("niri_pq_gamut", if pq_gamut { 1.0f32 } else { 0.0 }),
-        ];
-        uniforms.extend(gamut_uniforms(gamut.is_some(), gamut.flatten()));
+        let use_gamut = gamut.is_some();
+        let m = gamut.flatten().unwrap_or(colorimetry::IDENTITY);
+        let mut column_major = [0f32; 9];
+        for row in 0..3 {
+            for col in 0..3 {
+                column_major[col * 3 + row] = m[row * 3 + col] as f32;
+            }
+        }
+
         let max_in = match content {
             ContentColor::HdrPq { max_lum, .. } => f64::from(max_lum.unwrap_or(0)),
             _ => 0.,
         };
-        uniforms.extend(Self::tonemap_uniforms(
+        let (tm, tm_v, tm_ref_scale, tm_out_scale) = Self::tonemap_values(
             tonemap,
             max_in,
             f64::from(scale) * 10000.,
             f64::from(max_luminance),
-        ));
-        uniforms
+        );
+
+        ColorBlendParams {
+            hdr_pq: if sdr_to_hdr { 1.0 } else { 0.0 },
+            ref_lum_scale: scale,
+            linear,
+            linear_scale,
+            linear_to_ref,
+            hdr_to_sdr: if hdr_to_sdr { 1.0 } else { 0.0 },
+            pq_gamut: if pq_gamut { 1.0 } else { 0.0 },
+            use_gamut: if use_gamut { 1.0 } else { 0.0 },
+            gamut: column_major,
+            tonemap: tm,
+            tm_v,
+            tm_ref_scale,
+            tm_out_scale,
+        }
     }
 }
 
@@ -647,6 +742,43 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, blend: Option<(f64, f64)>) {
         None => {
             renderer.set_default_tex_program_override(None);
             renderer.set_solid_color_transform(None);
+        }
+    }
+}
+
+/// [`set_frame_blend`] over the TTY backend renderer.
+///
+/// On the Vulkan renderer, HDR frames install default [`ColorBlendParams`] performing the
+/// sRGB-to-PQ encode for every texture draw and a CPU transform for solid colors, mirroring
+/// the GLES default-program override.
+pub fn set_frame_blend_tty(renderer: &mut TtyRenderer, blend: Option<(f64, f64)>) {
+    match renderer {
+        TtyRenderer::Gles(multi) => set_frame_blend(multi.as_mut(), blend),
+        TtyRenderer::Vulkan(multi) => {
+            let vk: &mut VulkanRenderer = multi.as_mut();
+            vk.user_data().insert_if_missing(FrameBlendState::default);
+            vk.user_data()
+                .get::<FrameBlendState>()
+                .unwrap()
+                .set_values(blend);
+
+            match blend {
+                Some((ref_lum, _)) => {
+                    let scale = (ref_lum / 10000.) as f32;
+                    vk.set_default_color_params(Some(ColorBlendParams {
+                        hdr_pq: 1.0,
+                        ref_lum_scale: scale,
+                        ..Default::default()
+                    }));
+                    vk.set_solid_color_transform(Some(Box::new(move |color| {
+                        srgb_to_pq(color, scale)
+                    })));
+                }
+                None => {
+                    vk.set_default_color_params(None);
+                    vk.set_solid_color_transform(None);
+                }
+            }
         }
     }
 }
@@ -1049,10 +1181,25 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         let saved = frame
             .as_gles_frame()
             .and_then(|gles_frame| adjust_tex_program_for_content(gles_frame, self.content));
+        let saved_vk = if let crate::backend::tty::TtyFrame::Vulkan(multi) = &mut *frame {
+            let vk_frame: &mut VulkanFrame = multi.as_mut();
+            let params = FrameBlendState::vulkan_params_for_content(vk_frame, self.content);
+            let prev = vk_frame.take_color_params_override();
+            vk_frame.set_color_params_override(Some(params));
+            Some(prev)
+        } else {
+            None
+        };
         let res = RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache);
         if let Some(saved) = saved {
             if let Some(gles_frame) = frame.as_gles_frame() {
                 gles_frame.set_tex_program_override(saved);
+            }
+        }
+        if let Some(prev) = saved_vk {
+            if let crate::backend::tty::TtyFrame::Vulkan(multi) = &mut *frame {
+                let vk_frame: &mut VulkanFrame = multi.as_mut();
+                vk_frame.set_color_params_override(prev);
             }
         }
         res
