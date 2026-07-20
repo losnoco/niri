@@ -29,7 +29,7 @@ pub struct Shaders {
     pub clipped_surface: Option<NiriTexProgram>,
     pub postprocess_and_clip: Option<GlesTexProgram>,
     pub resize: Option<ShaderProgram>,
-    pub gradient_fade: Option<GlesTexProgram>,
+    pub gradient_fade: Option<NiriTexProgram>,
     pub blur: Option<BlurProgram>,
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
@@ -187,7 +187,8 @@ impl Shaders {
             .map_err(|err| {
                 warn!("error compiling gradient fade shader: {err:?}");
             })
-            .ok();
+            .ok()
+            .map(NiriTexProgram::Gles);
 
         let blur = BlurProgram::compile(renderer)
             .map_err(|err| {
@@ -441,6 +442,22 @@ impl Shaders {
                 .map(NiriTexProgram::Vulkan)
         };
 
+        let gradient_fade = {
+            let src = concat!(include_str!("gradient_fade.frag"), include_str!("hdr.frag"));
+            let uniforms = with_blend_uniform_names(&[
+                UniformName::new("cutoff", UniformType::_2f),
+                // The GLES texture shader interface, injected by the renderer per draw.
+                UniformName::new("alpha", UniformType::_1f),
+                UniformName::new("tint", UniformType::_1f),
+            ]);
+            compile_vulkan_program(renderer, src, &uniforms, &["tex"])
+                .map_err(|err| {
+                    warn!("error compiling vulkan gradient fade shader: {err:?}");
+                })
+                .ok()
+                .map(NiriTexProgram::Vulkan)
+        };
+
         let resize = {
             let program = assemble_resize_program(include_str!("resize.frag"));
             ShaderProgram::compile_vulkan(renderer, &program, &resize_uniforms(), RESIZE_TEXTURES)
@@ -458,7 +475,7 @@ impl Shaders {
             clipped_surface,
             postprocess_and_clip: None,
             resize,
-            gradient_fade: None,
+            gradient_fade,
             blur: None,
             custom_resize: RefCell::new(None),
             custom_close: RefCell::new(None),

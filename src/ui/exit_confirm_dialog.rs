@@ -16,10 +16,11 @@ use smithay::utils::{Point, Transform};
 use crate::animation::{Animation, Clock};
 use crate::niri_render_elements;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::{
+    TextureBuffer, TextureRenderElement, UniversalTextureRenderElement,
+};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const KEY_NAME: &str = "Enter";
@@ -38,7 +39,7 @@ pub struct ExitConfirmDialog {
 
 niri_render_elements! {
     ExitConfirmDialogRenderElement => {
-        Texture = RescaleRenderElement<PrimaryGpuTextureRenderElement>,
+        Texture = RescaleRenderElement<UniversalTextureRenderElement>,
         SolidColor = SolidColorRenderElement,
     }
 }
@@ -177,12 +178,10 @@ impl ExitConfirmDialog {
         let buffer = buffer.as_ref().unwrap_or(&fallback);
 
         let size = buffer.logical_size();
-        let Some(gles_renderer) = renderer.as_gles_renderer() else {
+        let Ok(buffer) = TextureBuffer::from_memory_buffer(renderer, buffer) else {
             return;
         };
-        let Ok(buffer) = TextureBuffer::from_memory_buffer(gles_renderer, buffer) else {
-            return;
-        };
+        let buffer = buffer.map_texture(R::wrap_texture);
 
         let location = (output_size.to_point() - size.to_point()).downscale(2.);
         let mut location = location.to_physical_precise_round(scale).to_logical(scale);
@@ -197,7 +196,7 @@ impl ExitConfirmDialog {
             None,
             Kind::Unspecified,
         );
-        let elem = PrimaryGpuTextureRenderElement(elem);
+        let elem = UniversalTextureRenderElement(elem);
         let elem = RescaleRenderElement::from_element(
             elem,
             (location + size.downscale(2.)).to_physical_precise_round(scale),
