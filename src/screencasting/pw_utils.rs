@@ -39,9 +39,7 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Element, RenderElement, RenderElementStates};
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::ExportMem;
 use smithay::output::{Output, OutputModeSource};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
@@ -56,6 +54,7 @@ use zbus::object_server::SignalEmitter;
 use crate::dbus::mutter_screen_cast::{self, CursorMode};
 use crate::niri::{CastTarget, State};
 use crate::render_helpers::blend::set_sdr_capture_blend;
+use crate::render_helpers::renderer::NiriCaptureRenderer;
 use crate::render_helpers::{
     clear_dmabuf, encompassing_geo, render_and_download, render_and_download_with_damage,
     render_to_dmabuf,
@@ -1209,15 +1208,20 @@ impl Cast {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn dequeue_buffer_and_render(
+    #[allow(clippy::too_many_arguments)]
+    pub fn dequeue_buffer_and_render<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
-        mut elements: &[CastRenderElement<GlesRenderer>],
-        cursor_data: &CursorData<CastRenderElement<GlesRenderer>>,
+        renderer: &mut R,
+        mut elements: &[CastRenderElement<R>],
+        cursor_data: &CursorData<CastRenderElement<R>>,
         size: Size<i32, Physical>,
         scale: Scale<f64>,
         reference_luminance: f64,
-    ) -> bool {
+    ) -> bool
+    where
+        R::Error: Send + Sync + 'static,
+        CastRenderElement<R>: RenderElement<R>,
+    {
         let mut inner = self.inner.borrow_mut();
 
         let CastState::Ready {
@@ -1365,7 +1369,10 @@ impl Cast {
         }
     }
 
-    pub fn dequeue_buffer_and_clear(&mut self, renderer: &mut GlesRenderer) -> bool {
+    pub fn dequeue_buffer_and_clear<R: NiriCaptureRenderer>(&mut self, renderer: &mut R) -> bool
+    where
+        R::Error: Send + Sync + 'static,
+    {
         let mut inner = self.inner.borrow_mut();
 
         // Clear out the damage tracker if we're in Ready state.
@@ -1827,10 +1834,10 @@ unsafe fn add_invisible_cursor(spa_buffer: *mut spa_buffer) {
     }
 }
 
-unsafe fn add_cursor_metadata(
-    renderer: &mut GlesRenderer,
+unsafe fn add_cursor_metadata<R: NiriCaptureRenderer>(
+    renderer: &mut R,
     spa_buffer: *mut spa_buffer,
-    cursor_data: &CursorData<impl RenderElement<GlesRenderer>>,
+    cursor_data: &CursorData<impl RenderElement<R>>,
     redraw: bool,
 ) {
     unsafe {
@@ -1923,15 +1930,18 @@ unsafe fn add_cursor_metadata(
     }
 }
 
-fn render_to_shmbuf(
-    renderer: &mut GlesRenderer,
+fn render_to_shmbuf<R: NiriCaptureRenderer>(
+    renderer: &mut R,
     damage_tracker: &mut OutputDamageTracker,
     buffer: &Shmbuf,
     fourcc: Fourcc,
-    elements: &[impl RenderElement<GlesRenderer>],
+    elements: &[impl RenderElement<R>],
     states: RenderElementStates,
     reference_luminance: f64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    R::Error: Send + Sync + 'static,
+{
     let _span = tracy_client::span!();
     set_sdr_capture_blend(renderer, reference_luminance);
     let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();

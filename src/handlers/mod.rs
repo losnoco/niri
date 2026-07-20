@@ -742,7 +742,7 @@ impl ScreencopyHandler for State {
         if screencopy.with_damage() {
             self.niri.screencopy_state.push(manager, screencopy);
         } else {
-            self.backend.with_primary_renderer(|renderer| {
+            crate::with_primary_renderer_any!(self.backend, |renderer| {
                 if let Err(err) = self
                     .niri
                     .render_for_screencopy_without_damage(renderer, manager, screencopy)

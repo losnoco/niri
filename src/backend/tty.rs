@@ -2203,6 +2203,14 @@ impl Tty {
         self.session.seat()
     }
 
+    pub fn primary_renderer(&mut self) -> Option<super::PrimaryRenderer<'_>> {
+        let renderer = self
+            .gpu_manager
+            .single_renderer(&self.primary_render_node)
+            .ok()?;
+        Some(super::PrimaryRenderer::Tty(renderer))
+    }
+
     pub fn with_primary_renderer<T>(
         &mut self,
         f: impl FnOnce(&mut GlesRenderer) -> T,

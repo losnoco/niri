@@ -422,12 +422,15 @@ impl FrameBlendState {
     }
 
     pub fn set_sdr_capture(renderer: &mut GlesRenderer, reference_luminance: f64) {
-        let state = Self::get(renderer);
-        state.hdr_pq.set(false);
-        state
-            .ref_lum_scale
+        Self::get(renderer).set_sdr_capture_values(reference_luminance);
+    }
+
+    /// Sets the SDR capture values on this state directly.
+    pub fn set_sdr_capture_values(&self, reference_luminance: f64) {
+        self.hdr_pq.set(false);
+        self.ref_lum_scale
             .set((reference_luminance / 10000.) as f32);
-        state.max_luminance.set(reference_luminance as f32);
+        self.max_luminance.set(reference_luminance as f32);
     }
 
     fn values_from_frame(frame: &GlesFrame) -> (bool, f32, f32) {
@@ -785,10 +788,42 @@ pub fn set_frame_blend_tty(renderer: &mut TtyRenderer, blend: Option<(f64, f64)>
 
 /// Configures the renderer for rendering into an SDR capture buffer, while preserving the
 /// reference luminance needed to convert HDR content back to SDR.
-pub fn set_sdr_capture_blend(renderer: &mut GlesRenderer, reference_luminance: f64) {
-    FrameBlendState::set_sdr_capture(renderer, reference_luminance);
-    renderer.set_default_tex_program_override(None);
-    renderer.set_solid_color_transform(None);
+pub fn set_sdr_capture_blend<R: CaptureBlend + ?Sized>(renderer: &mut R, reference_luminance: f64) {
+    renderer.set_sdr_capture_blend(reference_luminance);
+}
+
+/// Configuring a renderer for rendering into SDR capture buffers.
+pub trait CaptureBlend {
+    /// See [`set_sdr_capture_blend`].
+    fn set_sdr_capture_blend(&mut self, reference_luminance: f64);
+}
+
+impl CaptureBlend for GlesRenderer {
+    fn set_sdr_capture_blend(&mut self, reference_luminance: f64) {
+        FrameBlendState::set_sdr_capture(self, reference_luminance);
+        self.set_default_tex_program_override(None);
+        self.set_solid_color_transform(None);
+    }
+}
+
+impl CaptureBlend for TtyRenderer<'_> {
+    fn set_sdr_capture_blend(&mut self, reference_luminance: f64) {
+        match self {
+            TtyRenderer::Gles(multi) => {
+                CaptureBlend::set_sdr_capture_blend(multi.as_mut(), reference_luminance)
+            }
+            TtyRenderer::Vulkan(multi) => {
+                let vk: &mut VulkanRenderer = multi.as_mut();
+                vk.user_data().insert_if_missing(FrameBlendState::default);
+                vk.user_data()
+                    .get::<FrameBlendState>()
+                    .unwrap()
+                    .set_sdr_capture_values(reference_luminance);
+                vk.set_default_color_params(None);
+                vk.set_solid_color_transform(None);
+            }
+        }
+    }
 }
 
 /// The ST 2084 PQ inverse EOTF over clamped linear light.

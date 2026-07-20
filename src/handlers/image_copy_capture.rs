@@ -1,11 +1,12 @@
 use std::time::Duration;
 
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::{Buffer as _, Fourcc, Modifier};
 use smithay::backend::drm::DrmNode;
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
+use smithay::backend::renderer::Bind;
 use smithay::output::{Output, WeakOutput};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
@@ -28,6 +29,7 @@ use smithay::wayland::image_copy_capture::{
 use smithay::wayland::shm;
 use wayland_backend::server::Credentials;
 
+use crate::backend::Backend;
 use crate::cursor::{RenderCursor, XCursor};
 use crate::niri::{Niri, State};
 use crate::utils::{get_credentials_for_client, CastSessionId, CastStreamId};
@@ -94,8 +96,12 @@ pub fn source_output(source: &ImageCaptureSource) -> Option<Output> {
 /// clears the display's EGLDevice once a second EGLDisplay is created for the
 /// same GBM device, which the TTY backend does during initialization. See
 /// https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44351.
+///
+/// `render_formats` are the dmabuf formats the primary renderer can draw into
+/// (`Bind::<Dmabuf>::supported_formats()`), queried generically so that this
+/// works on both the GLES and Vulkan renderers.
 pub fn output_capture_constraints(
-    renderer: &GlesRenderer,
+    render_formats: Option<&FormatSet>,
     render_node: Option<DrmNode>,
     output: &Output,
 ) -> Option<BufferConstraints> {
@@ -104,13 +110,13 @@ pub fn output_capture_constraints(
 
     let dma = (|| {
         let node = render_node?;
-        let egl = renderer.egl_context();
+        let render_formats = render_formats?;
 
         // Offer all formats the renderer can draw into to avoid unnecessary
         // conversions, preserving the original order (many clients depend on
         // the order being stable to select the same format when renegotiating).
         let mut formats: Vec<(Fourcc, Vec<Modifier>)> = Vec::new();
-        for format in egl.dmabuf_render_formats().iter() {
+        for format in render_formats.iter() {
             match formats.iter_mut().find(|(code, _)| *code == format.code) {
                 Some((_, modifiers)) => modifiers.push(format.modifier),
                 None => formats.push((format.code, vec![format.modifier])),
@@ -302,11 +308,8 @@ impl ImageCopyCaptureHandler for State {
         }
 
         let render_node = self.backend.primary_render_node();
-        self.backend
-            .with_primary_renderer(|renderer| {
-                output_capture_constraints(renderer, render_node, &output)
-            })
-            .flatten()
+        let render_formats = primary_render_formats(&mut self.backend)?;
+        output_capture_constraints(render_formats.as_ref(), render_node, &output)
     }
 
     fn cursor_capture_constraints(
@@ -455,4 +458,12 @@ impl ImageCopyCaptureHandler for State {
         }
         self.niri.image_copy_capture_state.cleanup();
     }
+}
+
+/// The dmabuf formats the primary renderer can draw into, or `Some(None)` if the renderer doesn't
+/// report any. `None` if there is no primary renderer.
+pub fn primary_render_formats(backend: &mut Backend) -> Option<Option<FormatSet>> {
+    crate::with_primary_renderer_any!(backend, |renderer| {
+        Bind::<Dmabuf>::supported_formats(renderer)
+    })
 }

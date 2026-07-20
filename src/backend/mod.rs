@@ -30,6 +30,32 @@ pub enum Backend {
     Headless(Headless),
 }
 
+/// The primary renderer of a backend.
+#[allow(clippy::large_enum_variant)]
+pub enum PrimaryRenderer<'render> {
+    Tty(crate::backend::tty_renderer::TtyRenderer<'render>),
+    Gles(&'render mut GlesRenderer),
+}
+
+/// Runs a closure-like body with the backend's primary renderer, monomorphizing it over
+/// the possible renderer types (all implementing `NiriRenderer`).
+#[macro_export]
+macro_rules! with_primary_renderer_any {
+    ($backend:expr, |$renderer:ident| $body:expr) => {
+        match $backend.primary_renderer() {
+            Some($crate::backend::PrimaryRenderer::Tty(mut renderer)) => {
+                let $renderer = &mut renderer;
+                Some($body)
+            }
+            Some($crate::backend::PrimaryRenderer::Gles(renderer)) => {
+                let $renderer = renderer;
+                Some($body)
+            }
+            None => None,
+        }
+    };
+}
+
 /// HDR capabilities of an output, inserted into the [`Output`]'s user data by the backend.
 ///
 /// `supported` requires the DRM connector to expose the `Colorspace` (with BT2020_RGB) and
@@ -112,6 +138,18 @@ impl Backend {
             Backend::Tty(tty) => tty.primary_render_node(),
             Backend::Winit(winit) => winit.primary_render_node(),
             Backend::Headless(headless) => headless.primary_render_node(),
+        }
+    }
+
+    /// Returns the primary renderer, GLES or Vulkan.
+    ///
+    /// Use through [`with_primary_renderer_any!`](crate::with_primary_renderer_any), which
+    /// monomorphizes a closure body over both renderer types.
+    pub fn primary_renderer(&mut self) -> Option<PrimaryRenderer<'_>> {
+        match self {
+            Backend::Tty(tty) => tty.primary_renderer(),
+            Backend::Winit(winit) => Some(PrimaryRenderer::Gles(winit.renderer())),
+            Backend::Headless(headless) => headless.renderer().map(PrimaryRenderer::Gles),
         }
     }
 

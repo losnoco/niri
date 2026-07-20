@@ -1,5 +1,7 @@
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
+#[allow(unused_imports)]
+use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::{
     Bind, ExportMem, ImportAll, ImportMem, Offscreen, Renderer, RendererSuper, Texture,
 };
@@ -80,4 +82,38 @@ impl<'frame, 'buffer> AsGlesFrame<'frame, 'buffer> for TtyFrame<'_, 'frame, 'buf
             TtyFrame::Vulkan(_) => None,
         }
     }
+}
+
+/// The offscreen render target texture type of a renderer.
+pub trait HasOffscreen: Renderer {
+    type Offscreen: Texture + Clone + Send + 'static;
+}
+
+impl HasOffscreen for GlesRenderer {
+    type Offscreen = GlesTexture;
+}
+
+impl HasOffscreen for TtyRenderer<'_> {
+    type Offscreen = crate::backend::tty_renderer::TtyOffscreen;
+}
+
+/// Renderer bounds needed by the generic capture helpers (screenshots, screencopy,
+/// screencasting): offscreen render targets of the renderer's own texture type plus the
+/// SDR-capture blend control.
+pub trait NiriCaptureRenderer:
+    NiriRenderer
+    + HasOffscreen
+    + Offscreen<<Self as HasOffscreen>::Offscreen>
+    + Bind<<Self as HasOffscreen>::Offscreen>
+    + crate::render_helpers::blend::CaptureBlend
+{
+}
+
+impl<R> NiriCaptureRenderer for R where
+    R: NiriRenderer
+        + HasOffscreen
+        + Offscreen<<R as HasOffscreen>::Offscreen>
+        + Bind<<R as HasOffscreen>::Offscreen>
+        + crate::render_helpers::blend::CaptureBlend
+{
 }

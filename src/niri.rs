@@ -183,7 +183,7 @@ use crate::render_helpers::blend::{
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
-use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::texture::TextureBuffer;
@@ -1008,16 +1008,14 @@ impl State {
 
             // The size changed, so build the full constraints and send them to the client below.
             let render_node = self.backend.primary_render_node();
-            let constraints = self
-                .backend
-                .with_primary_renderer(|renderer| {
+            let constraints = image_copy_capture_impl::primary_render_formats(&mut self.backend)
+                .and_then(|render_formats| {
                     image_copy_capture_impl::output_capture_constraints(
-                        renderer,
+                        render_formats.as_ref(),
                         render_node,
                         &output,
                     )
-                })
-                .flatten();
+                });
             let Some(constraints) = constraints else {
                 return false;
             };
@@ -2484,7 +2482,7 @@ impl State {
     ) {
         let _span = tracy_client::span!("TakeScreenshot");
 
-        let rv = self.backend.with_primary_renderer(|renderer| {
+        let rv = crate::with_primary_renderer_any!(self.backend, |renderer| {
             let on_done = {
                 let to_screenshot = to_screenshot.clone();
                 move |path| {
@@ -5424,7 +5422,7 @@ impl Niri {
         // However, this should probably be restricted to sending frame callbacks to more surfaces,
         // to err on the safe side.
         self.send_frame_callbacks(output);
-        backend.with_primary_renderer(|renderer| {
+        crate::with_primary_renderer_any!(backend, |renderer| {
             #[cfg(feature = "xdp-gnome-screencast")]
             {
                 // Render and send to PipeWire screencast streams.
@@ -6080,11 +6078,14 @@ impl Niri {
         feedback
     }
 
-    pub fn render_for_screencopy_with_damage(
+    pub fn render_for_screencopy_with_damage<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         output: &Output,
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        OutputRenderElements<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::render_for_screencopy_with_damage");
 
         let mut screencopy_state = mem::take(&mut self.screencopy_state);
@@ -6158,12 +6159,16 @@ impl Niri {
         self.screencopy_state = screencopy_state;
     }
 
-    pub fn render_for_screencopy_without_damage(
+    pub fn render_for_screencopy_without_damage<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         manager: &ZwlrScreencopyManagerV1,
         screencopy: Screencopy,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        R::Error: Send + Sync + 'static,
+        OutputRenderElements<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::render_for_screencopy");
 
         let output = screencopy.output();
@@ -6212,12 +6217,15 @@ impl Niri {
         res
     }
 
-    pub fn render_for_image_copy_capture(
+    pub fn render_for_image_copy_capture<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         output: &Output,
         target_presentation_time: Duration,
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        OutputRenderElements<R>: RenderElement<R>,
+    {
         let Some(mode) = output.current_mode() else {
             return;
         };
@@ -6359,12 +6367,15 @@ impl Niri {
         self.image_copy_sessions = sessions;
     }
 
-    pub fn render_for_image_copy_cursor_capture(
+    pub fn render_for_image_copy_cursor_capture<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         output: &Output,
         target_presentation_time: Duration,
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        PointerRenderElements<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::render_for_image_copy_cursor_capture");
 
         let scale: Scale<f64> = output.current_scale().fractional_scale().into();
@@ -6463,11 +6474,11 @@ impl Niri {
         self.image_copy_cursor_sessions = sessions;
     }
 
-    pub fn render_cursor_for_capture(
+    pub fn render_cursor_for_capture<R: NiriRenderer>(
         &self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         output: &Output,
-    ) -> Vec<PointerRenderElements<GlesRenderer>> {
+    ) -> Vec<PointerRenderElements<R>> {
         let int_scale = output.current_scale().integer_scale();
         let output_scale = Scale::from(output.current_scale().fractional_scale());
 
@@ -6639,10 +6650,10 @@ impl Niri {
     }
 
     #[allow(clippy::type_complexity)]
-    fn render_for_screencopy_internal(
-        renderer: &mut GlesRenderer,
+    fn render_for_screencopy_internal<R: NiriCaptureRenderer>(
+        renderer: &mut R,
         damage_tracker: &mut OutputDamageTracker,
-        elements: &[impl RenderElement<GlesRenderer>],
+        elements: &[impl RenderElement<R>],
         states: RenderElementStates,
         screencopy: &Screencopy,
         reference_luminance: f64,
@@ -6777,14 +6788,18 @@ impl Niri {
         })
     }
 
-    pub fn screenshot(
+    pub fn screenshot<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         output: &Output,
         write_to_disk: bool,
         include_pointer: bool,
         path: Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        R::Error: Send + Sync + 'static,
+        OutputRenderElements<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::screenshot");
 
         self.update_render_elements(Some(output));
@@ -6815,15 +6830,19 @@ impl Niri {
             .context("error saving screenshot")
     }
 
-    pub fn screenshot_window(
+    pub fn screenshot_window<R: NiriCaptureRenderer>(
         &self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         output: &Output,
         mapped: &Mapped,
         write_to_disk: bool,
         show_pointer: bool,
         path: Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        R::Error: Send + Sync + 'static,
+        WindowScreenshotRenderElement<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::screenshot_window");
 
         let scale = Scale::from(output.current_scale().fractional_scale());
@@ -6834,7 +6853,7 @@ impl Niri {
                 mapped.rules().opacity.unwrap_or(1.).clamp(0., 1.)
             };
 
-        let mut elements: Vec<WindowScreenshotRenderElement<GlesRenderer>> = Vec::new();
+        let mut elements: Vec<WindowScreenshotRenderElement<R>> = Vec::new();
 
         // Add pointer if requested and it's over this window.
         if show_pointer {
@@ -6992,17 +7011,16 @@ impl Niri {
     }
 
     #[cfg(feature = "dbus")]
-    pub fn screenshot_all_outputs(
+    pub fn screenshot_all_outputs<R: NiriCaptureRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         include_pointer: bool,
         on_done: impl FnOnce(PathBuf) + Send + 'static,
-    ) -> anyhow::Result<()> {
-        use smithay::backend::renderer::{Bind as _, ExportMem as _};
-
-        use crate::render_helpers::copy_framebuffer;
-        use crate::render_helpers::texture::TextureRenderElement;
-
+    ) -> anyhow::Result<()>
+    where
+        R::Error: Send + Sync + 'static,
+        OutputRenderElements<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::screenshot_all_outputs");
 
         self.update_render_elements(None);
@@ -7015,12 +7033,16 @@ impl Niri {
             .max_by(f64::total_cmp)
             .context("no outputs")?;
 
-        // Render each output to a separate texture.
+        // Render each output separately at its own scale.
         //
         // Rendering everything at once doesn't quite work because elements don't like rescaling
         // (need to investigate this at some point), and even if it worked fine, it would result in
         // various 1 px jank.
-        let mut textures = Vec::new();
+        //
+        // The outputs are combined on the CPU rather than through intermediate textures, since the
+        // offscreen texture type isn't necessarily importable as a render element on every
+        // renderer (e.g. Vulkan).
+        let mut shots = Vec::new();
         for output in self.global_space.outputs() {
             let loc = self.global_space.output_geometry(output).unwrap().loc;
 
@@ -7037,7 +7059,7 @@ impl Niri {
             };
             let elements = self.render_to_vec(ctx, output, include_pointer);
 
-            let (texture, _sync) = render_to_texture(
+            let pixels = render_to_vec(
                 renderer,
                 size,
                 Scale::from(scale),
@@ -7047,45 +7069,22 @@ impl Niri {
             )
             .context("error rendering")?;
 
-            let buffer = TextureBuffer::from_texture(
-                renderer,
-                texture,
-                scale,
-                Transform::Normal,
-                Vec::new(),
+            let dst = Rectangle::new(
+                loc.to_f64().to_physical_precise_round(screenshot_scale),
+                size.to_f64()
+                    .upscale(screenshot_scale / scale)
+                    .to_i32_round(),
             );
-            let elem = TextureRenderElement::from_texture_buffer(
-                buffer,
-                loc.to_f64(),
-                1.,
-                None,
-                None,
-                Kind::Unspecified,
-            );
-
-            textures.push(elem);
+            shots.push((pixels, size, dst));
         }
 
         // Now combine everything together.
-        let (mut texture, _sync, geo) = render_to_encompassing_texture(
-            renderer,
-            Scale::from(screenshot_scale),
-            Transform::Normal,
-            Fourcc::Abgr8888,
-            &textures,
-        )
-        .context("error rendering")?;
-
-        // FIXME: unfortunate second bind.
-        let target = renderer
-            .bind(&mut texture)
-            .context("error binding texture")?;
-        let mapping = copy_framebuffer(renderer, &target, Fourcc::Abgr8888)
-            .context("error copying framebuffer")?;
-        let copy = renderer
-            .map_texture(&mapping)
-            .context("error mapping texture")?;
-        let pixels = copy.to_vec();
+        let geo = shots
+            .iter()
+            .map(|(_, _, dst)| *dst)
+            .reduce(|a, b| a.merge(b))
+            .context("no outputs")?;
+        let pixels = compose_screenshot(geo, &shots);
 
         let path = make_screenshot_path(&self.config.borrow())
             .ok()
@@ -7862,4 +7861,66 @@ niri_render_elements! {
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
     }
+}
+
+/// Combines per-output RGBA8 screenshots into one image covering `geo`.
+///
+/// Each shot is `(pixels, size, dst)`: the output rendered at its own scale with physical `size`,
+/// placed at `dst` in the combined image. Shots whose size matches their destination are copied
+/// as is; others are resampled with bilinear filtering. Areas not covered by any output are left
+/// transparent.
+#[cfg(feature = "dbus")]
+fn compose_screenshot(
+    geo: Rectangle<i32, Physical>,
+    shots: &[(Vec<u8>, Size<i32, Physical>, Rectangle<i32, Physical>)],
+) -> Vec<u8> {
+    let _span = tracy_client::span!("compose_screenshot");
+
+    let (w, h) = (geo.size.w as usize, geo.size.h as usize);
+    let mut out = vec![0u8; w * h * 4];
+
+    for (pixels, size, dst) in shots {
+        let (sw, sh) = (size.w as usize, size.h as usize);
+        let (dw, dh) = (dst.size.w as usize, dst.size.h as usize);
+        if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+            continue;
+        }
+        let ox = (dst.loc.x - geo.loc.x) as usize;
+        let oy = (dst.loc.y - geo.loc.y) as usize;
+
+        if (sw, sh) == (dw, dh) {
+            for y in 0..dh {
+                let src = &pixels[y * sw * 4..(y + 1) * sw * 4];
+                let start = ((oy + y) * w + ox) * 4;
+                out[start..start + dw * 4].copy_from_slice(src);
+            }
+            continue;
+        }
+
+        let fx = sw as f64 / dw as f64;
+        let fy = sh as f64 / dh as f64;
+        for y in 0..dh {
+            let sy = ((y as f64 + 0.5) * fy - 0.5).clamp(0., (sh - 1) as f64);
+            let y0 = sy.floor() as usize;
+            let y1 = (y0 + 1).min(sh - 1);
+            let ty = sy - y0 as f64;
+
+            for x in 0..dw {
+                let sx = ((x as f64 + 0.5) * fx - 0.5).clamp(0., (sw - 1) as f64);
+                let x0 = sx.floor() as usize;
+                let x1 = (x0 + 1).min(sw - 1);
+                let tx = sx - x0 as f64;
+
+                let px = |x: usize, y: usize, c: usize| f64::from(pixels[(y * sw + x) * 4 + c]);
+                let dst_idx = ((oy + y) * w + ox + x) * 4;
+                for c in 0..4 {
+                    let top = px(x0, y0, c) * (1. - tx) + px(x1, y0, c) * tx;
+                    let bottom = px(x0, y1, c) * (1. - tx) + px(x1, y1, c) * tx;
+                    out[dst_idx + c] = (top * (1. - ty) + bottom * ty).round() as u8;
+                }
+            }
+        }
+    }
+
+    out
 }

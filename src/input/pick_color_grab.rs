@@ -39,59 +39,58 @@ impl PickColorGrab {
         let (output, pos_within_output) = data.niri.output_under(location)?;
         let output = output.clone();
 
-        data.backend
-            .with_primary_renderer(|renderer| {
-                data.niri.update_render_elements(Some(&output));
+        crate::with_primary_renderer_any!(data.backend, |renderer| {
+            data.niri.update_render_elements(Some(&output));
 
-                let scale = Scale::from(output.current_scale().fractional_scale());
-                // FIXME: perhaps replace floor with round once we figure out the pointer behavior
-                // at the bottom/right edges of the monitors.
-                let pos = pos_within_output.to_physical_precise_floor(scale);
-                let size = Size::<i32, Physical>::from((1, 1));
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            // FIXME: perhaps replace floor with round once we figure out the pointer behavior
+            // at the bottom/right edges of the monitors.
+            let pos = pos_within_output.to_physical_precise_floor(scale);
+            let size = Size::<i32, Physical>::from((1, 1));
 
-                let ctx = RenderCtx {
-                    renderer,
-                    // This is an interactive operation so we can render without blocking out.
-                    target: RenderTarget::Output,
-                    xray: None,
-                };
-                let elements = data.niri.render_to_vec(ctx, &output, false);
+            let ctx = RenderCtx {
+                renderer,
+                // This is an interactive operation so we can render without blocking out.
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            let elements = data.niri.render_to_vec(ctx, &output, false);
 
-                let mapping = match render_and_download(
-                    renderer,
-                    size,
-                    scale,
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    elements.iter().rev().map(|elem| {
-                        let offset = pos.upscale(-1);
-                        RelocateRenderElement::from_element(elem, offset, Relocate::Relative)
-                    }),
-                ) {
-                    Ok(mapping) => mapping,
-                    Err(_) => return None,
-                };
-                let pixels = match renderer.map_texture(&mapping) {
-                    Ok(pixels) => pixels,
-                    Err(_) => return None,
-                };
+            let mapping = match render_and_download(
+                renderer,
+                size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev().map(|elem| {
+                    let offset = pos.upscale(-1);
+                    RelocateRenderElement::from_element(elem, offset, Relocate::Relative)
+                }),
+            ) {
+                Ok(mapping) => mapping,
+                Err(_) => return None,
+            };
+            let pixels = match renderer.map_texture(&mapping) {
+                Ok(pixels) => pixels,
+                Err(_) => return None,
+            };
 
-                if pixels.len() == 4 {
-                    let rgb = [
-                        f64::from(pixels[0]) / 255.0,
-                        f64::from(pixels[1]) / 255.0,
-                        f64::from(pixels[2]) / 255.0,
-                    ];
-                    Some(PickedColor { rgb })
-                } else {
-                    error!(
-                        "unexpected pixel data length: {} (expected 4)",
-                        pixels.len()
-                    );
-                    None
-                }
-            })
-            .flatten()
+            if pixels.len() == 4 {
+                let rgb = [
+                    f64::from(pixels[0]) / 255.0,
+                    f64::from(pixels[1]) / 255.0,
+                    f64::from(pixels[2]) / 255.0,
+                ];
+                Some(PickedColor { rgb })
+            } else {
+                error!(
+                    "unexpected pixel data length: {} (expected 4)",
+                    pixels.len()
+                );
+                None
+            }
+        })
+        .flatten()
     }
 }
 

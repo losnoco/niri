@@ -734,3 +734,74 @@ impl TtyGpuManager {
         }
     }
 }
+
+/// Offscreen render target texture of the TTY backend renderer.
+#[derive(Debug, Clone)]
+pub enum TtyOffscreen {
+    Gles(GlesTexture),
+    Vulkan(smithay::backend::renderer::vulkan::VulkanTexture),
+}
+
+impl Texture for TtyOffscreen {
+    fn width(&self) -> u32 {
+        match self {
+            TtyOffscreen::Gles(texture) => texture.width(),
+            TtyOffscreen::Vulkan(texture) => texture.width(),
+        }
+    }
+
+    fn height(&self) -> u32 {
+        match self {
+            TtyOffscreen::Gles(texture) => texture.height(),
+            TtyOffscreen::Vulkan(texture) => texture.height(),
+        }
+    }
+
+    fn size(&self) -> Size<i32, BufferCoord> {
+        match self {
+            TtyOffscreen::Gles(texture) => texture.size(),
+            TtyOffscreen::Vulkan(texture) => texture.size(),
+        }
+    }
+
+    fn format(&self) -> Option<Fourcc> {
+        match self {
+            TtyOffscreen::Gles(texture) => Texture::format(texture),
+            TtyOffscreen::Vulkan(texture) => Texture::format(texture),
+        }
+    }
+}
+
+impl Offscreen<TtyOffscreen> for TtyRenderer<'_> {
+    fn create_buffer(
+        &mut self,
+        format: Fourcc,
+        size: Size<i32, BufferCoord>,
+    ) -> Result<TtyOffscreen, Self::Error> {
+        match self {
+            TtyRenderer::Gles(renderer) => {
+                Ok(TtyOffscreen::Gles(renderer.create_buffer(format, size)?))
+            }
+            TtyRenderer::Vulkan(renderer) => {
+                Ok(TtyOffscreen::Vulkan(renderer.create_buffer(format, size)?))
+            }
+        }
+    }
+}
+
+impl Bind<TtyOffscreen> for TtyRenderer<'_> {
+    fn bind<'a>(
+        &mut self,
+        target: &'a mut TtyOffscreen,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        match (self, target) {
+            (TtyRenderer::Gles(renderer), TtyOffscreen::Gles(target)) => {
+                Ok(TtyFramebuffer::Gles(renderer.bind(target)?))
+            }
+            (TtyRenderer::Vulkan(renderer), TtyOffscreen::Vulkan(target)) => {
+                Ok(TtyFramebuffer::Vulkan(renderer.bind(target)?))
+            }
+            _ => unreachable!("mismatched TtyRenderer and TtyOffscreen variants"),
+        }
+    }
+}

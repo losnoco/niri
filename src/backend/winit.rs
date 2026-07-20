@@ -305,6 +305,10 @@ impl Winit {
         self.render_node
     }
 
+    pub fn renderer(&mut self) -> &mut GlesRenderer {
+        self.backend.renderer()
+    }
+
     pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
         let _span = tracy_client::span!("Winit::render");
 

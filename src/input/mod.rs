@@ -755,7 +755,7 @@ impl State {
             Action::ScreenshotScreen(write_to_disk, show_pointer, path) => {
                 let active = self.niri.layout.active_output().cloned();
                 if let Some(active) = active {
-                    self.backend.with_primary_renderer(|renderer| {
+                    crate::with_primary_renderer_any!(self.backend, |renderer| {
                         if let Err(err) = self.niri.screenshot(
                             renderer,
                             &active,
@@ -793,7 +793,7 @@ impl State {
             Action::ScreenshotWindow(write_to_disk, show_pointer, path) => {
                 let focus = self.niri.layout.focus_with_output();
                 if let Some((mapped, output)) = focus {
-                    self.backend.with_primary_renderer(|renderer| {
+                    crate::with_primary_renderer_any!(self.backend, |renderer| {
                         if let Err(err) = self.niri.screenshot_window(
                             renderer,
                             output,
@@ -817,7 +817,7 @@ impl State {
                 let window = windows.find(|(_, m)| m.id().get() == id);
                 if let Some((Some(monitor), mapped)) = window {
                     let output = monitor.output();
-                    self.backend.with_primary_renderer(|renderer| {
+                    crate::with_primary_renderer_any!(self.backend, |renderer| {
                         if let Err(err) = self.niri.screenshot_window(
                             renderer,
                             output,
