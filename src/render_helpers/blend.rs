@@ -749,6 +749,71 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, blend: Option<(f64, f64)>) {
     }
 }
 
+/// The `niri_blend` values of a Vulkan frame as custom shader uniforms, for niri's own
+/// shader programs (which embed the blend stage).
+pub fn vulkan_blend_custom_uniforms(
+    frame: &VulkanFrame,
+    content: ContentColor,
+) -> Vec<smithay::backend::renderer::vulkan::CustomUniform<'static>> {
+    use smithay::backend::renderer::vulkan::{CustomUniform, CustomUniformValue};
+
+    let p = FrameBlendState::vulkan_params_for_content(frame, content);
+    vec![
+        CustomUniform {
+            name: "niri_hdr_pq",
+            value: CustomUniformValue::Float(p.hdr_pq),
+        },
+        CustomUniform {
+            name: "niri_ref_lum_scale",
+            value: CustomUniformValue::Float(p.ref_lum_scale),
+        },
+        CustomUniform {
+            name: "niri_linear",
+            value: CustomUniformValue::Float(p.linear),
+        },
+        CustomUniform {
+            name: "niri_linear_scale",
+            value: CustomUniformValue::Float(p.linear_scale),
+        },
+        CustomUniform {
+            name: "niri_linear_to_ref",
+            value: CustomUniformValue::Float(p.linear_to_ref),
+        },
+        CustomUniform {
+            name: "niri_hdr_to_sdr",
+            value: CustomUniformValue::Float(p.hdr_to_sdr),
+        },
+        CustomUniform {
+            name: "niri_pq_gamut",
+            value: CustomUniformValue::Float(p.pq_gamut),
+        },
+        CustomUniform {
+            name: "niri_use_gamut",
+            value: CustomUniformValue::Float(p.use_gamut),
+        },
+        CustomUniform {
+            name: "niri_gamut",
+            value: CustomUniformValue::Mat3(p.gamut),
+        },
+        CustomUniform {
+            name: "niri_tonemap",
+            value: CustomUniformValue::Float(p.tonemap),
+        },
+        CustomUniform {
+            name: "niri_tm_v",
+            value: CustomUniformValue::Float(p.tm_v),
+        },
+        CustomUniform {
+            name: "niri_tm_ref_scale",
+            value: CustomUniformValue::Float(p.tm_ref_scale),
+        },
+        CustomUniform {
+            name: "niri_tm_out_scale",
+            value: CustomUniformValue::Float(p.tm_out_scale),
+        },
+    ]
+}
+
 /// [`set_frame_blend`] over the TTY backend renderer.
 ///
 /// On the Vulkan renderer, HDR frames install default [`ColorBlendParams`] performing the

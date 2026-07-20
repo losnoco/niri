@@ -81,7 +81,7 @@ use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::blend::{self, set_frame_blend_tty, DEFAULT_REFERENCE_LUMINANCE};
 use crate::render_helpers::debug::draw_damage;
-use crate::render_helpers::renderer::AsGlesRenderer;
+use crate::render_helpers::renderer::{AsGlesRenderer, AsVulkanRenderer};
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
@@ -893,25 +893,27 @@ impl Tty {
                 debug!("bound legacy EGL to wl_display");
             }
 
-            if let Some(gles_renderer) = renderer.as_gles_renderer() {
+            if renderer.as_gles_renderer().is_some() {
+                let gles_renderer = renderer.as_gles_renderer().unwrap();
                 resources::init(gles_renderer);
                 shaders::init(gles_renderer);
                 blend::FrameBlendState::init(gles_renderer);
-
-                let config = self.config.borrow();
-                if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {
-                    shaders::set_custom_resize_program(gles_renderer, Some(src));
-                }
-                if let Some(src) = config.animations.window_close.custom_shader.as_deref() {
-                    shaders::set_custom_close_program(gles_renderer, Some(src));
-                }
-                if let Some(src) = config.animations.window_open.custom_shader.as_deref() {
-                    shaders::set_custom_open_program(gles_renderer, Some(src));
-                }
-                drop(config);
-            } else {
-                warn!("running on the vulkan renderer: custom shaders and effects are unavailable");
+            } else if renderer.as_vulkan_renderer().is_some() {
+                shaders::init_vulkan(renderer.as_vulkan_renderer().unwrap());
+                info!("running on the vulkan renderer");
             }
+
+            let config = self.config.borrow();
+            if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {
+                shaders::set_custom_resize_program(&mut renderer, Some(src));
+            }
+            if let Some(src) = config.animations.window_close.custom_shader.as_deref() {
+                shaders::set_custom_close_program(&mut renderer, Some(src));
+            }
+            if let Some(src) = config.animations.window_open.custom_shader.as_deref() {
+                shaders::set_custom_open_program(&mut renderer, Some(src));
+            }
+            drop(config);
 
             niri.update_shaders();
 

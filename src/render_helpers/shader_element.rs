@@ -36,7 +36,13 @@ pub struct ShaderRenderElement {
 }
 
 #[derive(Debug, Clone)]
-pub struct ShaderProgram(Rc<ShaderProgramInner>);
+pub enum ShaderProgram {
+    Gles(GlesShaderProgram),
+    Vulkan(smithay::backend::renderer::vulkan::VulkanPixelProgram),
+}
+
+#[derive(Debug, Clone)]
+pub struct GlesShaderProgram(Rc<ShaderProgramInner>);
 
 #[derive(Debug)]
 struct ShaderProgramInner {
@@ -61,7 +67,11 @@ struct ShaderProgramInternal {
 
 impl PartialEq for ShaderProgram {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
+        match (self, other) {
+            (ShaderProgram::Gles(a), ShaderProgram::Gles(b)) => Rc::ptr_eq(&a.0, &b.0),
+            (ShaderProgram::Vulkan(a), ShaderProgram::Vulkan(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -71,7 +81,7 @@ unsafe fn compile_program(
     additional_uniforms: &[UniformName<'_>],
     texture_uniforms: &[&str],
     // destruction_callback_sender: Sender<CleanupResource>,
-) -> Result<ShaderProgram, GlesError> {
+) -> Result<GlesShaderProgram, GlesError> {
     let shader = format!("#version 100\n{src}");
     let program = unsafe { link_program(gl, include_str!("shaders/texture.vert"), &shader)? };
     let debug_shader = format!("#version 100\n#define DEBUG_FLAGS\n{src}");
@@ -87,7 +97,7 @@ unsafe fn compile_program(
     let alpha = c"niri_alpha";
     let tint = c"niri_tint";
 
-    Ok(ShaderProgram(Rc::new(ShaderProgramInner {
+    Ok(GlesShaderProgram(Rc::new(ShaderProgramInner {
         normal: ShaderProgramInternal {
             program,
             uniform_matrix: gl.GetUniformLocation(program, matrix.as_ptr()),
@@ -173,16 +183,45 @@ impl ShaderProgram {
         let mut additional_uniforms = additional_uniforms.to_vec();
         additional_uniforms.extend(FrameBlendState::uniform_names());
 
-        renderer.with_context(move |gl| unsafe {
-            compile_program(gl, &src, &additional_uniforms, texture_uniforms)
-        })?
+        Ok(ShaderProgram::Gles(renderer.with_context(
+            move |gl| unsafe { compile_program(gl, &src, &additional_uniforms, texture_uniforms) },
+        )??))
+    }
+
+    /// Compiles the same program for the Vulkan renderer.
+    ///
+    /// The GLES source is transformed to Vulkan GLSL: uniform declarations move into the
+    /// generated std140 block, `niri_v_coords` becomes the vertex input, and alpha/tint come
+    /// from the push constants.
+    pub fn compile_vulkan(
+        renderer: &mut smithay::backend::renderer::vulkan::VulkanRenderer,
+        src: &str,
+        additional_uniforms: &[UniformName<'_>],
+        texture_uniforms: &[&str],
+    ) -> anyhow::Result<Self> {
+        let mut src = src.to_string();
+        src.push_str(include_str!("shaders/hdr.frag"));
+        let mut additional_uniforms = additional_uniforms.to_vec();
+        additional_uniforms.extend(FrameBlendState::uniform_names());
+
+        let program = super::shaders::compile_vulkan_program(
+            renderer,
+            &src,
+            &additional_uniforms,
+            texture_uniforms,
+        )?;
+        Ok(ShaderProgram::Vulkan(program))
     }
 
     pub fn destroy(self, renderer: &mut GlesRenderer) -> Result<(), GlesError> {
-        renderer.with_context(move |gl| unsafe {
-            gl.DeleteProgram(self.0.normal.program);
-            gl.DeleteProgram(self.0.debug.program);
-        })
+        match self {
+            ShaderProgram::Gles(program) => renderer.with_context(move |gl| unsafe {
+                gl.DeleteProgram(program.0.normal.program);
+                gl.DeleteProgram(program.0.debug.program);
+            }),
+            // Deferred destruction happens internally.
+            ShaderProgram::Vulkan(_) => Ok(()),
+        }
     }
 }
 
@@ -311,7 +350,9 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
             return Ok(());
         };
 
-        let Some(shader) = Shaders::get_from_frame(frame).program(self.program) else {
+        let Some(ShaderProgram::Gles(shader)) =
+            Shaders::get_from_frame(frame).program(self.program)
+        else {
             return Ok(());
         };
 
@@ -542,6 +583,79 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
     }
 }
 
+impl ShaderRenderElement {
+    fn draw_vulkan(
+        &self,
+        frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), TtyRendererError<'_>> {
+        use smithay::backend::renderer::multigpu::Error as MultiError;
+        use smithay::backend::renderer::vulkan::{CustomUniform, CustomUniformValue};
+
+        let _span = tracy_client::span!("ShaderRenderElement::draw_vulkan");
+
+        // Snapshot textures are not supported on the Vulkan renderer yet.
+        if !self.textures.is_empty() {
+            return Ok(());
+        }
+
+        let Some(program) = frame
+            .user_data()
+            .get::<Shaders>()
+            .and_then(|shaders| shaders.program(self.program))
+        else {
+            return Ok(());
+        };
+        let ShaderProgram::Vulkan(program) = program else {
+            return Ok(());
+        };
+
+        let mut uniforms: Vec<CustomUniform<'_>> = self
+            .additional_uniforms
+            .iter()
+            .filter_map(uniform_to_custom)
+            .collect();
+        uniforms.push(CustomUniform {
+            name: "niri_size",
+            value: CustomUniformValue::Vec2([dst.size.w as f32, dst.size.h as f32]),
+        });
+        uniforms.push(CustomUniform {
+            name: "niri_scale",
+            value: CustomUniformValue::Float(self.scale),
+        });
+        uniforms.extend(super::blend::vulkan_blend_custom_uniforms(
+            frame,
+            super::blend::ContentColor::default(),
+        ));
+
+        frame
+            .render_custom(&program, dst, damage, &uniforms, &[], self.alpha)
+            .map_err(|err| TtyRendererError::Vulkan(MultiError::Render(err)))
+    }
+}
+
+/// Converts a GLES uniform value into a custom shader uniform, skipping unsupported types.
+fn uniform_to_custom<'a>(
+    uniform: &'a Uniform<'_>,
+) -> Option<smithay::backend::renderer::vulkan::CustomUniform<'a>> {
+    use smithay::backend::renderer::gles::UniformValue;
+    use smithay::backend::renderer::vulkan::{CustomUniform, CustomUniformValue};
+
+    let value = match &uniform.value {
+        UniformValue::_1f(a) => CustomUniformValue::Float(*a),
+        UniformValue::_2f(a, b) => CustomUniformValue::Vec2([*a, *b]),
+        UniformValue::_3f(a, b, c) => CustomUniformValue::Vec3([*a, *b, *c]),
+        UniformValue::_4f(a, b, c, d) => CustomUniformValue::Vec4([*a, *b, *c, *d]),
+        UniformValue::Matrix3x3 { matrices, .. } => CustomUniformValue::Mat3(*matrices.first()?),
+        _ => return None,
+    };
+    Some(CustomUniform {
+        name: &uniform.name,
+        value,
+    })
+}
+
 impl<'render> RenderElement<TtyRenderer<'render>> for ShaderRenderElement {
     fn draw(
         &self,
@@ -552,6 +666,12 @@ impl<'render> RenderElement<TtyRenderer<'render>> for ShaderRenderElement {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
+        if let TtyFrame::Vulkan(multi) = frame {
+            let vk_frame: &mut smithay::backend::renderer::vulkan::VulkanFrame<'_, '_> =
+                multi.as_mut();
+            return self.draw_vulkan(vk_frame, dst, damage);
+        }
+
         let Some(frame) = frame.as_gles_frame() else {
             return Ok(());
         };
