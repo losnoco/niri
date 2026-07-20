@@ -2334,10 +2334,9 @@ impl State {
 
         self.niri.update_render_elements(None);
 
-        let Some(screenshots) = self
-            .backend
-            .with_primary_renderer(|renderer| self.niri.capture_screenshots(renderer).collect())
-        else {
+        let Some(screenshots) = crate::with_primary_renderer_any!(self.backend, |renderer| {
+            self.niri.capture_screenshots(renderer).collect()
+        }) else {
             return;
         };
 
@@ -2356,7 +2355,7 @@ impl State {
             tool.unset_grab(self, SERIAL_COUNTER.next_serial(), time);
         }
 
-        self.backend.with_primary_renderer(|renderer| {
+        crate::with_primary_renderer_any!(self.backend, |renderer| {
             self.niri
                 .screenshot_ui
                 .open(renderer, screenshots, default_output, show_pointer, path)
@@ -2390,7 +2389,7 @@ impl State {
         };
         let path = path.take();
 
-        self.backend.with_primary_renderer(|renderer| {
+        crate::with_primary_renderer_any!(self.backend, |renderer| {
             match self.niri.screenshot_ui.capture(renderer) {
                 Ok((size, pixels)) => {
                     if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
@@ -6744,10 +6743,19 @@ impl Niri {
         self.queue_redraw_all();
     }
 
-    pub fn capture_screenshots<'a>(
+    pub fn capture_screenshots<'a, R: NiriCaptureRenderer>(
         &'a self,
-        renderer: &'a mut GlesRenderer,
-    ) -> impl Iterator<Item = (Output, [OutputScreenshot; 3])> + 'a {
+        renderer: &'a mut R,
+    ) -> impl Iterator<Item = (Output, [OutputScreenshot; 3])> + 'a
+    where
+        PointerRenderElements<R>: RenderElement<R>,
+        TileRenderElement<R>: RenderElement<R>,
+        WindowMruUiRenderElement<R>: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+        R::Error: Send + Sync + 'static,
+        OutputRenderElements<R>: RenderElement<R>,
+    {
         self.global_space.outputs().cloned().filter_map(|output| {
             let size = output.current_mode().unwrap().size;
             let transform = output.current_transform();
@@ -6810,13 +6818,8 @@ impl Niri {
                     OutputScreenshot::from_textures(
                         renderer,
                         scale,
-                        texture.into_gles().expect("screenshot UI runs on GLES"),
-                        res_pointer.map(|(texture, _, geo)| {
-                            (
-                                texture.into_gles().expect("screenshot UI runs on GLES"),
-                                geo,
-                            )
-                        }),
+                        texture,
+                        res_pointer.map(|(texture, _, geo)| (texture, geo)),
                     )
                 })
             });
@@ -7583,7 +7586,18 @@ impl Niri {
         }
     }
 
-    pub fn do_screen_transition(&mut self, renderer: &mut GlesRenderer, delay_ms: Option<u16>) {
+    pub fn do_screen_transition<R: NiriCaptureRenderer>(
+        &mut self,
+        renderer: &mut R,
+        delay_ms: Option<u16>,
+    ) where
+        TileRenderElement<R>: RenderElement<R>,
+        WindowMruUiRenderElement<R>: RenderElement<R>,
+        LayoutElementRenderElement<R>: RenderElement<R>,
+        UniversalTextureRenderElement: RenderElement<R>,
+        R::Error: Send + Sync + 'static,
+        OutputRenderElements<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::do_screen_transition");
 
         self.update_render_elements(None);
@@ -7632,11 +7646,7 @@ impl Niri {
                 }
 
                 let textures = textures.map(|res| {
-                    let texture = res
-                        .unwrap()
-                        .0
-                        .into_gles()
-                        .expect("screen transition runs on GLES");
+                    let texture = res.unwrap().0;
                     TextureBuffer::from_texture(
                         renderer,
                         texture,
@@ -7912,6 +7922,7 @@ niri_render_elements! {
         WindowMruUi = WindowMruUiRenderElement<R>,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         Texture = PrimaryGpuTextureRenderElement,
+        UniversalTexture = UniversalTextureRenderElement,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
     }

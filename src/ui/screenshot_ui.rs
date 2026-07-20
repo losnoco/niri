@@ -14,19 +14,21 @@ use pangocairo::cairo::{self, ImageSurface};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
-use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
-use smithay::backend::renderer::{ExportMem, Texture as _};
+use smithay::backend::renderer::element::{Kind, RenderElement};
+use smithay::backend::renderer::Texture as _;
 use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::animation::{Animation, Clock};
+use crate::backend::tty_renderer::TtyOffscreen;
 use crate::layout::floating::DIRECTIONAL_MOVE_PX;
 use crate::niri_render_elements;
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
+use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::{
+    TextureBuffer, TextureRenderElement, UniversalTextureRenderElement,
+};
 use crate::render_helpers::{render_to_texture, RenderTarget};
 use crate::utils::to_physical_precise_round;
 
@@ -94,18 +96,18 @@ pub struct OutputData {
     screenshot: [OutputScreenshot; 3],
     buffers: [SolidColorBuffer; 8],
     locations: [Point<i32, Physical>; 8],
-    panel: Option<(TextureBuffer<GlesTexture>, TextureBuffer<GlesTexture>)>,
+    panel: Option<(TextureBuffer<TtyOffscreen>, TextureBuffer<TtyOffscreen>)>,
 }
 
 pub struct OutputScreenshot {
-    texture: GlesTexture,
-    buffer: PrimaryGpuTextureRenderElement,
-    pointer: Option<PrimaryGpuTextureRenderElement>,
+    texture: TtyOffscreen,
+    buffer: UniversalTextureRenderElement,
+    pointer: Option<UniversalTextureRenderElement>,
 }
 
 niri_render_elements! {
     ScreenshotUiRenderElement => {
-        Screenshot = PrimaryGpuTextureRenderElement,
+        Screenshot = UniversalTextureRenderElement,
         SolidColor = SolidColorRenderElement,
     }
 }
@@ -135,9 +137,9 @@ impl ScreenshotUi {
         }
     }
 
-    pub fn open(
+    pub fn open<R: NiriRenderer>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         // Output, screencast, screen capture.
         screenshots: HashMap<Output, [OutputScreenshot; 3]>,
         default_output: Output,
@@ -657,7 +659,7 @@ impl ScreenshotUi {
                 .to_f64()
                 .to_logical(scale);
 
-            let elem = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
+            let elem = UniversalTextureRenderElement(TextureRenderElement::from_texture_buffer(
                 buffer.clone(),
                 location,
                 alpha * progress,
@@ -694,10 +696,12 @@ impl ScreenshotUi {
         push(screenshot.buffer.clone().into());
     }
 
-    pub fn capture(
-        &self,
-        renderer: &mut GlesRenderer,
-    ) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)> {
+    pub fn capture<R>(&self, renderer: &mut R) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)>
+    where
+        R: NiriCaptureRenderer,
+        R::Error: Send + Sync + 'static,
+        UniversalTextureRenderElement: RenderElement<R>,
+    {
         let _span = tracy_client::span!("ScreenshotUi::capture");
 
         let Self::Open {
@@ -739,7 +743,6 @@ impl ScreenshotUi {
                 );
                 match res {
                     Ok((texture, _)) => {
-                        let texture = texture.into_gles().expect("screenshot UI runs on GLES");
                         tex_rect = Some((texture, Rectangle::from_size(rect.size)));
                     }
                     Err(err) => {
@@ -749,15 +752,19 @@ impl ScreenshotUi {
             }
         }
 
-        let (texture, rect) = tex_rect.unwrap_or_else(|| (screenshot.texture.clone(), rect));
+        let (mut texture, rect) = tex_rect.unwrap_or_else(|| (screenshot.texture.clone(), rect));
         // The size doesn't actually matter because we're not transforming anything.
         let buf_rect = rect
             .to_logical(1)
             .to_buffer(1, Transform::Normal, &Size::from((1, 1)));
 
+        let texture = R::unwrap_offscreen(&mut texture)
+            .context("screenshot texture is from a different renderer")?;
+        let target = renderer.bind(texture).context("error binding texture")?;
         let mapping = renderer
-            .copy_texture(&texture, buf_rect, Fourcc::Abgr8888)
+            .copy_framebuffer(&target, buf_rect, Fourcc::Abgr8888)
             .context("error copying texture")?;
+        drop(target);
         let copy = renderer
             .map_texture(&mapping)
             .context("error mapping texture")?;
@@ -1023,13 +1030,13 @@ impl ScreenshotUi {
 }
 
 impl OutputScreenshot {
-    pub fn from_textures(
-        renderer: &mut GlesRenderer,
+    pub fn from_textures<R: NiriRenderer>(
+        renderer: &mut R,
         scale: Scale<f64>,
-        texture: GlesTexture,
-        pointer: Option<(GlesTexture, Rectangle<i32, Physical>)>,
+        texture: TtyOffscreen,
+        pointer: Option<(TtyOffscreen, Rectangle<i32, Physical>)>,
     ) -> Self {
-        let buffer = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
+        let buffer = UniversalTextureRenderElement(TextureRenderElement::from_texture_buffer(
             TextureBuffer::from_texture(
                 renderer,
                 texture.clone(),
@@ -1045,7 +1052,7 @@ impl OutputScreenshot {
         ));
 
         let pointer = pointer.map(|(texture, geo)| {
-            PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
+            UniversalTextureRenderElement(TextureRenderElement::from_texture_buffer(
                 TextureBuffer::from_texture(
                     renderer,
                     texture,
@@ -1132,11 +1139,11 @@ fn is_within_capture_button(
     (pos.x - xc) * (pos.x - xc) + (pos.y - yc) * (pos.y - yc) <= radius * radius
 }
 
-fn render_panel(
-    renderer: &mut GlesRenderer,
+fn render_panel<R: NiriRenderer>(
+    renderer: &mut R,
     scale: f64,
     text: &str,
-) -> anyhow::Result<TextureBuffer<GlesTexture>> {
+) -> anyhow::Result<TextureBuffer<TtyOffscreen>> {
     let _span = tracy_client::span!("screenshot_ui::render_panel");
 
     let padding: i32 = to_physical_precise_round(scale, PADDING);
@@ -1227,5 +1234,5 @@ fn render_panel(
         Vec::new(),
     )?;
 
-    Ok(buffer)
+    Ok(buffer.map_texture(R::wrap_texture))
 }

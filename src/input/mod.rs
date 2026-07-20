@@ -748,7 +748,7 @@ impl State {
                 spawn_sh(command, Some(token.clone()));
             }
             Action::DoScreenTransition(delay_ms) => {
-                self.backend.with_primary_renderer(|renderer| {
+                crate::with_primary_renderer_any!(self.backend, |renderer| {
                     self.niri.do_screen_transition(renderer, delay_ms);
                 });
             }

@@ -1,12 +1,13 @@
 use std::time::Duration;
 
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::GlesTexture;
 use smithay::utils::{Scale, Transform};
 
 use crate::animation::Clock;
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::backend::tty_renderer::TtyOffscreen;
+use crate::render_helpers::texture::{
+    TextureBuffer, TextureRenderElement, UniversalTextureRenderElement,
+};
 use crate::render_helpers::RenderTarget;
 
 pub const DELAY: Duration = Duration::from_millis(250);
@@ -15,7 +16,7 @@ pub const DURATION: Duration = Duration::from_millis(500);
 #[derive(Debug)]
 pub struct ScreenTransition {
     /// Texture to crossfade from for each render target.
-    from_texture: [TextureBuffer<GlesTexture>; 3],
+    from_texture: [TextureBuffer<TtyOffscreen>; 3],
     /// Monotonic time when to start the crossfade.
     start_at: Duration,
     /// Clock to drive animations.
@@ -24,7 +25,7 @@ pub struct ScreenTransition {
 
 impl ScreenTransition {
     pub fn new(
-        from_texture: [TextureBuffer<GlesTexture>; 3],
+        from_texture: [TextureBuffer<TtyOffscreen>; 3],
         delay: Duration,
         clock: Clock,
     ) -> Self {
@@ -47,7 +48,7 @@ impl ScreenTransition {
         }
     }
 
-    pub fn render(&self, target: RenderTarget) -> PrimaryGpuTextureRenderElement {
+    pub fn render(&self, target: RenderTarget) -> UniversalTextureRenderElement {
         // Screen transition ignores animation slowdown.
         let now = self.clock.now_unadjusted();
 
@@ -65,7 +66,7 @@ impl ScreenTransition {
             RenderTarget::ScreenCapture => 2,
         };
 
-        PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
+        UniversalTextureRenderElement(TextureRenderElement::from_texture_buffer(
             self.from_texture[idx].clone(),
             (0., 0.),
             alpha,
