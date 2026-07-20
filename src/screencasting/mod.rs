@@ -16,6 +16,7 @@ use smithay::utils::{DeviceFd, Physical, Point, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
+use crate::layout::tile::TileRenderElement;
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriCaptureRenderer;
@@ -24,6 +25,7 @@ use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 use crate::window::mapped::{MappedId, WindowCastRenderElements};
 
 mod pw_utils;
+use crate::ui::mru::WindowMruUiRenderElement;
 use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
 
 pub struct Screencasting {
@@ -546,6 +548,8 @@ impl Niri {
         R::Error: Send + Sync + 'static,
         CastRenderElement<R>: RenderElement<R>,
         OutputRenderElements<R>: RenderElement<R>,
+        WindowMruUiRenderElement<R>: RenderElement<R>,
+        TileRenderElement<R>: RenderElement<R>,
     {
         let _span = tracy_client::span!("Niri::render_for_screen_cast");
 

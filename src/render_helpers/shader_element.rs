@@ -5,8 +5,8 @@ use std::rc::Rc;
 use glam::{Mat3, Vec2};
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{
-    ffi, link_program, Capability, GlesError, GlesFrame, GlesRenderer, GlesTexture, Uniform,
-    UniformDesc, UniformName,
+    ffi, link_program, Capability, GlesError, GlesFrame, GlesRenderer, Uniform, UniformDesc,
+    UniformName,
 };
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::backend::renderer::DebugFlags;
@@ -18,6 +18,7 @@ use super::renderer::AsGlesFrame;
 use super::resources::Resources;
 use super::shaders::{ProgramType, Shaders};
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
+use crate::backend::tty_renderer::TtyOffscreen;
 
 /// Renders a shader with optional texture input, on the primary GPU.
 #[derive(Debug, Clone)]
@@ -31,7 +32,7 @@ pub struct ShaderRenderElement {
     scale: f32,
     alpha: f32,
     additional_uniforms: Rc<[Uniform<'static>]>,
-    textures: HashMap<String, GlesTexture>,
+    textures: HashMap<String, TtyOffscreen>,
     kind: Kind,
 }
 
@@ -235,7 +236,7 @@ impl ShaderRenderElement {
         scale: f32,
         alpha: f32,
         additional_uniforms: Rc<[Uniform<'static>]>,
-        textures: HashMap<String, GlesTexture>,
+        textures: HashMap<String, TtyOffscreen>,
         kind: Kind,
     ) -> Self {
         Self {
@@ -278,7 +279,7 @@ impl ShaderRenderElement {
         scale: f32,
         alpha: f32,
         uniforms: Rc<[Uniform<'static>]>,
-        textures: HashMap<String, GlesTexture>,
+        textures: HashMap<String, TtyOffscreen>,
     ) {
         self.area.size = size;
         self.opaque_regions = opaque_regions.unwrap_or_default();
@@ -441,6 +442,9 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
 
             unsafe {
                 for (i, texture) in self.textures.values().enumerate() {
+                    let TtyOffscreen::Gles(texture) = texture else {
+                        return Ok(());
+                    };
                     gl.ActiveTexture(ffi::TEXTURE0 + i as u32);
                     gl.BindTexture(ffi::TEXTURE_2D, texture.tex_id());
                     gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
@@ -595,9 +599,13 @@ impl ShaderRenderElement {
 
         let _span = tracy_client::span!("ShaderRenderElement::draw_vulkan");
 
-        // Snapshot textures are not supported on the Vulkan renderer yet.
-        if !self.textures.is_empty() {
-            return Ok(());
+        let mut textures: Vec<(&str, &smithay::backend::renderer::vulkan::VulkanTexture)> =
+            Vec::with_capacity(self.textures.len());
+        for (name, texture) in &self.textures {
+            let TtyOffscreen::Vulkan(texture) = texture else {
+                return Ok(());
+            };
+            textures.push((name, texture));
         }
 
         let Some(program) = frame
@@ -630,7 +638,7 @@ impl ShaderRenderElement {
         ));
 
         frame
-            .render_custom(&program, dst, damage, &uniforms, &[], self.alpha)
+            .render_custom(&program, dst, damage, &uniforms, &textures, self.alpha)
             .map_err(|err| TtyRendererError::Vulkan(MultiError::Render(err)))
     }
 }

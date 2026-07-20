@@ -264,7 +264,10 @@ impl ClosingWindow {
                     Uniform::new("niri_clamped_progress", clamped_progress as f32),
                     Uniform::new("niri_random_seed", self.random_seed),
                 ]),
-                HashMap::from([(String::from("niri_tex"), buffer.texture().clone())]),
+                HashMap::from([(
+                    String::from("niri_tex"),
+                    crate::backend::tty_renderer::TtyOffscreen::Gles(buffer.texture().clone()),
+                )]),
                 Kind::Unspecified,
             )
             .with_location(Point::from((0., 0.)))

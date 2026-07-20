@@ -742,6 +742,16 @@ pub enum TtyOffscreen {
     Vulkan(smithay::backend::renderer::vulkan::VulkanTexture),
 }
 
+impl TtyOffscreen {
+    /// Whether this is the only reference to this texture.
+    pub fn is_unique_reference(&mut self) -> bool {
+        match self {
+            TtyOffscreen::Gles(texture) => texture.is_unique_reference(),
+            TtyOffscreen::Vulkan(texture) => texture.is_unique_reference(),
+        }
+    }
+}
+
 impl Texture for TtyOffscreen {
     fn width(&self) -> u32 {
         match self {

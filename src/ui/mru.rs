@@ -16,7 +16,7 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
-use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::{Kind, RenderElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::Color32F;
 use smithay::input::keyboard::Keysym;
@@ -1110,7 +1110,10 @@ impl WindowMruUi {
         output: &Output,
         mut ctx: RenderCtx<R>,
         push: &mut dyn FnMut(WindowMruUiRenderElement<R>),
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        WindowMruUiRenderElement<R>: RenderElement<R>,
+    {
         let (inner, progress) = match &self.state {
             UiState::Closed { .. } => return,
             UiState::Closing { inner, anim } => (inner, anim.clamped_value()),
@@ -1146,11 +1149,7 @@ impl WindowMruUi {
         // During the closing fade, use an offscreen to avoid transparent compositing artifacts.
         let mut pushed_offscreen = false;
         if *output == inner.output && alpha < 1. {
-            'offscreen: {
-                let Some(mut ctx) = ctx.as_gles() else {
-                    break 'offscreen;
-                };
-
+            {
                 let mut elems = Vec::new();
                 inner.render(niri, ctx.r(), &mut |elem| elems.push(elem));
                 elems.push(WindowMruUiRenderElement::SolidColor(render_backdrop(1.)));

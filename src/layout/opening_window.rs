@@ -7,7 +7,7 @@ use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
 use smithay::backend::renderer::element::{Element as _, Kind, RenderElement};
-use smithay::backend::renderer::gles::{GlesRenderer, Uniform};
+use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::Texture;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
@@ -46,10 +46,10 @@ impl OpenAnimation {
 
     // We can't depend on view_rect here, because the result of window opening can be snapshot and
     // then rendered elsewhere.
-    pub fn render(
+    pub fn render<R: crate::render_helpers::renderer::NiriRenderer>(
         &self,
-        renderer: &mut GlesRenderer,
-        elements: &[impl RenderElement<GlesRenderer>],
+        renderer: &mut R,
+        elements: &[impl RenderElement<R>],
         geo_size: Size<f64, Logical>,
         location: Point<f64, Logical>,
         scale: Scale<f64>,

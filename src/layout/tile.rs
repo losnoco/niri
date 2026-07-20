@@ -4,7 +4,7 @@ use std::rc::Rc;
 use niri_config::utils::MergeWith as _;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
 use niri_ipc::WindowLayout;
-use smithay::backend::renderer::element::{Element, Kind};
+use smithay::backend::renderer::element::{Element, Kind, RenderElement};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
@@ -1167,7 +1167,12 @@ impl<W: LayoutElement> Tile<W> {
                         let elem = ResizeRenderElement::new(
                             area,
                             scale,
-                            texture_from.clone(),
+                            (
+                                crate::backend::tty_renderer::TtyOffscreen::Gles(
+                                    texture_from.0.clone(),
+                                ),
+                                texture_from.1,
+                            ),
                             resize.snapshot.size,
                             (texture_current, texture_current_geo),
                             window_size,
@@ -1368,7 +1373,10 @@ impl<W: LayoutElement> Tile<W> {
         xray_pos: XrayPos,
         focus_ring: bool,
         push: &mut dyn FnMut(TileRenderElement<R>),
-    ) {
+    ) where
+        R::Error: Send + Sync + 'static,
+        TileRenderElement<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Tile::render");
 
         let scale = Scale::from(self.scale);
@@ -1381,7 +1389,7 @@ impl<W: LayoutElement> Tile<W> {
         let mut pushed = false;
         self.window().set_offscreen_data(None);
 
-        if let (Some(open), Some(mut ctx)) = (&self.open_animation, ctx.as_gles()) {
+        if let Some(open) = &self.open_animation {
             let mut elements = Vec::new();
             self.render_inner(
                 ctx.r(),
@@ -1407,7 +1415,7 @@ impl<W: LayoutElement> Tile<W> {
                     warn!("error rendering window opening animation: {err:?}");
                 }
             }
-        } else if let (Some(alpha), Some(mut ctx)) = (&self.alpha_animation, ctx.as_gles()) {
+        } else if let Some(alpha) = &self.alpha_animation {
             let mut elements = Vec::new();
             self.render_inner(
                 ctx.r(),
