@@ -593,6 +593,20 @@ impl Mapped {
         update_tiled_state(self.toplevel(), prefer_no_csd, self.rules.tiled_state);
     }
 
+    /// Sets the pending xdg-toplevel suspended state.
+    ///
+    /// Smithay drops the state for clients below xdg_wm_base v6. The configure is sent by the
+    /// regular refresh machinery, which dedups unchanged state.
+    pub fn set_suspended(&self, suspended: bool) {
+        self.toplevel().with_pending_state(|state| {
+            if suspended {
+                state.states.set(xdg_toplevel::State::Suspended);
+            } else {
+                state.states.unset(xdg_toplevel::State::Suspended);
+            }
+        });
+    }
+
     pub fn is_windowed_fullscreen(&self) -> bool {
         self.is_windowed_fullscreen
     }

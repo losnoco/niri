@@ -10,6 +10,7 @@ mod floating;
 mod fullscreen;
 mod layer_shell;
 mod remove_output;
+mod suspended;
 mod transactions;
 mod virtual_pointer;
 mod window_opening;

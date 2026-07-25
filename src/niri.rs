@@ -4750,9 +4750,41 @@ impl Niri {
     pub fn refresh_window_states(&mut self) {
         let _span = tracy_client::span!("Niri::refresh_window_states");
 
+        // While the session is locked or the monitors are powered off, no window is visible, so
+        // tell clients they are suspended. This gives them a definitive signal instead of relying
+        // on frame-callback-starvation heuristics — notably, Chromium's self-drawn notification
+        // toasts get stuck open forever without it. Clearing the state on unlock/power-on is what
+        // resumes such clients. Windows on hidden workspaces are deliberately not suspended: they
+        // can become visible in the overview or through casts at any time.
+        //
+        // Cast targets are exempt: window casts keep streaming through lock and power-off, and
+        // output casts keep streaming the desktop while monitors are merely powered off (when
+        // locked, output casts show the lock screen, so their windows do suspend).
+        let is_locked = self.is_locked();
+        let suspend_all = is_locked || !self.monitors_active;
+
+        #[cfg(feature = "xdp-gnome-screencast")]
+        let casts = &self.casting.casts;
+
         let config = self.config.borrow();
         self.layout.with_windows_mut(|mapped, _output| {
             mapped.update_tiled_state(config.prefer_no_csd);
+
+            #[allow(unused_mut)]
+            let mut suspended = suspend_all;
+            #[cfg(feature = "xdp-gnome-screencast")]
+            if suspended {
+                let id = mapped.id().get();
+                let exempt = casts.iter().any(|cast| match &cast.target {
+                    CastTarget::Window { id: cast_id } => *cast_id == id,
+                    CastTarget::Output { output: weak, .. } => {
+                        !is_locked && _output.is_some_and(|o| weak == &o.downgrade())
+                    }
+                    CastTarget::Nothing => false,
+                });
+                suspended = !exempt;
+            }
+            mapped.set_suspended(suspended);
         });
         drop(config);
     }
