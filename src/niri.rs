@@ -2999,12 +2999,15 @@ impl Niri {
             GammaControlManagerState::new::<State, _>(&display_handle, move |client| {
                 is_tty && !client.get_data::<ClientState>().unwrap().restricted
             });
-        // Advertise color management only when at least one output opts into HDR in the config. This
-        // keeps HDR fully opt-in and off by default — with no `hdr` config, niri behaves exactly as
-        // before. Actual HDR signalling is additionally restricted to the TTY backend (it lives in
-        // `Tty::render`), so advertising on winit/headless is harmless. (Snapshot taken at startup;
-        // toggling `hdr` in the config needs a restart to (un)advertise the global.)
-        let advertise_color_management = config.borrow().outputs.0.iter().any(|o| o.hdr.is_some());
+        // The color-management global is always advertised. HDR remains opt-in per output: without
+        // an `hdr` config node (or without driver/sink support), every description niri hands out
+        // is plain sRGB, so clients on SDR outputs see a color-managed-but-SDR compositor. Keying
+        // HDR off the *descriptions* rather than the global's presence means toggling `hdr` in the
+        // config at runtime works: `refresh_color_management` recomputes the descriptions from the
+        // live config each refresh and notifies clients of changes, covering outputs that are
+        // disabled or unplugged at startup and enabled later. Actual HDR signalling is additionally
+        // restricted to the TTY backend (it lives in `Tty::render`), so advertising on
+        // winit/headless is harmless.
         let color_management_state = ColorManagementState::new::<State, _>(
             &display_handle,
             // ext_linear is what Mesa's Vulkan WSI needs (in combination with sRGB primaries
@@ -3034,7 +3037,7 @@ impl Niri {
                 Feature::WindowsBt2100,
             ],
             [RenderIntent::Perceptual],
-            move |_client| advertise_color_management,
+            |_client| true,
         );
         let activation_state = XdgActivationState::new::<State>(&display_handle);
         event_loop

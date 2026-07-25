@@ -14,8 +14,8 @@ use super::client::ClientId;
 use super::*;
 use crate::backend::OutputHdrCaps;
 
-/// A fixture whose config opts an output into HDR, so the (gated) `wp_color_manager_v1` global is
-/// advertised. Without an HDR-enabled output, niri does not advertise color management at all.
+/// A fixture whose config opts an output into HDR. The `wp_color_manager_v1` global is always
+/// advertised regardless; the `hdr` node only affects the descriptions niri hands out.
 fn fixture_with_hdr() -> Fixture {
     let mut config = Config::default();
     config.outputs.0.push(Output {
@@ -41,8 +41,10 @@ fn global_is_advertised_and_bound() {
 }
 
 #[test]
-fn global_not_advertised_without_hdr_config() {
-    // Default config (no `hdr` on any output) must not advertise color management.
+fn global_advertised_without_hdr_config() {
+    // The global is advertised even with a default config (no `hdr` on any output): clients that
+    // probe color management once at startup must be able to bind it so they can react when HDR
+    // is enabled on an output later at runtime.
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
@@ -50,8 +52,8 @@ fn global_not_advertised_without_hdr_config() {
     f.double_roundtrip(id);
 
     assert!(
-        f.client(id).state.color_manager.is_none(),
-        "wp_color_manager_v1 must not be advertised without an HDR-enabled output"
+        f.client(id).state.color_manager.is_some(),
+        "wp_color_manager_v1 must be advertised even without an HDR-enabled output"
     );
 }
 
@@ -160,6 +162,74 @@ fn feedback_preferred_is_pq_with_mode_on() {
     let client = f.client(id);
     assert_eq!(client.state.info_tf, Some(TransferFunction::St2084Pq));
     assert_eq!(client.state.info_primaries, Some(Primaries::Bt2020));
+}
+
+#[test]
+fn preferred_rebroadcast_on_runtime_hdr_toggle() {
+    use niri_config::output::HdrMode;
+
+    // Start with HDR off in the config, on an HDR-capable output (caps injected like the TTY
+    // backend would). Toggling the `hdr` node at runtime (as a config reload does) must notify
+    // existing feedback surfaces in both directions: off -> on and on -> off.
+    let mut config = Config::default();
+    config.outputs.0.push(Output {
+        name: "headless-1".to_owned(),
+        hdr: None,
+        ..Default::default()
+    });
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+    f.niri_output(1)
+        .user_data()
+        .insert_if_missing(|| OutputHdrCaps {
+            supported: true,
+            max_luminance: 800,
+            min_luminance: 100,
+            max_frame_avg_luminance: 600,
+        });
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    f.client(id).probe_surface_preferred(&surface);
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).state.info_tf, Some(TransferFunction::Srgb));
+
+    // Enable HDR at runtime; the feedback surface must hear about it.
+    let notified = f.client(id).state.preferred_changed.len();
+    f.niri().config.borrow_mut().outputs.0[0].hdr = Some(Hdr {
+        mode: HdrMode::On,
+        ..Default::default()
+    });
+    f.double_roundtrip(id);
+    assert!(
+        f.client(id).state.preferred_changed.len() > notified,
+        "enabling hdr at runtime must send preferred_changed"
+    );
+    f.client(id).requery_preferred();
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).state.info_tf, Some(TransferFunction::St2084Pq));
+    assert_eq!(f.client(id).state.info_primaries, Some(Primaries::Bt2020));
+
+    // And disable it again.
+    let notified = f.client(id).state.preferred_changed.len();
+    f.niri().config.borrow_mut().outputs.0[0].hdr = None;
+    f.double_roundtrip(id);
+    assert!(
+        f.client(id).state.preferred_changed.len() > notified,
+        "disabling hdr at runtime must send preferred_changed"
+    );
+    f.client(id).requery_preferred();
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).state.info_tf, Some(TransferFunction::Srgb));
+    assert_eq!(f.client(id).state.info_primaries, Some(Primaries::Srgb));
 }
 
 #[test]

@@ -313,16 +313,20 @@ output "HDMI-A-1" {
 
 Opts this output into HDR. When present, niri:
 
-- advertises the `wp-color-management-v1` protocol to clients (so an HDR app, e.g. `mpv --vo=gpu-next`
-  or gamescope, can tell niri its content is HDR);
+- tells clients on this output (through the always-advertised `wp-color-management-v1` protocol)
+  that it prefers HDR (PQ / BT.2020) content, so an HDR app, e.g. `mpv --vo=gpu-next` or gamescope,
+  can tell niri its content is HDR;
 - requests a 10-bit (or wider) scanout buffer, and at least 10 `max-bpc`;
 - while a fullscreen application is showing HDR (PQ / BT.2020) content, switches the output into HDR
   mode (sets the connector to BT.2020 and attaches a PQ `HDR_OUTPUT_METADATA` infoframe), and reverts
   to SDR when it stops.
 
-With no `hdr` node on any output, color management is not advertised at all and behavior is unchanged.
-HDR signalling only works on the TTY backend, and requires a GPU/display that exposes the HDR
-connector properties (amdgpu, recent Intel, and nvidia do).
+The `wp-color-management-v1` protocol itself is always advertised; without an `hdr` node, every
+description niri hands out is plain sRGB, so behavior is unchanged. Adding or removing `hdr` at
+runtime (via a config reload) notifies clients of the changed preference — this also covers HDR
+outputs that are unplugged or disabled at login and enabled later. HDR signalling only works on the
+TTY backend, and requires a GPU/display that exposes the HDR connector properties (amdgpu, recent
+Intel, and nvidia do).
 
 The optional `mode` property controls when the output is in HDR:
 
