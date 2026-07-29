@@ -22,6 +22,10 @@ use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1::{
+    self, ZxdgToplevelDecorationV1,
+};
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
@@ -70,6 +74,7 @@ pub struct State {
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub viewporter: Option<WpViewporter>,
     pub subcompositor: Option<WlSubcompositor>,
+    pub decoration_manager: Option<ZxdgDecorationManagerV1>,
     pub color_manager: Option<WpColorManagerV1>,
     /// Feedback objects kept alive so preferred_changed events can arrive.
     pub surface_feedbacks: Vec<WpColorManagementSurfaceFeedbackV1>,
@@ -97,6 +102,8 @@ pub struct Window {
     pub xdg_surface: XdgSurface,
     pub xdg_toplevel: XdgToplevel,
     pub viewport: WpViewport,
+    pub decoration_manager: Option<ZxdgDecorationManagerV1>,
+    pub decoration: Option<ZxdgToplevelDecorationV1>,
     pub pending_configure: Configure,
     pub configures_received: Vec<(u32, Configure)>,
     pub close_requested: bool,
@@ -122,6 +129,7 @@ pub struct Configure {
     pub size: (i32, i32),
     pub bounds: Option<(i32, i32)>,
     pub states: Vec<xdg_toplevel::State>,
+    pub decoration_mode: Option<zxdg_toplevel_decoration_v1::Mode>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -173,6 +181,9 @@ impl fmt::Display for Configure {
             write!(f, "bounds: none, ")?;
         }
         write!(f, "states: {:?}", self.states)?;
+        if let Some(mode) = self.decoration_mode {
+            write!(f, ", decoration: {mode:?}")?;
+        }
         Ok(())
     }
 }
@@ -212,6 +223,7 @@ impl Client {
             spbm: None,
             viewporter: None,
             subcompositor: None,
+            decoration_manager: None,
             color_manager: None,
             surface_feedbacks: Vec::new(),
             preferred_changed: Vec::new(),
@@ -457,6 +469,8 @@ impl State {
             xdg_surface,
             xdg_toplevel,
             viewport,
+            decoration_manager: self.decoration_manager.clone(),
+            decoration: None,
             pending_configure: Configure::default(),
             configures_received: Vec::new(),
             close_requested: false,
@@ -561,6 +575,29 @@ impl Window {
 
     pub fn set_parent(&self, parent: Option<&XdgToplevel>) {
         self.xdg_toplevel.set_parent(parent);
+    }
+
+    pub fn create_decoration(&mut self) {
+        let manager = self
+            .decoration_manager
+            .as_ref()
+            .expect("decoration manager is not bound");
+        let decoration = manager.get_toplevel_decoration(&self.xdg_toplevel, &self.qh, ());
+        assert!(self.decoration.replace(decoration).is_none());
+    }
+
+    pub fn destroy_decoration(&mut self) {
+        self.decoration.take().unwrap().destroy();
+        // Without a decoration object, the surface is client-side decorated.
+        self.pending_configure.decoration_mode = None;
+    }
+
+    pub fn set_decoration_mode(&self, mode: zxdg_toplevel_decoration_v1::Mode) {
+        self.decoration.as_ref().unwrap().set_mode(mode);
+    }
+
+    pub fn unset_decoration_mode(&self) {
+        self.decoration.as_ref().unwrap().unset_mode();
     }
 
     pub fn set_title(&self, title: &str) {
@@ -718,6 +755,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == WlSubcompositor::interface().name {
                     let version = min(version, WlSubcompositor::interface().version);
                     state.subcompositor = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ZxdgDecorationManagerV1::interface().name {
+                    let version = min(version, ZxdgDecorationManagerV1::interface().version);
+                    state.decoration_manager = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WpColorManagerV1::interface().name {
                     let version = min(version, WpColorManagerV1::interface().version);
                     state.color_manager = Some(registry.bind(name, version, qh, ()));
@@ -916,6 +956,43 @@ impl Dispatch<XdgToplevel, ()> for State {
                 window.pending_configure.bounds = Some((width, height));
             }
             xdg_toplevel::Event::WmCapabilities { .. } => (),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<ZxdgDecorationManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _manager: &ZxdgDecorationManagerV1,
+        _event: <ZxdgDecorationManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<ZxdgToplevelDecorationV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        decoration: &ZxdgToplevelDecorationV1,
+        event: <ZxdgToplevelDecorationV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let window = state
+            .windows
+            .iter_mut()
+            .find(|w| w.decoration.as_ref() == Some(decoration))
+            .unwrap();
+
+        match event {
+            zxdg_toplevel_decoration_v1::Event::Configure { mode } => {
+                window.pending_configure.decoration_mode = mode.into_result().ok();
+            }
             _ => unreachable!(),
         }
     }

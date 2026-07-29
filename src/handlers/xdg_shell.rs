@@ -969,10 +969,29 @@ impl XdgShellHandler for State {
 
 impl XdgDecorationHandler for State {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        // If we want CSD, we hide this global altogether.
+        // With xdg-decoration v2, a decoration object can be created for an already mapped
+        // toplevel, including right after destroying a previous decoration object. In that case
+        // the protocol requires the previously negotiated mode to be retained, so restore the
+        // last acked mode if there is one. Otherwise, advertise our preferred mode. (If we want
+        // CSD, we hide this global altogether.)
+        let prev_mode =
+            toplevel.with_committed_state(|current| current.and_then(|s| s.decoration_mode));
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+            state.decoration_mode =
+                Some(prev_mode.unwrap_or(zxdg_toplevel_decoration_v1::Mode::ServerSide));
         });
+
+        // The new decoration object needs a configure carrying its initial mode. If an initial
+        // configure wasn't sent, then we will send this as part of the initial configure later.
+        if toplevel.is_initial_configure_sent() {
+            // If this is a mapped window, flag it as needs configure to avoid duplicate configures.
+            let surface = toplevel.wl_surface();
+            if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
+                mapped.set_needs_configure();
+            } else {
+                toplevel.send_configure();
+            }
+        }
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: zxdg_toplevel_decoration_v1::Mode) {
@@ -1009,6 +1028,25 @@ impl XdgDecorationHandler for State {
 
         // A configure is required in response to this event. However, if an initial configure
         // wasn't sent, then we will send this as part of the initial configure later.
+        if toplevel.is_initial_configure_sent() {
+            // If this is a mapped window, flag it as needs configure to avoid duplicate configures.
+            let surface = toplevel.wl_surface();
+            if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
+                mapped.set_needs_configure();
+            } else {
+                toplevel.send_configure();
+            }
+        }
+    }
+
+    fn decoration_destroyed(&mut self, toplevel: ToplevelSurface) {
+        // The protocol requires the surface to switch back to client-side decorations at the
+        // next commit, unless a new decoration object is created first (in which case
+        // new_decoration() will run before any commit and override this).
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+        });
+
         if toplevel.is_initial_configure_sent() {
             // If this is a mapped window, flag it as needs configure to avoid duplicate configures.
             let surface = toplevel.wl_surface();

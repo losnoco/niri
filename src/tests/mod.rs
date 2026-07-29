@@ -14,3 +14,4 @@ mod suspended;
 mod transactions;
 mod virtual_pointer;
 mod window_opening;
+mod xdg_decoration;
