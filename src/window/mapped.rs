@@ -386,6 +386,17 @@ impl Mapped {
         self.is_minimized
     }
 
+    /// Whether the window is fullscreen, i.e. filling its whole output.
+    ///
+    /// Windowed fullscreen reports `false`, since such a window is laid out as an ordinary tile.
+    ///
+    /// Unlike the other `is_*` accessors here, this reads the committed toplevel state, so it
+    /// takes the surface state lock. Do not call it from inside `with_states()` or
+    /// `with_toplevel_role()` for the same surface: that deadlocks.
+    pub fn is_fullscreen(&self) -> bool {
+        LayoutElement::sizing_mode(self).is_fullscreen()
+    }
+
     /// Whether a `block-minimize` window rule prevents the client from minimizing itself.
     pub fn is_blocking_minimize(&self) -> bool {
         self.rules.block_minimize.unwrap_or(false)

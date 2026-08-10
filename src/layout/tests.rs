@@ -3198,6 +3198,62 @@ fn minimized_windows_are_not_in_any_workspace_but_stay_queryable() {
 }
 
 #[test]
+fn minimizing_preserves_the_fullscreen_state() {
+    let mut layout = Layout::default();
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::FullscreenWindow(1),
+            // Apply the configure, so the committed sizing mode actually becomes fullscreen.
+            Op::Communicate(1),
+        ],
+    );
+
+    let fullscreen_before = layout
+        .windows()
+        .find(|(_, win)| *win.id() == 1)
+        .map(|(_, win)| win.sizing_mode().is_fullscreen())
+        .unwrap();
+    assert!(fullscreen_before, "window should be fullscreen to start");
+
+    check_ops_on_layout(
+        &mut layout,
+        [Op::MinimizeWindow { id: 1 }, Op::Communicate(1)],
+    );
+
+    // IPC reports is_fullscreen from the sizing mode, so a minimized window keeps whatever state
+    // it will be restored with.
+    let fullscreen_while_minimized = layout
+        .minimized_windows()
+        .find(|win| *win.id() == 1)
+        .map(|win| win.sizing_mode().is_fullscreen())
+        .unwrap();
+    assert!(
+        fullscreen_while_minimized,
+        "a minimized window should keep its fullscreen state"
+    );
+
+    check_ops_on_layout(
+        &mut layout,
+        [Op::UnminimizeWindow { id: 1 }, Op::Communicate(1)],
+    );
+
+    let fullscreen_after = layout
+        .windows()
+        .find(|(_, win)| *win.id() == 1)
+        .map(|(_, win)| win.sizing_mode().is_fullscreen())
+        .unwrap();
+    assert!(
+        fullscreen_after,
+        "restoring should bring the window back fullscreen"
+    );
+}
+
+#[test]
 fn minimized_window_survives_output_removal() {
     let mut layout = Layout::default();
     check_ops_on_layout(

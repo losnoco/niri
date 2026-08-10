@@ -725,6 +725,15 @@ fn print_window(window: &Window) {
         if window.is_floating { "yes" } else { "no" }
     );
 
+    println!(
+        "  Is fullscreen: {}",
+        if window.is_fullscreen { "yes" } else { "no" }
+    );
+
+    if window.is_minimized {
+        println!("  Is minimized: yes");
+    }
+
     if let Some(pid) = window.pid {
         println!("  PID: {pid}");
     } else {
