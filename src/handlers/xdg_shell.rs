@@ -871,6 +871,33 @@ impl XdgShellHandler for State {
         }
     }
 
+    fn minimize_request(&mut self, toplevel: ToplevelSurface) {
+        let Some((mapped, _)) = self
+            .niri
+            .layout
+            .find_window_and_output_mut(toplevel.wl_surface())
+        else {
+            // Minimizing an unmapped window doesn't mean anything: it isn't in the layout yet, and
+            // it will open unminimized. A configure is not required in response to this request.
+            return;
+        };
+
+        // Fullscreen games minimize themselves whenever they lose focus, which would make them
+        // vanish from the layout on every window switch. The `block-minimize` window rule opts
+        // them out.
+        if mapped.is_blocking_minimize() {
+            trace!("ignoring client minimize request due to block-minimize window rule");
+            return;
+        }
+
+        let window = mapped.window.clone();
+
+        if self.niri.layout.minimize_window(&window) {
+            // The minimized window may have had focus.
+            self.niri.queue_redraw_all();
+        }
+    }
+
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         if self
             .niri

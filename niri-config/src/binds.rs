@@ -334,6 +334,15 @@ pub enum Action {
     MoveWorkspaceToMonitorUp,
     MoveWorkspaceToMonitorPrevious,
     MoveWorkspaceToMonitorNext,
+    MinimizeWindow,
+    #[knuffel(skip)]
+    MinimizeWindowById(u64),
+    UnminimizeWindow,
+    #[knuffel(skip)]
+    UnminimizeWindowById(u64),
+    ToggleWindowMinimized,
+    #[knuffel(skip)]
+    ToggleWindowMinimizedById(u64),
     ToggleWindowFloating,
     #[knuffel(skip)]
     ToggleWindowFloatingById(u64),
@@ -664,6 +673,14 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::ToggleDebugTint {} => Self::ToggleDebugTint,
             niri_ipc::Action::DebugToggleOpaqueRegions {} => Self::DebugToggleOpaqueRegions,
             niri_ipc::Action::DebugToggleDamage {} => Self::DebugToggleDamage,
+            niri_ipc::Action::MinimizeWindow { id: None } => Self::MinimizeWindow,
+            niri_ipc::Action::MinimizeWindow { id: Some(id) } => Self::MinimizeWindowById(id),
+            niri_ipc::Action::UnminimizeWindow { id: None } => Self::UnminimizeWindow,
+            niri_ipc::Action::UnminimizeWindow { id: Some(id) } => Self::UnminimizeWindowById(id),
+            niri_ipc::Action::ToggleWindowMinimized { id: None } => Self::ToggleWindowMinimized,
+            niri_ipc::Action::ToggleWindowMinimized { id: Some(id) } => {
+                Self::ToggleWindowMinimizedById(id)
+            }
             niri_ipc::Action::ToggleWindowFloating { id: None } => Self::ToggleWindowFloating,
             niri_ipc::Action::ToggleWindowFloating { id: Some(id) } => {
                 Self::ToggleWindowFloatingById(id)

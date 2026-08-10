@@ -67,6 +67,12 @@ pub struct WindowRule {
     pub baba_is_float: Option<bool>,
     #[knuffel(child, unwrap(argument))]
     pub block_out_from: Option<BlockOutFrom>,
+    /// Ignore `xdg_toplevel.set_minimized` coming from the client itself.
+    ///
+    /// Minimizing through a keybind, IPC or foreign-toplevel still works. This is mainly useful
+    /// for fullscreen games, which minimize themselves when they lose focus.
+    #[knuffel(child, unwrap(argument))]
+    pub block_minimize: Option<bool>,
     #[knuffel(child, unwrap(argument))]
     pub allow_tearing: Option<bool>,
     #[knuffel(child, unwrap(argument))]

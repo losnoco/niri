@@ -76,6 +76,9 @@ pub struct ResolvedWindowRules {
     /// What to do on xdg-activation requests.
     pub on_xdg_activate: Option<OnXdgActivate>,
 
+    /// Whether to ignore `xdg_toplevel.set_minimized` requests from the client itself.
+    pub block_minimize: Option<bool>,
+
     /// Extra bound on the minimum window width.
     pub min_width: Option<u16>,
     /// Extra bound on the minimum window height.
@@ -268,6 +271,10 @@ impl ResolvedWindowRules {
 
                 if let Some(x) = rule.on_xdg_activate {
                     resolved.on_xdg_activate = Some(x);
+                }
+
+                if let Some(x) = rule.block_minimize {
+                    resolved.block_minimize = Some(x);
                 }
 
                 if let Some(x) = rule.min_width {

@@ -96,6 +96,9 @@ pub struct Mapped {
     /// Whether this window is floating.
     is_floating: bool,
 
+    /// Whether this window is minimized, i.e. held outside the layout.
+    is_minimized: bool,
+
     /// Whether this window is a target of a window cast.
     is_window_cast_target: bool,
 
@@ -288,6 +291,7 @@ impl Mapped {
             is_focused: false,
             is_active_in_column: true,
             is_floating: false,
+            is_minimized: false,
             is_window_cast_target: false,
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
@@ -376,6 +380,15 @@ impl Mapped {
 
     pub fn is_floating(&self) -> bool {
         self.is_floating
+    }
+
+    pub fn is_minimized(&self) -> bool {
+        self.is_minimized
+    }
+
+    /// Whether a `block-minimize` window rule prevents the client from minimizing itself.
+    pub fn is_blocking_minimize(&self) -> bool {
+        self.rules.block_minimize.unwrap_or(false)
     }
 
     pub fn is_window_cast_target(&self) -> bool {
@@ -1012,6 +1025,27 @@ impl LayoutElement for Mapped {
         let changed = self.is_floating != floating;
         self.is_floating = floating;
         self.need_to_recompute_rules |= changed;
+    }
+
+    fn set_minimized(&mut self, minimized: bool) {
+        if self.is_minimized == minimized {
+            return;
+        }
+
+        self.is_minimized = minimized;
+        self.need_to_recompute_rules = true;
+
+        // A minimized window is not visible anywhere, so let it stop rendering. This mirrors what
+        // we do for windows hidden by a screen lock or by DPMS.
+        self.set_suspended(minimized);
+    }
+
+    fn is_minimized(&self) -> bool {
+        self.is_minimized
+    }
+
+    fn is_blocking_minimize(&self) -> bool {
+        self.rules.block_minimize.unwrap_or(false)
     }
 
     fn set_bounds(&self, bounds: Size<i32, Logical>) {

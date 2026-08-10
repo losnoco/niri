@@ -2896,7 +2896,11 @@ impl Niri {
         let compositor_state = CompositorState::new_v6::<State>(&display_handle);
         let xdg_shell_state = XdgShellState::new_with_capabilities::<State>(
             &display_handle,
-            [WmCapabilities::Fullscreen, WmCapabilities::Maximize],
+            [
+                WmCapabilities::Fullscreen,
+                WmCapabilities::Maximize,
+                WmCapabilities::Minimize,
+            ],
         );
         let xdg_decoration_state =
             XdgDecorationState::new_with_filter::<State, _>(&display_handle, |client| {
@@ -4770,8 +4774,10 @@ impl Niri {
         self.layout.with_windows_mut(|mapped, _output| {
             mapped.update_tiled_state(config.prefer_no_csd);
 
+            // Minimized windows aren't rendered anywhere, so let them stop drawing. A window cast
+            // still exempts them below, same as for a locked screen.
             #[allow(unused_mut)]
-            let mut suspended = suspend_all;
+            let mut suspended = suspend_all || mapped.is_minimized();
             #[cfg(feature = "xdp-gnome-screencast")]
             if suspended {
                 let id = mapped.id().get();

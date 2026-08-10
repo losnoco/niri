@@ -215,6 +215,16 @@ impl LayoutElement for TestWindow {
 
     fn set_floating(&mut self, _floating: bool) {}
 
+    fn set_minimized(&mut self, _minimized: bool) {}
+
+    fn is_minimized(&self) -> bool {
+        false
+    }
+
+    fn is_blocking_minimize(&self) -> bool {
+        false
+    }
+
     fn set_bounds(&self, _bounds: Size<i32, Logical>) {}
 
     fn is_ignoring_opacity_window_rule(&self) -> bool {

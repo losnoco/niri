@@ -569,6 +569,14 @@ binds {
     // e.g. by double-clicking on the titlebar.
     Mod+M { maximize-window-to-edges; }
 
+    // Minimizing takes the window out of the layout entirely: it stops being rendered
+    // and no longer occupies space in any column. Since niri has no taskbar of its own,
+    // unminimize-window without an id restores the most recently minimized window,
+    // so this pair works as minimize/undo-minimize. A taskbar that speaks
+    // wlr-foreign-toplevel-management (e.g. Waybar's wlr/taskbar) can also restore them.
+    Mod+Alt+H { minimize-window; }
+    Mod+Alt+Shift+H { unminimize-window; }
+
     // Expand the focused column to space not taken up by other fully visible columns.
     // Makes the column "fill the rest of the space".
     Mod+Ctrl+F { expand-column-to-available-width; }

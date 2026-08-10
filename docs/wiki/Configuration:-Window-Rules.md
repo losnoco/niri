@@ -52,6 +52,7 @@ window-rule {
     // Properties that apply continuously.
     draw-border-with-background false
     opacity 0.5
+    block-minimize true
     block-out-from "screencast"
     // block-out-from "screen-capture"
     variable-refresh-rate true
@@ -624,6 +625,28 @@ window-rule {
     on-xdg-activate "set-urgent"
 }
 ```
+
+#### `block-minimize`
+
+Ignore `xdg_toplevel.set_minimized` requests coming from the window itself.
+
+Minimizing the window through a key binding, through `niri msg action minimize-window`, or from a taskbar still works; only the window's own requests are ignored.
+
+This is mainly useful for fullscreen games.
+Windows games leave exclusive fullscreen and minimize themselves whenever they lose focus, which under Wine means every time you switch to another window in niri.
+Without this rule, the game disappears from your layout on every window switch.
+
+```kdl
+window-rule {
+    match app-id=r#"^borderlands4\.exe$"#
+
+    block-minimize true
+}
+```
+
+> [!NOTE]
+> This does not stop the game from *leaving fullscreen* on focus loss, it only stops it from being taken out of the layout.
+> Wine's own `WAYLANDDRV_FOCUS_LOSS=0` environment variable suppresses the focus change itself.
 
 #### `opacity`
 
