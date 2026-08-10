@@ -639,10 +639,8 @@ impl ForeignToplevelHandler for State {
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();
 
-            // Clicking a minimized window in a taskbar should restore it, which is the only way to
-            // get it back with a mouse.
-            self.niri.layout.unminimize_window(&window);
-
+            // activate_window() restores the window if it was minimized, which is what a taskbar
+            // click on a minimized entry should do.
             self.niri.layout.activate_window(&window);
             self.niri.layer_shell_on_demand_focus = None;
             self.niri.queue_redraw_all();

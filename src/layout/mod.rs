@@ -1788,6 +1788,15 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        // Activating a minimized window restores it. Docks and taskbars ask to activate a window
+        // to bring it up, and there's no separate unminimize request in most of the paths that
+        // land here (niri IPC FocusWindow, xdg-activation, ext-workspace), so without this a dock
+        // click on a minimized window would silently do nothing.
+        //
+        // Note that focus-follows-mouse goes through activate_window_without_raising() instead,
+        // which deliberately does not restore: a minimized window is never under the pointer.
+        self.unminimize_window(window);
+
         let MonitorSet::Normal {
             monitors,
             active_monitor_idx,

@@ -3198,6 +3198,46 @@ fn minimized_windows_are_not_in_any_workspace_but_stay_queryable() {
 }
 
 #[test]
+fn activating_a_minimized_window_restores_it() {
+    // Docks and taskbars ask to activate a window to bring it up; there is no separate unminimize
+    // request on most paths that reach activate_window(). Without restoring here, a dock click on
+    // a minimized entry silently does nothing.
+    let mut layout = Layout::default();
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::MinimizeWindow { id: 1 },
+        ],
+    );
+    assert!(layout.is_minimized(&1));
+
+    // Op::FocusWindow is Layout::activate_window, which is what niri IPC FocusWindow,
+    // xdg-activation and wlr-foreign-toplevel activation all funnel into.
+    check_ops_on_layout(&mut layout, [Op::FocusWindow(1)]);
+
+    assert!(
+        !layout.is_minimized(&1),
+        "activating should have restored it"
+    );
+    assert!(
+        layout.workspaces().any(|(_, _, ws)| ws.has_window(&1)),
+        "a restored window must be back in a workspace"
+    );
+    assert_eq!(
+        layout.focus().map(|win| *win.id()),
+        Some(1),
+        "the restored window should end up focused"
+    );
+}
+
+#[test]
 fn minimizing_preserves_the_fullscreen_state() {
     let mut layout = Layout::default();
     check_ops_on_layout(
