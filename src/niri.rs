@@ -196,6 +196,7 @@ use crate::screencasting::Screencasting;
 use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
+use crate::ui::minimized_strip::{self, MinimizedStripRenderElement};
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
@@ -442,6 +443,11 @@ pub struct Niri {
 
     pub window_mru_ui: WindowMruUi,
     pub pending_mru_commit: Option<PendingMruCommit>,
+
+    /// Backdrop buffers for the minimized-window strip, one vec per output.
+    ///
+    /// Kept here rather than in the strip module because rendering only gets `&Niri`.
+    pub minimized_strip_buffers: RefCell<HashMap<Output, Vec<SolidColorBuffer>>>,
 
     pub pick_window: Option<async_channel::Sender<Option<MappedId>>>,
     pub pick_color: Option<async_channel::Sender<Option<niri_ipc::PickedColor>>>,
@@ -3312,6 +3318,7 @@ impl Niri {
             exit_confirm_dialog,
 
             window_mru_ui,
+            minimized_strip_buffers: RefCell::new(HashMap::new()),
             pending_mru_commit: None,
 
             pick_window: None,
@@ -3685,6 +3692,8 @@ impl Niri {
         if self.window_mru_ui.output() == Some(output) {
             self.cancel_mru();
         }
+
+        self.minimized_strip_buffers.borrow_mut().remove(output);
     }
 
     pub fn output_resized(&mut self, output: &Output) {
@@ -4938,6 +4947,7 @@ impl Niri {
         LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         WindowMruUiRenderElement<R>: RenderElement<R>,
+        MinimizedStripRenderElement<R>: RenderElement<R>,
         TileRenderElement<R>: RenderElement<R>,
     {
         let mut elements = Vec::new();
@@ -4958,6 +4968,7 @@ impl Niri {
         LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         WindowMruUiRenderElement<R>: RenderElement<R>,
+        MinimizedStripRenderElement<R>: RenderElement<R>,
         TileRenderElement<R>: RenderElement<R>,
     {
         let _span = tracy_client::span!("Niri::render");
@@ -4998,6 +5009,7 @@ impl Niri {
         LayoutElementRenderElement<R>: RenderElement<R>,
         R::Error: Send + Sync + 'static,
         WindowMruUiRenderElement<R>: RenderElement<R>,
+        MinimizedStripRenderElement<R>: RenderElement<R>,
         TileRenderElement<R>: RenderElement<R>,
     {
         let state = self.output_state.get(output).unwrap();
@@ -5089,6 +5101,10 @@ impl Niri {
         // Then, the Alt-Tab switcher.
         self.window_mru_ui
             .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
+
+        // Then the minimized-window strip, below the Alt-Tab switcher but above the layout, since
+        // it's a persistent overlay rather than a modal one.
+        minimized_strip::render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
 
         // Don't draw the focus ring on the workspaces while interactively moving above those
         // workspaces, since the interactively-moved window already has a focus ring.
@@ -6161,6 +6177,7 @@ impl Niri {
         R::Error: Send + Sync + 'static,
         OutputRenderElements<R>: RenderElement<R>,
         WindowMruUiRenderElement<R>: RenderElement<R>,
+        MinimizedStripRenderElement<R>: RenderElement<R>,
         TileRenderElement<R>: RenderElement<R>,
     {
         let _span = tracy_client::span!("Niri::render_for_screencopy_with_damage");
@@ -6248,6 +6265,7 @@ impl Niri {
         R::Error: Send + Sync + 'static,
         OutputRenderElements<R>: RenderElement<R>,
         WindowMruUiRenderElement<R>: RenderElement<R>,
+        MinimizedStripRenderElement<R>: RenderElement<R>,
         TileRenderElement<R>: RenderElement<R>,
     {
         let _span = tracy_client::span!("Niri::render_for_screencopy");
@@ -6309,6 +6327,7 @@ impl Niri {
         R::Error: Send + Sync + 'static,
         OutputRenderElements<R>: RenderElement<R>,
         WindowMruUiRenderElement<R>: RenderElement<R>,
+        MinimizedStripRenderElement<R>: RenderElement<R>,
         TileRenderElement<R>: RenderElement<R>,
     {
         let Some(mode) = output.current_mode() else {
@@ -6800,6 +6819,7 @@ impl Niri {
         PointerRenderElements<R>: RenderElement<R>,
         TileRenderElement<R>: RenderElement<R>,
         WindowMruUiRenderElement<R>: RenderElement<R>,
+        MinimizedStripRenderElement<R>: RenderElement<R>,
         LayoutElementRenderElement<R>: RenderElement<R>,
         UniversalTextureRenderElement: RenderElement<R>,
         R::Error: Send + Sync + 'static,
@@ -6896,6 +6916,7 @@ impl Niri {
         R::Error: Send + Sync + 'static,
         OutputRenderElements<R>: RenderElement<R>,
         WindowMruUiRenderElement<R>: RenderElement<R>,
+        MinimizedStripRenderElement<R>: RenderElement<R>,
         TileRenderElement<R>: RenderElement<R>,
     {
         let _span = tracy_client::span!("Niri::screenshot");
@@ -7121,6 +7142,7 @@ impl Niri {
         R::Error: Send + Sync + 'static,
         OutputRenderElements<R>: RenderElement<R>,
         WindowMruUiRenderElement<R>: RenderElement<R>,
+        MinimizedStripRenderElement<R>: RenderElement<R>,
         TileRenderElement<R>: RenderElement<R>,
     {
         let _span = tracy_client::span!("Niri::screenshot_all_outputs");
@@ -7642,6 +7664,7 @@ impl Niri {
     ) where
         TileRenderElement<R>: RenderElement<R>,
         WindowMruUiRenderElement<R>: RenderElement<R>,
+        MinimizedStripRenderElement<R>: RenderElement<R>,
         LayoutElementRenderElement<R>: RenderElement<R>,
         UniversalTextureRenderElement: RenderElement<R>,
         R::Error: Send + Sync + 'static,
@@ -7969,6 +7992,7 @@ niri_render_elements! {
         SolidColor = SolidColorRenderElement,
         ScreenshotUi = ScreenshotUiRenderElement,
         WindowMruUi = WindowMruUiRenderElement<R>,
+        MinimizedStrip = MinimizedStripRenderElement<R>,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         Texture = PrimaryGpuTextureRenderElement,
         UniversalTexture = UniversalTextureRenderElement,

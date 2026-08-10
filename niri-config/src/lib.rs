@@ -83,6 +83,7 @@ pub struct Config {
     pub blur: Blur,
     pub gestures: Gestures,
     pub overview: Overview,
+    pub minimized_windows: MinimizedWindows,
     pub environment: Environment,
     pub xwayland_satellite: XwaylandSatellite,
     pub window_rules: Vec<WindowRule>,
@@ -204,6 +205,7 @@ where
                 "blur" => m_merge!(blur),
                 "gestures" => m_merge!(gestures),
                 "overview" => m_merge!(overview),
+                "minimized-windows" => m_merge!(minimized_windows),
                 "xwayland-satellite" => m_merge!(xwayland_satellite),
                 "switch-events" => m_merge!(switch_events),
                 "debug" => m_merge!(debug),
@@ -1740,6 +1742,12 @@ mod tests {
                         a: 0.3137255,
                     },
                 },
+            },
+            minimized_windows: MinimizedWindows {
+                off: false,
+                position: BottomLeft,
+                size: 96.0,
+                gaps: 8.0,
             },
             environment: Environment(
                 [

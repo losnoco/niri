@@ -198,3 +198,71 @@ impl MergeWith<XwaylandSatellitePart> for XwaylandSatellite {
         merge_clone!((self, part), path);
     }
 }
+
+/// Corner of the output to put the minimized-window strip in.
+#[derive(knuffel::DecodeScalar, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MinimizedPosition {
+    TopLeft,
+    TopRight,
+    #[default]
+    BottomLeft,
+    BottomRight,
+}
+
+impl MinimizedPosition {
+    pub fn is_top(self) -> bool {
+        matches!(self, Self::TopLeft | Self::TopRight)
+    }
+
+    pub fn is_left(self) -> bool {
+        matches!(self, Self::TopLeft | Self::BottomLeft)
+    }
+}
+
+/// On-screen strip of minimized windows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MinimizedWindows {
+    pub off: bool,
+    pub position: MinimizedPosition,
+    /// Length of the longer side of a thumbnail, in logical pixels.
+    pub size: f64,
+    /// Gap between thumbnails, and between the strip and the output edges.
+    pub gaps: f64,
+}
+
+impl Default for MinimizedWindows {
+    fn default() -> Self {
+        Self {
+            off: false,
+            position: MinimizedPosition::BottomLeft,
+            size: 96.,
+            gaps: 8.,
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub struct MinimizedWindowsPart {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub on: bool,
+    #[knuffel(child, unwrap(argument))]
+    pub position: Option<MinimizedPosition>,
+    #[knuffel(child, unwrap(argument))]
+    pub size: Option<FloatOrInt<16, 1024>>,
+    #[knuffel(child, unwrap(argument))]
+    pub gaps: Option<FloatOrInt<0, 256>>,
+}
+
+impl MergeWith<MinimizedWindowsPart> for MinimizedWindows {
+    fn merge_with(&mut self, part: &MinimizedWindowsPart) {
+        self.off |= part.off;
+        if part.on {
+            self.off = false;
+        }
+
+        merge_clone!((self, part), position);
+        merge!((self, part), size, gaps);
+    }
+}

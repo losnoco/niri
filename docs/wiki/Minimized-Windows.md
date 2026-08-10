@@ -4,8 +4,9 @@ Minimizing takes a window out of the layout entirely.
 A minimized window is not rendered, does not occupy space in any column, and does not receive frame callbacks, so most clients stop drawing while minimized.
 It is not closed, and it keeps its size and its floating state, so restoring it puts it back the way it was.
 
-Because niri has no taskbar of its own, a minimized window has no on-screen representation.
-The default `Mod+Alt+Shift+H` bind restores the most recently minimized window, so you always have a way back — see [Restoring](#restoring) below.
+By default a small strip of thumbnails in the bottom-left corner of every output shows what is currently minimized; clicking one restores it.
+See [The strip](#the-strip) below to move it or turn it off.
+The `Mod+Alt+Shift+H` bind also restores the most recently minimized window, so you always have a way back even with the strip disabled.
 
 ## Minimizing
 
@@ -27,10 +28,38 @@ binds {
 `toggle-window-minimized` minimizes a window, or restores it if it is already minimized.
 Note that without `--id` it acts on the *focused* window, and a minimized window is never focused, so the no-argument form can only minimize.
 
+## The strip
+
+Minimized windows are shown as thumbnails in a corner of every output.
+Clicking a thumbnail restores that window and focuses it.
+
+```kdl
+minimized-windows {
+    // off
+
+    // top-left, top-right, bottom-left or bottom-right.
+    position "bottom-left"
+
+    // Length of the longer side of a thumbnail, in logical pixels.
+    size 96
+
+    // Gap between thumbnails, and between the strip and the output edges.
+    gaps 8
+}
+```
+
+Thumbnails keep their window's aspect ratio and are laid out along a row of `size` height, so windows of different shapes still line up.
+If more windows are minimized than fit across the output, the ones that don't fit are simply not shown rather than being shrunk — they are still restorable with `unminimize-window --id` or from a taskbar.
+
+Because minimized windows are suspended, a thumbnail shows the last frame the window drew before it was minimized, not live content.
+
+The strip renders nothing when nothing is minimized, so there is no need for a separate "hide when empty" setting.
+
 ## Restoring
 
-There are three ways to get a minimized window back:
+There are four ways to get a minimized window back:
 
+- **Clicking its thumbnail** in the strip.
 - **A taskbar.** Minimized windows are reported over `wlr-foreign-toplevel-management` with the `minimized` state, and activating one restores and focuses it. Waybar's `wlr/taskbar` and similar panels work out of the box.
 - **`unminimize-window`.** With `--id`, restores that window. Without an id, restores the most recently minimized window, which makes it usable as a plain "undo minimize" bind.
 - **IPC.** `niri msg windows` lists minimized windows with `"is_minimized": true`. Their `workspace_id` is the workspace they will be restored to.

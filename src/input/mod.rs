@@ -50,6 +50,7 @@ use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
+use crate::ui::minimized_strip;
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
@@ -2857,6 +2858,40 @@ impl State {
         let mod_down = modifiers.contains(mod_key.to_modifiers());
 
         if ButtonState::Pressed == button_state {
+            // Clicking a minimized window's thumbnail restores it. Handle this before anything
+            // else so the strip stays clickable even when it overlaps a window.
+            if let Some(MouseButton::Left) = button {
+                if !pointer.is_grabbed()
+                    && !self.niri.screenshot_ui.is_open()
+                    && !self.niri.window_mru_ui.is_open()
+                {
+                    let location = pointer.current_location();
+                    if let Some((output, pos_within_output)) = self.niri.output_under(location) {
+                        let output = output.clone();
+                        let id =
+                            minimized_strip::window_under(&self.niri, &output, pos_within_output);
+
+                        if let Some(id) = id {
+                            let window = self
+                                .niri
+                                .layout
+                                .minimized_windows()
+                                .find(|m| m.id() == id)
+                                .map(|m| m.window.clone());
+
+                            if let Some(window) = window {
+                                self.niri.layout.unminimize_window(&window);
+                                self.niri.layout.activate_window(&window);
+                                self.niri.queue_redraw_all();
+                            }
+
+                            self.niri.suppressed_buttons.insert(button_code);
+                            return;
+                        }
+                    }
+                }
+            }
+
             let mut is_mru_open = false;
             if let Some(mru_output) = self.niri.window_mru_ui.output() {
                 is_mru_open = true;

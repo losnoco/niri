@@ -27,6 +27,7 @@ use crate::window::mapped::{MappedId, WindowCastRenderElements};
 mod pw_utils;
 use crate::layout::LayoutElementRenderElement;
 use crate::render_helpers::texture::UniversalTextureRenderElement;
+use crate::ui::minimized_strip::MinimizedStripRenderElement;
 use crate::ui::mru::WindowMruUiRenderElement;
 use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
 
@@ -553,6 +554,7 @@ impl Niri {
         CastRenderElement<R>: RenderElement<R>,
         OutputRenderElements<R>: RenderElement<R>,
         WindowMruUiRenderElement<R>: RenderElement<R>,
+        MinimizedStripRenderElement<R>: RenderElement<R>,
         TileRenderElement<R>: RenderElement<R>,
     {
         let _span = tracy_client::span!("Niri::render_for_screen_cast");
