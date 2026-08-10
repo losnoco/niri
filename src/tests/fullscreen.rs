@@ -295,3 +295,83 @@ fn interactive_move_unmaximize_to_scrolling_restores_size() {
         @"size: 936 × 1048, bounds: 1920 × 1080, states: [Activated]"
     );
 }
+
+#[test]
+fn fullscreen_requested_after_initial_configure_but_before_map() {
+    // Wine commits the toplevel role, lets the initial configure come back, and only then asks
+    // for fullscreen -- several milliseconds later, in a separate batch. It then acks the
+    // configure it already has, which is the non-fullscreen one, and maps.
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    // The initial configure has already gone out, without a fullscreen state.
+    let window = f.client(id).window(&surface);
+    assert_snapshot!(
+        window.format_recent_configures(),
+        @"size: 936 × 1048, bounds: 1888 × 1048, states: []"
+    );
+
+    // Now the client asks for fullscreen, then maps by acking the stale configure.
+    window.set_fullscreen(None);
+    window.attach_new_buffer();
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    assert_snapshot!(
+        window.format_recent_configures(),
+        @r"
+    size: 1920 × 1080, bounds: 1888 × 1048, states: [Fullscreen]
+    size: 1920 × 1080, bounds: 1888 × 1048, states: [Fullscreen, Activated]
+    "
+    );
+}
+
+#[test]
+fn fullscreen_requested_with_buffer_less_commits_and_fixed_size_hint() {
+    // Closer to what Wine actually does: buffer-less commits in between, the fullscreen request
+    // repeated, and a fixed min == max size hint set just before mapping.
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.set_fullscreen(None);
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.set_fullscreen(None);
+    window.commit();
+    f.roundtrip(id);
+
+    // Wine marks non-resizable windows as fixed size, which is also what makes niri float them.
+    let window = f.client(id).window(&surface);
+    window.set_min_size(1920, 1080);
+    window.set_max_size(1920, 1080);
+    window.attach_new_buffer();
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    assert_snapshot!(
+        window.format_recent_configures(),
+        @r"
+    size: 936 × 1048, bounds: 1888 × 1048, states: []
+    size: 1920 × 1080, bounds: 1888 × 1048, states: [Fullscreen]
+    size: 1920 × 1080, bounds: 1888 × 1048, states: [Fullscreen]
+    size: 1920 × 1080, bounds: 1888 × 1048, states: [Fullscreen, Activated]
+    "
+    );
+}

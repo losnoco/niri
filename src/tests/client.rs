@@ -557,6 +557,14 @@ impl Window {
         self.viewport.set_destination(i32::from(w), i32::from(h));
     }
 
+    pub fn set_min_size(&self, w: i32, h: i32) {
+        self.xdg_toplevel.set_min_size(w, h);
+    }
+
+    pub fn set_max_size(&self, w: i32, h: i32) {
+        self.xdg_toplevel.set_max_size(w, h);
+    }
+
     pub fn set_fullscreen(&self, output: Option<&WlOutput>) {
         self.xdg_toplevel.set_fullscreen(output);
     }
