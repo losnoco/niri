@@ -3164,6 +3164,40 @@ fn minimize_takes_window_out_of_the_layout_and_restores_it() {
 }
 
 #[test]
+fn minimized_windows_are_not_in_any_workspace_but_stay_queryable() {
+    // Regression test: a minimized window is in no workspace, and code that looked windows up
+    // across workspaces used to unwrap that lookup. XWayland clients reposition popups while
+    // minimized, which took down the compositor.
+    let mut layout = Layout::default();
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::MinimizeWindow { id: 1 },
+        ],
+    );
+
+    // Must not panic for a window that is in no workspace.
+    let _ = layout.popup_target_rect(&1);
+    let _ = layout.should_trigger_focus_follows_mouse_on(&1);
+
+    // These are reachable over IPC with an explicit window id, and are no-ops while minimized.
+    layout.center_window(Some(&1));
+    layout.move_floating_window(
+        Some(&1),
+        PositionChange::SetFixed(0.),
+        PositionChange::SetFixed(0.),
+        false,
+    );
+    layout.verify_invariants();
+
+    assert!(layout.is_minimized(&1), "window should still be minimized");
+}
+
+#[test]
 fn minimized_window_survives_output_removal() {
     let mut layout = Layout::default();
     check_ops_on_layout(

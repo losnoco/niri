@@ -1695,9 +1695,25 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        // A minimized window is in no workspace, but it can still have popups: XWayland apps in
+        // particular keep creating and repositioning them while minimized. Constrain those to the
+        // window's own size; they aren't visible anyway.
+        if let Some(min) = self
+            .minimized
+            .iter()
+            .find(|min| min.tile.window().id() == window)
+        {
+            return Rectangle::from_size(min.tile.window_size());
+        }
+
         self.workspaces()
             .find_map(|(_, _, ws)| ws.popup_target_rect(window))
-            .unwrap()
+            .unwrap_or_else(|| {
+                // Better to misplace a popup than to take down the compositor from a client
+                // request.
+                error!("no popup target rect for window, using a fallback");
+                Rectangle::from_size(Size::from((1., 1.)))
+            })
     }
 
     pub fn update_output_size(&mut self, output: &Output) {
@@ -1746,15 +1762,16 @@ impl<W: LayoutElement> Layout<W> {
             return true;
         };
 
-        let (mon, ws_idx) = monitors
-            .iter()
-            .find_map(|mon| {
-                mon.workspaces
-                    .iter()
-                    .position(|ws| ws.has_window(window))
-                    .map(|ws_idx| (mon, ws_idx))
-            })
-            .unwrap();
+        // Minimized windows are in no workspace. They can't be under the pointer either, but don't
+        // panic if we somehow get asked about one.
+        let Some((mon, ws_idx)) = monitors.iter().find_map(|mon| {
+            mon.workspaces
+                .iter()
+                .position(|ws| ws.has_window(window))
+                .map(|ws_idx| (mon, ws_idx))
+        }) else {
+            return true;
+        };
 
         // During a gesture, focus-follows-mouse does not cause any unintended workspace switches.
         if let Some(WorkspaceSwitch::Gesture(_)) = mon.workspace_switch {
@@ -2528,7 +2545,11 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         let workspace = if let Some(id) = id {
-            Some(self.workspaces_mut().find(|ws| ws.has_window(id)).unwrap())
+            // A minimized window is in no workspace, so there is nothing to position.
+            let Some(ws) = self.workspaces_mut().find(|ws| ws.has_window(id)) else {
+                return;
+            };
+            Some(ws)
         } else {
             self.active_workspace_mut()
         };
@@ -3544,7 +3565,11 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         let workspace = if let Some(id) = id {
-            Some(self.workspaces_mut().find(|ws| ws.has_window(id)).unwrap())
+            // A minimized window is in no workspace, so there is nothing to position.
+            let Some(ws) = self.workspaces_mut().find(|ws| ws.has_window(id)) else {
+                return;
+            };
+            Some(ws)
         } else {
             self.active_workspace_mut()
         };
