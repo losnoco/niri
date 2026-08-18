@@ -3,15 +3,21 @@
 // niri_hdr_pq = 1.0 enables the transform, 0.0 passes through (SDR outputs; uniforms
 // default to 0). niri_ref_lum_scale = reference luminance / 10000 (PQ peak).
 //
+// niri_hdr_ref_scale = output reference luminance / content reference luminance, the
+// linear-light rescale applied to HDR PQ content so the SDR reference luminance also acts as
+// a brightness control over it. 1.0 (or 0.0, unset) leaves the content alone.
+//
 // niri_linear selects extended-linear content handling (Windows scRGB or a parametric
 // ext_linear image description): 0 = off, nonzero = on; the container gamut comes from
 // niri_gamut.
-// Encoded 1.0 corresponds to max_lum cd/m²; niri_linear_scale = max_lum / 10000 and
-// niri_linear_to_ref = max_lum / reference_lum. Unlike other content it is also transformed
-// on SDR outputs, since its raw linear values are meaningless there.
+// Encoded 1.0 corresponds to max_lum cd/m²; niri_linear_scale = max_lum / 10000 rescaled from
+// the content's reference white to the output's, and niri_linear_to_ref = max_lum /
+// reference_lum. Unlike other content it is also transformed on SDR outputs, since its raw
+// linear values are meaningless there.
 
 uniform float niri_hdr_pq;
 uniform float niri_ref_lum_scale;
+uniform float niri_hdr_ref_scale;
 uniform float niri_linear;
 uniform float niri_linear_scale;
 uniform float niri_linear_to_ref;
@@ -125,6 +131,10 @@ vec4 niri_blend(vec4 color) {
 
         rgb = niri_pq_eotf(rgb);
 
+        // Scale the content's reference white to the capture's before compressing the
+        // headroom, exactly as the PQ paths above do.
+        rgb = rgb * (niri_hdr_ref_scale > 0.0 ? niri_hdr_ref_scale : 1.0);
+
         // Compress the headroom above the reference white into the SDR range instead of
         // clipping it below. (For non-BT.2020 containers this happens in container space,
         // a close approximation.)
@@ -150,13 +160,26 @@ vec4 niri_blend(vec4 color) {
     if (niri_pq_gamut > 0.5) {
         float a = color.a;
         vec3 rgb = a > 0.0 ? color.rgb / a : color.rgb;
-        rgb = niri_tonemap_apply(niri_gamut * niri_pq_eotf(rgb));
+        rgb = niri_pq_eotf(rgb) * (niri_hdr_ref_scale > 0.0 ? niri_hdr_ref_scale : 1.0);
+        rgb = niri_tonemap_apply(niri_gamut * rgb);
         rgb = niri_pq_inv_eotf(rgb);
         return vec4(rgb * a, a);
     }
 
-    if (niri_hdr_pq < 0.5 && niri_linear < 0.5)
+    if (niri_hdr_pq < 0.5 && niri_linear < 0.5) {
+        // BT.2020-container PQ content within the output peak otherwise passes through
+        // numerically. When its reference white differs from the output's, rescale it in
+        // linear light and re-encode, so the SDR reference luminance acts as an output-wide
+        // brightness control over HDR content too. A zero scale means the uniform was never
+        // set (a program that does not drive the blend state): pass through.
+        if (niri_hdr_ref_scale > 0.0 && abs(niri_hdr_ref_scale - 1.0) > 0.00001) {
+            float a = color.a;
+            vec3 rgb = a > 0.0 ? color.rgb / a : color.rgb;
+            rgb = niri_pq_inv_eotf(niri_pq_eotf(rgb) * niri_hdr_ref_scale);
+            return vec4(rgb * a, a);
+        }
         return color;
+    }
 
     float a = color.a;
     vec3 rgb = a > 0.0 ? color.rgb / a : color.rgb;
@@ -170,11 +193,10 @@ vec4 niri_blend(vec4 color) {
     if (niri_linear > 0.5) {
         if (niri_hdr_pq > 0.5) {
             // Extended-linear content on an HDR output: already linear light; negative
-            // values escape the container gamut. The mapping to PQ is absolute
-            // (max_lum / 10000 per channel) and deliberately independent of the SDR
-            // reference luminance: scRGB-style content is display-referred for a
-            // BT.2100/PQ-mode screen and must never be tone mapped, only clamped to the
-            // output volume (which niri_pq_inv_eotf does).
+            // values escape the container gamut. Scale its reference white to the output
+            // reference white before converting to PQ. `niri_linear_scale` is computed as
+            // max_lum / 10000 * output_reference / content_reference, so changing the SDR
+            // reference luminance changes the absolute brightness of HDR linear content.
             rgb = niri_use_gamut > 0.5 ? niri_gamut * rgb : to_bt2020 * rgb;
             rgb = niri_pq_inv_eotf(rgb * niri_linear_scale);
         } else {

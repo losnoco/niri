@@ -15,6 +15,10 @@ uniform sampler2D tex;
 
 uniform float alpha;
 uniform float niri_ref_lum_scale;
+// Output reference luminance / content reference luminance: the linear-light rescale HDR PQ
+// content gets on composited frames, applied here too so captures match what is on screen.
+// 0.0 (unset) means no rescale; see hdr.frag.
+uniform float niri_hdr_ref_scale;
 // 1.0 = use niri_gamut (container primaries -> BT.709, identity when equal) instead of the
 // built-in BT.2020 constant.
 uniform float niri_use_gamut;
@@ -117,6 +121,11 @@ vec4 niri_hdr_to_sdr(vec4 color) {
     vec3 rgb = a > 0.0 ? color.rgb / a : color.rgb;
 
     rgb = niri_pq_eotf(rgb);
+
+    // Scale the content's reference white to the output's, before tone mapping, exactly like
+    // niri_blend()'s PQ path does — the tone mapping curve is anchored at the output
+    // reference luminance in both.
+    rgb = rgb * (niri_hdr_ref_scale > 0.0 ? niri_hdr_ref_scale : 1.0);
 
     // Compress the headroom above the reference white into the SDR range instead of
     // clipping it. (For non-BT.2020 containers this happens in container space, a close
