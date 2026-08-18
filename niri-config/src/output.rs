@@ -69,6 +69,8 @@ pub struct Output {
     pub modeline: Option<Modeline>,
     #[knuffel(child)]
     pub variable_refresh_rate: Option<Vrr>,
+    #[knuffel(child, unwrap(argument), default)]
+    pub allow_tearing: TearingMode,
     #[knuffel(child)]
     pub focus_at_startup: bool,
     // Deprecated; use layout.background_color.
@@ -110,6 +112,7 @@ impl Default for Output {
             mode: None,
             modeline: None,
             variable_refresh_rate: None,
+            allow_tearing: TearingMode::default(),
             background_color: None,
             backdrop_color: None,
             hot_corners: None,
@@ -141,6 +144,79 @@ pub struct MaxBpc(pub niri_ipc::MaxBpc);
 pub struct Vrr {
     #[knuffel(property, default = false)]
     pub on_demand: bool,
+}
+
+/// Which windows may tear on an output.
+///
+/// This only gates tearing; it never requests it. A window still has to ask for a tearing
+/// presentation, either through the tearing-control protocol or through the `allow-tearing` window
+/// rule, before any of these modes let it through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TearingMode {
+    /// Never tear on this output, even when a window asks for it.
+    Never,
+    /// Only honor tearing requests from the focused fullscreen window.
+    ///
+    /// A tearing page flip updates the entire output, so a request coming from a window that
+    /// doesn't cover it (or that the user isn't looking at) would tear unrelated content too.
+    #[default]
+    Fullscreen,
+    /// Honor tearing requests from any window visible on this output.
+    Always,
+}
+
+impl FromStr for TearingMode {
+    type Err = miette::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "true" | "yes" | "always" => Ok(Self::Always),
+            "false" | "no" | "never" => Ok(Self::Never),
+            "fullscreen" => Ok(Self::Fullscreen),
+            _ => Err(miette::miette!(
+                r#"invalid tearing mode, can be true, false, or "fullscreen""#
+            )),
+        }
+    }
+}
+
+impl<S: ErrorSpan> knuffel::DecodeScalar<S> for TearingMode {
+    fn type_check(
+        type_name: &Option<knuffel::span::Spanned<knuffel::ast::TypeName, S>>,
+        ctx: &mut Context<S>,
+    ) {
+        if let Some(type_name) = &type_name {
+            ctx.emit_error(DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+    }
+
+    fn raw_decode(
+        value: &knuffel::span::Spanned<knuffel::ast::Literal, S>,
+        ctx: &mut Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        match &**value {
+            knuffel::ast::Literal::Bool(val) => Ok(if *val { Self::Always } else { Self::Never }),
+            // Also accept the booleans spelled out, so that "yes"/"no" work next to "fullscreen".
+            knuffel::ast::Literal::String(val) => match Self::from_str(val) {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    ctx.emit_error(DecodeError::conversion(value, e.to_string()));
+                    Ok(Self::default())
+                }
+            },
+            _ => {
+                ctx.emit_error(DecodeError::conversion(
+                    value,
+                    r#"expected true, false, or "fullscreen""#,
+                ));
+                Ok(Self::default())
+            }
+        }
+    }
 }
 
 /// HDR (high dynamic range) output configuration.
@@ -613,6 +689,37 @@ mod tests {
         assert!("1920x".parse::<ConfiguredMode>().is_err());
         assert!("1920x1080@".parse::<ConfiguredMode>().is_err());
         assert!("1920x1080@60Hz".parse::<ConfiguredMode>().is_err());
+    }
+
+    #[test]
+    fn parse_tearing_mode() {
+        #[derive(knuffel::Decode, Debug)]
+        struct Cfg {
+            #[knuffel(child, unwrap(argument), default)]
+            allow_tearing: TearingMode,
+        }
+
+        fn parse(text: &str) -> TearingMode {
+            knuffel::parse::<Cfg>("test.kdl", text)
+                .unwrap()
+                .allow_tearing
+        }
+
+        assert_eq!(parse(""), TearingMode::Fullscreen);
+        assert_eq!(parse("allow-tearing true"), TearingMode::Always);
+        assert_eq!(parse("allow-tearing false"), TearingMode::Never);
+        assert_eq!(parse(r#"allow-tearing "yes""#), TearingMode::Always);
+        assert_eq!(parse(r#"allow-tearing "no""#), TearingMode::Never);
+        assert_eq!(parse(r#"allow-tearing "always""#), TearingMode::Always);
+        assert_eq!(parse(r#"allow-tearing "never""#), TearingMode::Never);
+        assert_eq!(
+            parse(r#"allow-tearing "fullscreen""#),
+            TearingMode::Fullscreen
+        );
+
+        assert!(knuffel::parse::<Cfg>("test.kdl", r#"allow-tearing "sometimes""#).is_err());
+        assert!(knuffel::parse::<Cfg>("test.kdl", "allow-tearing 3").is_err());
+        assert!(knuffel::parse::<Cfg>("test.kdl", "allow-tearing").is_err());
     }
 
     fn make_output_name(

@@ -673,7 +673,8 @@ window-rule {
 
 #### `allow-tearing`
 
-Allow screen tearing on an output where this window is visible.
+Request screen tearing for this window, as if it had used the tearing-control protocol. Setting it
+to `false` suppresses the window's own tearing requests instead.
 
 ```kdl
 // Allow tearing only when osu! has keyboard focus.
@@ -683,6 +684,11 @@ window-rule {
     allow-tearing true
 }
 ```
+
+Whether the request is actually honored depends on the output's
+[`allow-tearing`](./Configuration:-Outputs.md#allow-tearing) setting, which by default only lets the
+focused fullscreen window tear. If you want a windowed application to tear, set `allow-tearing true`
+on the output as well.
 
 #### `variable-refresh-rate`
 

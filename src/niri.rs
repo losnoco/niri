@@ -16,7 +16,7 @@ use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
 use calloop::ping::make_ping;
 use niri_config::debug::PreviewRender;
-use niri_config::output::{HdrMode, MaxBpc};
+use niri_config::output::{HdrMode, MaxBpc, TearingMode};
 use niri_config::{
     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
     WorkspaceReference, Xkb,
@@ -5562,7 +5562,28 @@ impl Niri {
     }
 
     pub fn output_allows_tearing(&self, output: &Output) -> bool {
+        let name = output.user_data().get::<OutputName>().unwrap();
+        let mode = self
+            .config
+            .borrow()
+            .outputs
+            .find(name)
+            .map_or_else(TearingMode::default, |output| output.allow_tearing);
+
+        if mode == TearingMode::Never {
+            return false;
+        }
+
         self.layout.windows_for_output(output).any(|mapped| {
+            // A tearing page flip updates the whole output at once, so in the default mode we only
+            // let the window that covers it and that the user is actually looking at through.
+            //
+            // is_fullscreen() takes the surface state lock, so it must stay outside the
+            // with_surfaces() closure below.
+            if mode == TearingMode::Fullscreen && !(mapped.is_focused() && mapped.is_fullscreen()) {
+                return false;
+            }
+
             let mut visible = false;
             let mut hint = false;
 

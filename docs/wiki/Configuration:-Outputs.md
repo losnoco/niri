@@ -13,6 +13,7 @@ output "eDP-1" {
     transform "90"
     position x=1280 y=0
     variable-refresh-rate // on-demand=true
+    allow-tearing "fullscreen"
     focus-at-startup
     backdrop-color "#001100"
     // max-bpc 8
@@ -226,6 +227,51 @@ output "HDMI-A-1" {
     variable-refresh-rate on-demand=true
 }
 ```
+
+### `allow-tearing`
+
+<sup>Since: next release</sup>
+
+Controls which windows are allowed to present with screen tearing (an immediate, non-vblank-synced
+page flip) on this output.
+
+This setting only *gates* tearing, it never requests it. A window still has to ask for a tearing
+presentation before anything tears, either by using the tearing-control protocol (most games and
+emulators do this, sometimes behind a "disable vsync" option), or by matching an
+[`allow-tearing` window rule](./Configuration:-Window-Rules.md#allow-tearing). What this setting
+decides is whose requests niri will honor.
+
+| Value | Behavior |
+| --- | --- |
+| `"fullscreen"` (default) | Honor tearing requests from the focused fullscreen window only. |
+| `true` / `"yes"` / `"always"` | Honor tearing requests from any window visible on the output. |
+| `false` / `"no"` / `"never"` | Never tear on this output. |
+
+The default is `"fullscreen"` because a tearing page flip updates the *whole* output, not just the
+window that asked for it. A tearing request from a window that doesn't cover the output — or that
+you aren't looking at — would tear your bar, your other tiles, and any animation running at the
+time. Restricting it to the focused fullscreen window gives games the latency benefit exactly where
+it's visible, and keeps the rest of the desktop tear-free.
+
+```kdl
+// Default: only a focused fullscreen game tears.
+output "DP-1" {
+    allow-tearing "fullscreen"
+}
+
+// Honor every tearing request on this output, fullscreen or not.
+output "DP-2" {
+    allow-tearing true
+}
+
+// Never tear here, no matter what a window asks for.
+output "eDP-1" {
+    allow-tearing false
+}
+```
+
+Note that the [`force-tearing` debug flag](./Configuration:-Debug-Options.md#force-tearing) bypasses
+this setting entirely, as it bypasses the window-side check too.
 
 ### `focus-at-startup`
 

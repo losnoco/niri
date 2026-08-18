@@ -54,7 +54,7 @@ pub use crate::input::{Input, ModKey, ScrollMethod, TrackLayout, WarpMouseToFocu
 pub use crate::layer_rule::LayerRule;
 pub use crate::layout::*;
 pub use crate::misc::*;
-pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
+pub use crate::output::{Output, OutputName, Outputs, Position, TearingMode, Vrr};
 use crate::recent_windows::RecentWindowsPart;
 pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, RecentWindows};
 pub use crate::utils::FloatOrInt;
@@ -769,6 +769,7 @@ mod tests {
                     reference-luminance 203
                 }
                 variable-refresh-rate on-demand=true
+                allow-tearing true
                 background-color "rgba(25, 25, 102, 1.0)"
                 hot-corners {
                     off
@@ -1225,6 +1226,7 @@ mod tests {
                                 on_demand: true,
                             },
                         ),
+                        allow_tearing: Always,
                         focus_at_startup: true,
                         background_color: Some(
                             Color {
@@ -1268,6 +1270,7 @@ mod tests {
                         ),
                         modeline: None,
                         variable_refresh_rate: None,
+                        allow_tearing: Fullscreen,
                         focus_at_startup: false,
                         background_color: None,
                         backdrop_color: None,
@@ -1299,6 +1302,7 @@ mod tests {
                             },
                         ),
                         variable_refresh_rate: None,
+                        allow_tearing: Fullscreen,
                         focus_at_startup: false,
                         background_color: None,
                         backdrop_color: None,

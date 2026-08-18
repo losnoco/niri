@@ -384,7 +384,7 @@ debug {
 
 ### `force-tearing`
 
-Enables screen tearing unconditionally, overriding any [`allow-tearing`](./Configuration:-Window-Rules.md#allow-tearing) window rules.
+Enables screen tearing unconditionally, overriding any [`allow-tearing`](./Configuration:-Window-Rules.md#allow-tearing) window rules and the [output `allow-tearing`](./Configuration:-Outputs.md#allow-tearing) setting.
 
 ```kdl
 debug {
