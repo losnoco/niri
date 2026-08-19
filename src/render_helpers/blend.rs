@@ -902,31 +902,35 @@ fn vulkan_params_custom_uniforms(
 pub fn set_frame_blend_tty(renderer: &mut TtyRenderer, blend: Option<(f64, f64)>) {
     match renderer {
         TtyRenderer::Gles(multi) => set_frame_blend(multi.as_mut(), blend),
-        TtyRenderer::Vulkan(multi) => {
-            let vk: &mut VulkanRenderer = multi.as_mut();
-            vk.user_data().insert_if_missing(FrameBlendState::default);
-            vk.user_data()
-                .get::<FrameBlendState>()
-                .unwrap()
-                .set_values(blend);
+        TtyRenderer::Vulkan(multi) => set_frame_blend_vulkan(multi.as_mut(), blend),
+    }
+}
 
-            match blend {
-                Some((ref_lum, _)) => {
-                    let scale = (ref_lum / 10000.) as f32;
-                    vk.set_default_color_params(Some(ColorBlendParams {
-                        hdr_pq: 1.0,
-                        ref_lum_scale: scale,
-                        ..Default::default()
-                    }));
-                    vk.set_solid_color_transform(Some(Box::new(move |color| {
-                        srgb_to_pq(color, scale)
-                    })));
-                }
-                None => {
-                    vk.set_default_color_params(None);
-                    vk.set_solid_color_transform(None);
-                }
-            }
+/// [`set_frame_blend`] over the Vulkan renderer.
+pub fn set_frame_blend_vulkan(renderer: &mut VulkanRenderer, blend: Option<(f64, f64)>) {
+    renderer
+        .user_data()
+        .insert_if_missing(FrameBlendState::default);
+    renderer
+        .user_data()
+        .get::<FrameBlendState>()
+        .unwrap()
+        .set_values(blend);
+
+    match blend {
+        Some((ref_lum, _)) => {
+            let scale = (ref_lum / 10000.) as f32;
+            renderer.set_default_color_params(Some(ColorBlendParams {
+                hdr_pq: 1.0,
+                ref_lum_scale: scale,
+                ..Default::default()
+            }));
+            renderer
+                .set_solid_color_transform(Some(Box::new(move |color| srgb_to_pq(color, scale))));
+        }
+        None => {
+            renderer.set_default_color_params(None);
+            renderer.set_solid_color_transform(None);
         }
     }
 }
