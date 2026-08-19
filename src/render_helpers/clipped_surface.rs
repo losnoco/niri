@@ -247,6 +247,8 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
         let mut uniforms = self.compute_uniforms();
         uniforms.extend(FrameBlendState::uniforms_for_content(frame, self.content));
         let saved = frame.take_tex_program_override();
+        crate::audit_texture_program!("clipped_surface");
+
         frame.override_default_tex_program(program.clone(), uniforms);
         let res = RenderElement::<GlesRenderer>::draw(
             &self.inner,
@@ -291,6 +293,8 @@ impl<'render> RenderElement<TtyRenderer<'render>>
                         self.content,
                     ));
                     saved = Some(gles_frame.take_tex_program_override());
+                    crate::audit_texture_program!("clipped_surface");
+
                     gles_frame.override_default_tex_program(program.clone(), uniforms);
                 }
             }
@@ -311,6 +315,8 @@ impl<'render> RenderElement<TtyRenderer<'render>>
                         }),
                 );
                 saved_vk = Some(vk_frame.take_tex_program_override());
+                crate::audit_texture_program!("clipped_surface");
+
                 vk_frame.set_tex_program_override(Some((program.clone(), uniforms)));
             }
             _ => {}

@@ -1214,6 +1214,7 @@ fn adjust_tex_program_for_content(
                 return None;
             };
             let uniforms = FrameBlendState::uniforms_for_content(frame, content);
+            crate::audit_texture_program!("texture_hdr");
             frame.set_tex_program_override(Some((program, uniforms)));
             Some(saved)
         }
@@ -1244,6 +1245,7 @@ fn adjust_tex_program_for_content(
                             return saved.is_some().then_some(saved);
                         };
                         let uniforms = FrameBlendState::uniforms_for_content(frame, content);
+                        crate::audit_texture_program!("texture_hdr");
                         frame.set_tex_program_override(Some((program, uniforms)));
                         Some(saved)
                     }
@@ -1270,6 +1272,7 @@ fn adjust_tex_program_for_content(
                     f64::from(ref_lum_scale) * 10000.,
                     f64::from(frame_max_lum),
                 ));
+                crate::audit_texture_program!("texture_hdr_to_sdr");
                 frame.override_default_tex_program(program, uniforms);
                 Some(saved)
             } else {
@@ -1287,6 +1290,7 @@ fn adjust_tex_program_for_content(
                 return None;
             };
             let uniforms = FrameBlendState::uniforms_for_content(frame, content);
+            crate::audit_texture_program!("texture_hdr");
             frame.set_tex_program_override(Some((program, uniforms)));
             Some(saved)
         }

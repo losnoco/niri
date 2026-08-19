@@ -37,7 +37,7 @@ pub struct Shaders {
     pub custom_open: RefCell<Option<ShaderProgram>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgramType {
     Border,
     Shadow,

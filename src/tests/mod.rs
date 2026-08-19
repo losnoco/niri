@@ -2,6 +2,7 @@ use fixture::Fixture;
 
 mod client;
 mod fixture;
+mod gpu;
 mod server;
 
 mod animations;
@@ -10,6 +11,7 @@ mod floating;
 mod fullscreen;
 mod layer_shell;
 mod remove_output;
+mod shader_runtime;
 mod suspended;
 mod transactions;
 mod virtual_pointer;

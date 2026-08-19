@@ -105,6 +105,8 @@ impl RenderElement<GlesRenderer> for GradientFadeTextureRenderElement {
         let mut uniforms = vec![Uniform::new("cutoff", self.cutoff)];
         uniforms.extend(FrameBlendState::uniforms(frame));
         let saved = frame.take_tex_program_override();
+        crate::audit_texture_program!("gradient_fade");
+
         frame.override_default_tex_program(program.clone(), uniforms);
         let res = RenderElement::<GlesRenderer>::draw(
             &self.inner,
@@ -144,6 +146,8 @@ impl<'render> RenderElement<TtyRenderer<'render>> for GradientFadeTextureRenderE
                     let mut uniforms = vec![Uniform::new("cutoff", self.cutoff)];
                     uniforms.extend(FrameBlendState::uniforms(gles_frame));
                     saved = Some(gles_frame.take_tex_program_override());
+                    crate::audit_texture_program!("gradient_fade");
+
                     gles_frame.override_default_tex_program(program.clone(), uniforms);
                 }
             }
@@ -169,6 +173,8 @@ impl<'render> RenderElement<TtyRenderer<'render>> for GradientFadeTextureRenderE
                     }),
                 );
                 saved_vk = Some(vk_frame.take_tex_program_override());
+                crate::audit_texture_program!("gradient_fade");
+
                 vk_frame.set_tex_program_override(Some((program.clone(), uniforms)));
             }
             _ => {}

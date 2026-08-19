@@ -40,6 +40,25 @@ It also usually helps to run the randomized tests for a longer period, so that t
 env RUN_SLOW_TESTS=1 PROPTEST_CASES=200000 PROPTEST_MAX_GLOBAL_REJECTS=200000 RUST_BACKTRACE=1 cargo test --release --all
 ```
 
+### Shader Tests
+
+`src/tests/shader_runtime.rs` runs niri's shaders on a real renderer: it creates a GLES renderer on a surfaceless EGL display and a Vulkan renderer on the first available device, then draws the render elements the compositor draws (borders, shadows, the animation shaders, blur and the background effects, the HDR texture shaders, whole scenes assembled by the layout) and fails on any renderer error.
+
+This catches what compiling a shader cannot: uniforms that were renamed, retyped or never bound. For the GLES renderer the tests additionally check every draw against the linked program, and fail if the shader uses a uniform the draw did not set — GL leaves such a uniform at its previous value instead of reporting an error.
+
+No GPU is needed. A software driver works just as well, since nothing checks pixel output:
+
+```
+env LIBGL_ALWAYS_SOFTWARE=1 cargo test --lib shader_runtime
+env VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json cargo test --lib shader_runtime
+```
+
+Without any usable driver, the tests print a message and pass. Set `NIRI_TEST_REQUIRE_GPU=1` to turn those skips into failures:
+
+```
+env NIRI_TEST_REQUIRE_GPU=1 cargo test --lib shader_runtime
+```
+
 ### Visual Tests
 
 The `niri-visual-tests` sub-crate is a GTK application that runs hard-coded test cases so that you can visually check that they look right. It uses mock windows with the real layout and rendering code. It is especially helpful when working on animations.

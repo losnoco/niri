@@ -405,6 +405,8 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             uniforms.extend(FrameBlendState::uniforms_for_blend_space(frame));
             uniforms
         });
+        crate::audit_texture_program!("postprocess_and_clip", if program.is_some());
+
         let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
 
         frame.render_texture_from_to(
@@ -617,6 +619,8 @@ impl FramebufferEffectElement {
                     }),
             );
             let saved = vk_frame.take_tex_program_override();
+            crate::audit_texture_program!("postprocess_and_clip");
+
             vk_frame.set_tex_program_override(Some((program, uniforms)));
             Some(saved)
         } else {

@@ -176,6 +176,8 @@ impl Blur {
         let _span = tracy_client::span!("Blur::render");
         trace!("rendering blur");
 
+        crate::audit_texture_program!("blur");
+
         ensure!(
             renderer.context_id() == self.renderer_context_id,
             "wrong renderer"
@@ -430,6 +432,8 @@ impl VulkanBlur {
     ) -> anyhow::Result<VulkanTexture> {
         let _span = tracy_client::span!("VulkanBlur::render");
         trace!("rendering vulkan blur");
+
+        crate::audit_texture_program!("blur");
 
         let passes = options.passes.clamp(1, 31) as usize;
         let size = source.size();

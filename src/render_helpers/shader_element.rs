@@ -431,6 +431,23 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
         let has_debug = !frame.debug_flags().is_empty();
         let has_tint = frame.debug_flags().contains(DebugFlags::TINT);
 
+        #[cfg(test)]
+        draw_audit::record(draw_audit::DrawRecord {
+            program: self.program,
+            gl_program: Some(if has_debug {
+                shader.0.debug.program
+            } else {
+                shader.0.normal.program
+            }),
+            uniforms: self
+                .additional_uniforms
+                .iter()
+                .chain(&blend_uniforms)
+                .map(|uniform| uniform.name.to_string())
+                .collect(),
+            textures: self.textures.keys().cloned().collect(),
+        });
+
         // render
         let span_loc = smithay::gpu_span_location!("draw shader");
         frame.with_profiled_context(span_loc, move |gl| -> Result<(), GlesError> {
@@ -636,6 +653,17 @@ impl ShaderRenderElement {
             super::blend::ContentColor::default(),
         ));
 
+        #[cfg(test)]
+        draw_audit::record(draw_audit::DrawRecord {
+            program: self.program,
+            gl_program: None,
+            uniforms: uniforms.iter().map(|u| u.name.to_string()).collect(),
+            textures: textures
+                .iter()
+                .map(|(name, _)| (*name).to_owned())
+                .collect(),
+        });
+
         frame.render_custom(&program, dst, damage, &uniforms, &textures, self.alpha)
     }
 }
@@ -726,5 +754,94 @@ impl<'render> RenderElement<TtyRenderer<'render>> for ShaderRenderElement {
         // If scanout for things other than Wayland buffers is implemented, this will need to take
         // the target GPU into account.
         None
+    }
+}
+
+/// Records a draw with one of the renderer's custom texture programs into the test audit
+/// trail, and compiles to nothing outside of tests.
+///
+/// These programs (the rounded-corner clip, the postprocess, the gradient fade, the HDR
+/// texture shaders, the blur) belong to the renderer rather than to a
+/// [`ShaderRenderElement`], so a test cannot tell from the render elements alone whether a
+/// scene exercised them. See the `draw_audit` module.
+#[macro_export]
+macro_rules! audit_texture_program {
+    ($name:literal) => {
+        #[cfg(test)]
+        $crate::render_helpers::shader_element::draw_audit::record_texture_program($name);
+    };
+    ($name:literal, if $cond:expr) => {
+        #[cfg(test)]
+        if $cond {
+            $crate::render_helpers::shader_element::draw_audit::record_texture_program($name);
+        }
+    };
+}
+
+/// Test-only audit trail of the shader draws that a render pass performed.
+///
+/// Recording every draw's bound uniforms lets tests check them against the uniforms the
+/// linked program actually uses: GL silently leaves an unbound uniform at its previous (or
+/// zero) value, so forgetting to bind one is invisible at runtime and produces wrong pixels
+/// instead of an error. The records also tell a test which shader programs a scene really
+/// exercised, so a scene that stops producing an effect cannot pass vacuously.
+#[cfg(test)]
+pub mod draw_audit {
+    use std::cell::RefCell;
+
+    use super::ProgramType;
+
+    /// One [`ShaderRenderElement`](super::ShaderRenderElement) draw.
+    #[derive(Debug, Clone)]
+    pub struct DrawRecord {
+        /// Which of niri's shader programs was drawn.
+        pub program: ProgramType,
+        /// The GL program object of the draw, or `None` for a Vulkan draw.
+        pub gl_program: Option<u32>,
+        /// Names of every uniform that was given a value for this draw.
+        pub uniforms: Vec<String>,
+        /// Names of the texture samplers that were bound for this draw.
+        pub textures: Vec<String>,
+    }
+
+    thread_local! {
+        static RECORDS: RefCell<Option<Vec<DrawRecord>>> = const { RefCell::new(None) };
+        static TEXTURE_PROGRAMS: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
+    }
+
+    /// Starts recording draws on this thread, discarding any earlier records.
+    pub fn start() {
+        RECORDS.with(|records| *records.borrow_mut() = Some(Vec::new()));
+        TEXTURE_PROGRAMS.with(|programs| *programs.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stops recording and returns everything recorded since [`start`].
+    pub fn take() -> Vec<DrawRecord> {
+        RECORDS.with(|records| records.borrow_mut().take().unwrap_or_default())
+    }
+
+    /// Stops recording and returns the custom texture programs drawn since [`start`].
+    pub fn take_texture_programs() -> Vec<&'static str> {
+        TEXTURE_PROGRAMS.with(|programs| programs.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(super) fn record(record: DrawRecord) {
+        RECORDS.with(|records| {
+            if let Some(records) = &mut *records.borrow_mut() {
+                records.push(record);
+            }
+        });
+    }
+
+    /// Records a draw with one of the custom texture programs, which are owned by the
+    /// renderer rather than by a [`ShaderRenderElement`](super::ShaderRenderElement).
+    pub fn record_texture_program(name: &'static str) {
+        TEXTURE_PROGRAMS.with(|programs| {
+            if let Some(programs) = &mut *programs.borrow_mut() {
+                if !programs.contains(&name) {
+                    programs.push(name);
+                }
+            }
+        });
     }
 }
