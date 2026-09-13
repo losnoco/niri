@@ -1442,10 +1442,11 @@ impl Tty {
             );
         }
 
-        // Probe the color pipelines (kernel drm_colorop API, Linux 6.19+) the primary plane
-        // offers. Not used for anything yet; they will let color-mismatched fullscreen content
-        // (SDR or scRGB on a PQ output) go direct scanout with the conversion done in the
-        // display hardware.
+        // Log the color pipelines (kernel drm_colorop API, Linux 6.19+) the primary plane
+        // offers. The DrmCompositor discovers them for every plane on its own and resolves the
+        // per-element scanout color transforms against them (see use_color_transforms), so that
+        // color-mismatched content (SDR or scRGB on a PQ output) can go direct scanout with the
+        // conversion done in the display hardware; this is diagnostics only.
         match surface.plane_color_pipelines(surface.plane()) {
             Ok(pipelines) if pipelines.is_empty() => {
                 debug!("primary plane offers no color pipelines");
