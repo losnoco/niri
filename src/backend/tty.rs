@@ -411,6 +411,8 @@ struct Surface {
     gamma_props: Option<GammaProps>,
     /// Gamma change to apply upon session resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
+    /// Whether the unsupported post-blend encode offload was already logged.
+    post_blend_unsupported_logged: bool,
     /// Tracy frame that goes from vblank to vblank.
     vblank_frame: Option<tracy_client::Frame>,
     /// Frame name for the VBlank frame.
@@ -1889,6 +1891,7 @@ impl Tty {
             was_direct_scanout: None,
             gamma_props,
             pending_gamma_change: None,
+            post_blend_unsupported_logged: false,
             vblank_frame: None,
             vblank_frame_name,
             time_since_presentation_plot_name,
@@ -2143,6 +2146,22 @@ impl Tty {
             }
         }
 
+        // A gamma change deferred by the post-blend encode offload can go through once the
+        // compositor has committed a frame resetting the gamma LUT.
+        let gamma_deferred = surface.pending_gamma_change.is_some();
+        if gamma_deferred && !surface.compositor.post_blend_encode_owns_gamma() {
+            let ramp = surface.pending_gamma_change.take().unwrap();
+            let ramp = ramp.as_deref();
+            let res = if let Some(gamma_props) = &mut surface.gamma_props {
+                gamma_props.set_gamma(&device.drm, ramp)
+            } else {
+                set_gamma_for_crtc(&device.drm, crtc, ramp)
+            };
+            if let Err(err) = res {
+                warn!("error applying deferred gamma change: {err:?}");
+            }
+        }
+
         if let Some(last_sequence) = output_state.last_drm_sequence {
             let delta = meta.sequence as f64 - last_sequence as f64;
             tracy_client::Client::running()
@@ -2385,9 +2404,44 @@ impl Tty {
         #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
         let transforms =
             niri.scanout_color_transforms(output, blend_hdr, scanout_ref_lum, peak_luminance);
+
+        // Planes whose color pipelines can't apply the PQ encode (nvidia's always end in linear
+        // light) can still scan out a single fullscreen surface by moving the encode behind
+        // blending, onto the CRTC gamma LUT. The compositor owns the gamma LUT while this is
+        // enabled, so gamma-control ramps keep it disabled (see Tty::set_gamma).
+        let gamma_in_use = surface.pending_gamma_change.is_some()
+            || surface
+                .gamma_props
+                .as_ref()
+                .is_some_and(|props| props.previous_blob.is_some());
+        let post_blend =
+            (blend_hdr && !gamma_in_use && self.config.borrow().debug.scanout_post_blend_encode)
+                .then(|| blend::hdr_post_blend_encode(peak_luminance));
+        #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
+        let linear_transforms = match post_blend {
+            Some(encode) => transforms
+                .iter()
+                .filter_map(|(id, transform)| {
+                    let linear = blend::post_blend_linear_transform((*transform)?, encode)?;
+                    Some((id.clone(), linear))
+                })
+                .collect(),
+            None => HashMap::new(),
+        };
+
         surface
             .compositor
             .use_color_transforms(transforms, blend_hdr);
+        let post_blend_enabled = surface
+            .compositor
+            .use_post_blend_encode(post_blend, linear_transforms);
+        if post_blend.is_some() && !post_blend_enabled && !surface.post_blend_unsupported_logged {
+            surface.post_blend_unsupported_logged = true;
+            debug!(
+                connector = surface.name.connector,
+                "post-blend encode offload unsupported (no GAMMA_LUT or primary plane color pipelines)"
+            );
+        }
 
         // A blend-space change alters what every shader outputs without any element damage;
         // force a full redraw. The cursor plane's contents bypass the renderer entirely, so
@@ -2400,6 +2454,16 @@ impl Tty {
                 .compositor
                 .set_cursor_buffer_transform(blend.map(|(ref_lum, _)| {
                     let encoder = blend::SrgbToPqEncoder::new((ref_lum / 10000.) as f32);
+                    Box::new(move |data: &mut [u8], stride: u32, size: (u32, u32)| {
+                        encoder.apply(data, stride, size);
+                    }) as Box<_>
+                }));
+            // Frames offloading the PQ encode to the gamma LUT (see use_post_blend_encode above)
+            // need the cursor in the same normalized linear light as the scanned out surface.
+            surface
+                .compositor
+                .set_cursor_buffer_transform_post_blend(blend.map(|(ref_lum, peak_lum)| {
+                    let encoder = blend::SrgbToPqEncoder::new_linear((ref_lum / peak_lum) as f32);
                     Box::new(move |data: &mut [u8], stride: u32, size: (u32, u32)| {
                         encoder.apply(data, stride, size);
                     }) as Box<_>
@@ -2700,6 +2764,16 @@ impl Tty {
         }
     }
 
+    /// Whether a gamma change is waiting to be applied, e.g. for the post-blend encode offload
+    /// to release the gamma LUT, which takes a redraw.
+    pub fn has_pending_gamma_change(&self, output: &Output) -> bool {
+        let tty_state = output.user_data().get::<TtyOutputState>().unwrap();
+        self.devices
+            .get(&tty_state.node)
+            .and_then(|device| device.surfaces.get(&tty_state.crtc))
+            .is_some_and(|surface| surface.pending_gamma_change.is_some())
+    }
+
     pub fn set_gamma(&mut self, output: &Output, ramp: Option<Vec<u16>>) -> anyhow::Result<()> {
         let tty_state = output.user_data().get::<TtyOutputState>().unwrap();
         let crtc = tty_state.crtc;
@@ -2710,8 +2784,11 @@ impl Tty {
             .context("missing device")?;
         let surface = device.surfaces.get_mut(&crtc).context("missing surface")?;
 
-        // Cannot change properties while the device is inactive.
-        if !self.session.is_active() {
+        // Cannot change properties while the device is inactive, nor while the compositor
+        // owns the gamma LUT for the post-blend encode offload. In the latter case the pending
+        // change disables the offload on the next frame, and is applied on the vblank after the
+        // gamma LUT was reset (see on_vblank).
+        if !self.session.is_active() || surface.compositor.post_blend_encode_owns_gamma() {
             surface.pending_gamma_change = Some(ramp);
             return Ok(());
         }

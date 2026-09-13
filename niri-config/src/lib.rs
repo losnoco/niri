@@ -2315,6 +2315,7 @@ mod tests {
                 enable_overlay_planes: false,
                 disable_cursor_plane: false,
                 disable_cursor_plane_on_hdr: false,
+                scanout_post_blend_encode: false,
                 disable_direct_scanout: false,
                 restrict_primary_scanout_to_matching_format: false,
                 force_disable_connectors_on_resume: false,

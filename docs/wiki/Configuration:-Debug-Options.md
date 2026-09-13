@@ -16,6 +16,7 @@ debug {
     enable-overlay-planes
     disable-cursor-plane
     disable-cursor-plane-on-hdr
+    scanout-post-blend-encode
     disable-direct-scanout
     restrict-primary-scanout-to-matching-format
     force-disable-connectors-on-resume
@@ -101,6 +102,25 @@ Overridden by `disable-cursor-plane`, which disables the cursor plane everywhere
 ```kdl
 debug {
     disable-cursor-plane-on-hdr
+}
+```
+
+### `scanout-post-blend-encode`
+
+On HDR outputs, let a fullscreen surface go direct scanout even when the display's plane color pipelines can't apply the final PQ encode, by moving that encode behind blending onto the CRTC gamma LUT.
+
+This is aimed at Nvidia, whose plane color pipelines can decode, scale and gamut-convert content but always end in linear light, so SDR or non-BT.2020 content on an HDR output is otherwise always composited.
+With this flag, when a single surface covers the whole output and nothing else is visible, the plane is programmed to output linear light normalized to the display's peak luminance, and the CRTC gamma LUT encodes it to PQ in the same atomic commit.
+A cursor on the cursor plane doesn't prevent this: on those frames its image is converted to the same linear light instead of PQ, so the gamma LUT encodes it along with the surface (cursor images in both forms are cached, so moving in and out of the offload doesn't re-convert them).
+A composited cursor does prevent direct scanout, so don't combine this with `disable-cursor-plane` or `disable-cursor-plane-on-hdr`.
+
+This is experimental.
+The gamma LUT is indexed by linear light, so it has little precision near black and dark gradients may band.
+While it is active, gamma adjustments from gamma-control clients (night light tools) are deferred until the offload is disabled again.
+
+```kdl
+debug {
+    scanout-post-blend-encode
 }
 ```
 

@@ -10,7 +10,7 @@
 
 use std::cell::Cell;
 
-use smithay::backend::drm::{Curve1DType, ScanoutColorTransform};
+use smithay::backend::drm::{Curve1DType, PostBlendEncode, ScanoutColorTransform};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{
@@ -408,6 +408,36 @@ pub fn scanout_color_transform(
                 encode: Some(Curve1DType::Gamma22Inv),
             },
         }
+    })
+}
+
+/// The post-blend encode for an HDR (PQ blend space) output: the plane outputs linear light
+/// normalized to the output's peak luminance, and the CRTC gamma LUT encodes it to PQ.
+pub fn hdr_post_blend_encode(peak_luminance: f64) -> PostBlendEncode {
+    PostBlendEncode {
+        encode: Curve1DType::Pq125InvEotf,
+        // The DRM PQ125 curves use 80 cd/m² as their linear unit.
+        linear_max: peak_luminance / 80.,
+    }
+}
+
+/// The plane half of a [`PostBlendEncode`]: `transform` without its encode stage, normalized so
+/// that the plane outputs 1.0 for [`PostBlendEncode::linear_max`].
+///
+/// Returns `None` for transforms that don't end in `encode.encode`. The normalization is
+/// applied through the multiplier, ahead of the gamut matrix, which is only equivalent because
+/// the gamut matrices carry no offset.
+pub fn post_blend_linear_transform(
+    transform: ScanoutColorTransform,
+    encode: PostBlendEncode,
+) -> Option<ScanoutColorTransform> {
+    if transform.encode != Some(encode.encode) {
+        return None;
+    }
+    Some(ScanoutColorTransform {
+        multiplier: transform.multiplier / encode.linear_max,
+        encode: None,
+        ..transform
     })
 }
 
@@ -1032,6 +1062,11 @@ pub fn srgb_to_pq(color: Color32F, ref_lum_scale: f32) -> Color32F {
 /// contents bypass the renderer, so the conversion the blend shaders would do runs here
 /// instead.
 ///
+/// [`Self::new_linear`] builds the variant for frames offloading the PQ encode to the CRTC
+/// gamma LUT ([`hdr_post_blend_encode`]): it outputs BT.2020 linear light scaled so that 1.0 is
+/// the output's peak luminance, matching the plane of the scanned out surface. 8 bits of linear
+/// light are coarse, but enough for cursor images.
+///
 /// This runs inside `render_frame` every time the cursor *image* changes, which an animated
 /// cursor does many times per second; the per-pixel `powf` version of this encode took
 /// 12-46 ms per change on a 256x256 cursor plane and dropped frames whenever the pointer
@@ -1045,6 +1080,8 @@ pub struct SrgbToPqEncoder {
     /// domain so the near-black region (where PQ is steepest) gets most of the samples:
     /// `pq[i] = pq_encode((i / (N - 1))^4 * ref_lum_scale)`.
     pq: Box<[f32; Self::PQ_SAMPLES]>,
+    /// Output linear light instead of PQ.
+    linear: bool,
 }
 
 impl SrgbToPqEncoder {
@@ -1067,7 +1104,20 @@ impl SrgbToPqEncoder {
             ref_lum_scale,
             eotf,
             pq,
+            linear: false,
         }
+    }
+
+    /// The variant outputting linear light for the post-blend encode offload, where `scale`
+    /// maps sRGB white to the normalized plane output (reference / peak luminance).
+    pub fn new_linear(scale: f32) -> Self {
+        let mut encoder = Self::new(scale);
+        for (i, v) in encoder.pq.iter_mut().enumerate() {
+            let t = i as f32 / (Self::PQ_SAMPLES - 1) as f32;
+            *v = (t * t) * (t * t) * scale;
+        }
+        encoder.linear = true;
+        encoder
     }
 
     /// sRGB EOTF for an unpremultiplied electrical value in [0, 1] (or above, for buffers
@@ -1087,6 +1137,9 @@ impl SrgbToPqEncoder {
         if lin >= 1. {
             // Out-of-range linear light from invalid premultiplied input; match the exact
             // path, whose clamp only applies after the reference-luminance scale.
+            if self.linear {
+                return lin * self.ref_lum_scale;
+            }
             return pq_encode(lin * self.ref_lum_scale);
         }
         let t = lin.max(0.).sqrt().sqrt();
@@ -1458,6 +1511,37 @@ impl<'render> RenderElement<TtyRenderer<'render>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_blend_linear_transform_drops_encode_and_normalizes() {
+        let encode = hdr_post_blend_encode(1000.);
+        let sdr = scanout_color_transform(
+            ContentColor::Sdr {
+                gamut: ContentGamut::Srgb,
+            },
+            true,
+            203.,
+            1000.,
+        )
+        .unwrap();
+        let linear = post_blend_linear_transform(sdr, encode).unwrap();
+        assert_eq!(linear.encode, None);
+        assert_eq!(linear.decode, sdr.decode);
+        assert_eq!(linear.ctm, sdr.ctm);
+        // Reference white lands at 203 / 1000 of the normalized range, and the gamma LUT
+        // encodes u × 1000 cd/m² back to the same PQ value the plane encode would produce.
+        assert!((linear.multiplier - 0.203).abs() < 1e-9);
+        let offloaded = encode.encode.eval(linear.multiplier * encode.linear_max);
+        let on_plane = Curve1DType::Pq125InvEotf.eval(203. / 80.);
+        assert!((offloaded - on_plane).abs() < 1e-9);
+
+        // Transforms without the PQ encode (SDR outputs) don't take part.
+        let sdr_output = ScanoutColorTransform {
+            encode: Some(Curve1DType::Gamma22Inv),
+            ..sdr
+        };
+        assert_eq!(post_blend_linear_transform(sdr_output, encode), None);
+    }
 
     #[test]
     fn content_color_classification() {
@@ -1937,6 +2021,45 @@ mod tests {
         // the white point rescaled by alpha.
         let half = srgb_to_pq(Color32F::new(0.5, 0.5, 0.5, 0.5), scale);
         assert!((half.r() - white.r() * 0.5).abs() < 0.0005);
+    }
+
+    #[test]
+    fn srgb_to_linear_encoder_matches_exact_conversion() {
+        let scale = (203. / 1000.) as f32;
+        let encoder = SrgbToPqEncoder::new_linear(scale);
+
+        let alphas = [1u8, 17, 128, 254, 255];
+        let mut pixels = Vec::new();
+        for a in alphas {
+            for v in (0u16..=255).step_by(15).map(|v| v as u8) {
+                pixels.push([v.min(a), (v / 2).min(a), (255 - v).min(a), a]);
+            }
+        }
+        let mut buf = pixels.iter().flatten().copied().collect::<Vec<u8>>();
+        encoder.apply(
+            &mut buf,
+            (pixels.len() * 4) as u32,
+            (pixels.len() as u32, 1),
+        );
+
+        for (px, out) in pixels.iter().zip(buf.chunks_exact(4)) {
+            let a = f32::from(px[3]) / 255.;
+            let lin = |c: u8| (f32::from(c) / 255. / a).powf(2.2);
+            let (r, g, b) = bt709_to_bt2020(lin(px[2]), lin(px[1]), lin(px[0]));
+            let expected = |c: f32| (c * scale * a * 255.).round().clamp(0., 255.) as u8;
+            let expected = [expected(b), expected(g), expected(r), px[3]];
+            for (o, e) in out.iter().zip(expected) {
+                assert!(
+                    o.abs_diff(e) <= 1,
+                    "{px:?}: got {out:?}, expected {expected:?}"
+                );
+            }
+        }
+
+        // sRGB white lands at reference / peak luminance of the normalized range.
+        let mut white = [255u8, 255, 255, 255];
+        encoder.apply(&mut white, 4, (1, 1));
+        assert_eq!(white[0], (0.203f32 * 255.).round() as u8);
     }
 
     #[test]

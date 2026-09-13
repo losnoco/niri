@@ -876,7 +876,13 @@ impl GammaControlHandler for State {
 
     fn set_gamma(&mut self, output: &Output, ramp: Option<Vec<u16>>) -> Option<()> {
         match self.backend.tty().set_gamma(output, ramp) {
-            Ok(()) => Some(()),
+            Ok(()) => {
+                // A deferred change needs a frame to disable the post-blend encode offload.
+                if self.backend.tty().has_pending_gamma_change(output) {
+                    self.niri.queue_redraw(output);
+                }
+                Some(())
+            }
             Err(err) => {
                 warn!("error setting gamma for output {}: {err:?}", output.name());
                 None
