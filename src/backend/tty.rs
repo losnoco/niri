@@ -2294,8 +2294,17 @@ impl Tty {
             let blend_hdr = hdr_allowed && (always_on || hdr_desc.is_some());
 
             let desired = if blend_hdr {
-                // Without fullscreen HDR content, the metadata comes from the sink's EDID.
-                let desc = hdr_desc.unwrap_or(ImageDescription {
+                // The HDR metadata stays fixed for as long as the output stays in HDR. Any change
+                // of the infoframe is a full modeset on nvidia whenever the GPU has a non-HDMI
+                // connector (NVKMS only synchronizes infoframes with flips on all-HDMI devices),
+                // which blanks the screen through the fullscreen animation. Niri maps content to
+                // the display's own peak luminance anyway, so the content's metadata tells the
+                // sink little.
+                //
+                // With mode="on" it always comes from the sink's EDID. In auto mode, entering HDR
+                // is a modeset regardless, so it is taken from the content that engages HDR and
+                // then kept until HDR is left.
+                let edid_desc = ImageDescription {
                     transfer: CmTransferFunction::St2084Pq,
                     primaries: CmPrimariesOption {
                         named: Some(CmPrimaries::Bt2020),
@@ -2308,10 +2317,21 @@ impl Tty {
                     luminances: None,
                     windows_scrgb: false,
                     windows_bt2100: false,
-                });
+                };
+                let pending = surface.compositor.pending_color_state();
+                let hdr_metadata = match pending.hdr_metadata {
+                    Some(metadata) if !always_on && pending.colorspace == Colorspace::Bt2020Rgb => {
+                        metadata
+                    }
+                    _ if always_on => build_hdr_metadata(&edid_desc, &surface.edid_hdr),
+                    _ => build_hdr_metadata(
+                        hdr_desc.as_ref().unwrap_or(&edid_desc),
+                        &surface.edid_hdr,
+                    ),
+                };
                 ConnectorColorState {
                     colorspace: Colorspace::Bt2020Rgb,
-                    hdr_metadata: Some(build_hdr_metadata(&desc, &surface.edid_hdr)),
+                    hdr_metadata: Some(hdr_metadata),
                     max_bpc,
                 }
             } else {

@@ -380,11 +380,15 @@ The optional `mode` property controls when the output is in HDR:
   application shows HDR content (passthrough). Applications are told to prefer HDR (PQ / BT.2020)
   once they are the active fullscreen window, so clients that listen for preference changes (SDL3
   games, mpv with `--target-colorspace-hint`) switch to HDR when they go fullscreen. Entering and
-  leaving HDR is a modeset (expect a brief blank).
+  leaving HDR is a modeset (expect a brief blank). The `HDR_OUTPUT_METADATA` is taken from the
+  application that engages HDR and kept until the output leaves HDR, even if other HDR content
+  becomes fullscreen in between.
 - `mode="on"`: the output is always in HDR. SDR content (the desktop, windowed applications) is
   composited into the HDR blend space, windowed HDR content displays correctly alongside it, and
   applications are told to prefer HDR upfront — use this for games that only probe HDR support once
-  at startup. There is no modeset when entering or leaving fullscreen. Costs: SDR-only fullscreen
+  at startup. The `HDR_OUTPUT_METADATA` always describes the display itself (from its EDID) and
+  never changes with the content, so there is no modeset when entering or leaving fullscreen (on
+  nvidia with DisplayPort, any metadata change would be one). Costs: SDR-only fullscreen
   applications lose direct scanout on this output, and the cursor is rendered without the cursor
   plane.
 
