@@ -73,6 +73,34 @@ pub struct OutputHdrCaps {
     pub max_frame_avg_luminance: u16,
 }
 
+impl OutputHdrCaps {
+    /// Applies the `peak-luminance` override from the output's HDR config, if any.
+    pub fn with_peak_luminance(self, peak_luminance: Option<f64>) -> Self {
+        let Some(peak) = peak_luminance else {
+            return self;
+        };
+        let (max_luminance, max_frame_avg_luminance) =
+            override_peak_luminance(peak, self.max_frame_avg_luminance);
+        Self {
+            max_luminance,
+            max_frame_avg_luminance,
+            ..self
+        }
+    }
+}
+
+/// The (max, max frame-average) luminance pair for a configured peak luminance: the peak
+/// replaces the max luminance, and caps the frame-average luminance, which can't exceed it.
+pub fn override_peak_luminance(peak: f64, max_frame_avg_luminance: u16) -> (u16, u16) {
+    let peak = peak.round().clamp(1., f64::from(u16::MAX)) as u16;
+    let frame_avg = if max_frame_avg_luminance > 0 {
+        max_frame_avg_luminance.min(peak)
+    } else {
+        0
+    };
+    (peak, frame_avg)
+}
+
 #[derive(PartialEq, Eq)]
 pub enum RenderResult {
     /// The frame was submitted to the backend for presentation.

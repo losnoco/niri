@@ -234,6 +234,13 @@ pub struct Hdr {
     /// in HDR mode. Defaults to 203 cd/m² (the BT.2408 reference white) when unset.
     #[knuffel(child, unwrap(argument))]
     pub reference_luminance: Option<FloatOrInt<0, 10000>>,
+    /// Peak luminance of the display, in cd/m² (nits), overriding the value from its EDID.
+    ///
+    /// Meant for displays whose EDID lacks the HDR luminance data (many TVs): niri then assumes
+    /// a conservative 500 cd/m². It is used for tone mapping, the `HDR_OUTPUT_METADATA` sent to
+    /// the display, and the luminances advertised to clients.
+    #[knuffel(child, unwrap(argument))]
+    pub peak_luminance: Option<FloatOrInt<1, 10000>>,
 }
 
 /// When HDR engages on an `hdr`-enabled output.

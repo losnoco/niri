@@ -396,6 +396,13 @@ The optional `reference-luminance` child (in cd/m²) is the luminance that SDR w
 an SDR application) is displayed at while the output is in HDR. Defaults to 203 (the BT.2408
 reference); raise it if the SDR desktop looks too dim next to HDR content.
 
+The optional `peak-luminance` child (in cd/m²) overrides the display's peak luminance from its EDID.
+Only set it for displays whose EDID doesn't provide HDR luminance data, which is common on TVs:
+without it niri assumes a conservative 500 cd/m². Use the peak brightness from the display's
+specifications. The value is used to tone map content brighter than the display, in the
+`HDR_OUTPUT_METADATA` sent to the display (max luminance and MaxCLL), and in the luminances
+advertised to applications. Setting it on a display with correct EDID data only replaces that data.
+
 Screenshots and screencasts of HDR outputs are rendered in SDR; HDR application content appears
 washed out in them.
 
@@ -409,6 +416,13 @@ output "eDP-1" {
 output "DP-1" {
     hdr mode="on" {
         reference-luminance 203
+    }
+}
+
+// A TV whose EDID has no HDR luminance data.
+output "HDMI-A-1" {
+    hdr {
+        peak-luminance 800
     }
 }
 ```

@@ -2699,6 +2699,7 @@ impl Niri {
         }
         let name = output.user_data().get::<OutputName>()?;
         let hdr = self.config.borrow().outputs.find(name)?.hdr.clone()?;
+        let caps = caps.with_peak_luminance(hdr.peak_luminance.map(|v| v.0));
         Some((hdr, caps))
     }
 

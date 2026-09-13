@@ -75,7 +75,7 @@ use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
 use super::tty_renderer::TtyGpuManager;
-use super::{IpcOutputMap, OutputHdrCaps, RenderResult};
+use super::{override_peak_luminance, IpcOutputMap, OutputHdrCaps, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, RedrawState, State};
@@ -458,6 +458,20 @@ impl EdidHdrInfo {
             // EDID reports cd/m²; the infoframe field is in 0.0001 cd/m² units.
             min_luminance: lum_u16(hdr.desired_content_min_luminance * 10000.),
             max_frame_avg_luminance: lum_u16(hdr.desired_content_max_frame_avg_luminance),
+        }
+    }
+
+    /// Applies the `peak-luminance` override from the output's HDR config, if any.
+    fn with_peak_luminance(self, peak_luminance: Option<f64>) -> Self {
+        let Some(peak) = peak_luminance else {
+            return self;
+        };
+        let (max_luminance, max_frame_avg_luminance) =
+            override_peak_luminance(peak, self.max_frame_avg_luminance);
+        Self {
+            max_luminance,
+            max_frame_avg_luminance,
+            ..self
         }
     }
 }
@@ -2292,10 +2306,16 @@ impl Tty {
         // The connector state is only *staged* here; smithay applies it inside its own commit
         // as a single atomic modeset together with mode, CRTC and plane state (committing
         // connector color properties standalone hangs some drivers, notably nvidia).
-        let (blend_hdr, reference_luminance) = {
+        let (blend_hdr, reference_luminance, edid_hdr) = {
             let config = self.config.borrow();
             let output_config = config.outputs.find(&surface.name);
             let hdr_config = output_config.and_then(|o| o.hdr.clone());
+            let edid_hdr = surface.edid_hdr.with_peak_luminance(
+                hdr_config
+                    .as_ref()
+                    .and_then(|h| h.peak_luminance)
+                    .map(|v| v.0),
+            );
             let hdr_allowed = hdr_config.is_some() && surface.hdr_supported;
             let max_bpc = output_config
                 .map(|o| effective_max_bpc(o, &surface.max_bpc_range))
@@ -2343,11 +2363,8 @@ impl Tty {
                     Some(metadata) if !always_on && pending.colorspace == Colorspace::Bt2020Rgb => {
                         metadata
                     }
-                    _ if always_on => build_hdr_metadata(&edid_desc, &surface.edid_hdr),
-                    _ => build_hdr_metadata(
-                        hdr_desc.as_ref().unwrap_or(&edid_desc),
-                        &surface.edid_hdr,
-                    ),
+                    _ if always_on => build_hdr_metadata(&edid_desc, &edid_hdr),
+                    _ => build_hdr_metadata(hdr_desc.as_ref().unwrap_or(&edid_desc), &edid_hdr),
                 };
                 ConnectorColorState {
                     colorspace: Colorspace::Bt2020Rgb,
@@ -2381,7 +2398,7 @@ impl Tty {
                 }
             }
 
-            (blend_hdr, reference_luminance)
+            (blend_hdr, reference_luminance, edid_hdr)
         };
 
         // Per-element scanout color transforms: reproduce the blend shaders' conversions in
@@ -2396,11 +2413,8 @@ impl Tty {
         } else {
             DEFAULT_REFERENCE_LUMINANCE
         };
-        let peak_luminance = blend::output_peak_luminance(
-            blend_hdr,
-            scanout_ref_lum,
-            surface.edid_hdr.max_luminance,
-        );
+        let peak_luminance =
+            blend::output_peak_luminance(blend_hdr, scanout_ref_lum, edid_hdr.max_luminance);
         #[allow(clippy::mutable_key_type)] // Id's Eq/Hash are stable.
         let transforms =
             niri.scanout_color_transforms(output, blend_hdr, scanout_ref_lum, peak_luminance);
@@ -4054,7 +4068,9 @@ fn build_hdr_metadata(desc: &ImageDescription, edid: &EdidHdrInfo) -> HdrOutputM
         .filter(|v| *v > 0)
         .map(|v| clamp_to(to_u16(v), edid.max_frame_avg_luminance))
         .or((edid.max_frame_avg_luminance > 0).then_some(edid.max_frame_avg_luminance))
-        .unwrap_or(500);
+        // The frame-average luminance can't exceed the content's max luminance, which matters
+        // for a configured peak-luminance below the placeholder.
+        .unwrap_or(max_cll.min(500));
 
     // ST 2086 mastering primaries: the client's target color volume, which may exceed the
     // container primaries (extended target volume). Without one, the target defaults to the
@@ -4307,6 +4323,23 @@ mod tests {
         assert_eq!(meta.max_display_mastering_luminance, 800);
         assert_eq!(meta.min_display_mastering_luminance, 100);
         assert_eq!(meta.max_cll, 800);
+        assert_eq!(meta.max_fall, 600);
+
+        // A configured peak luminance replaces the EDID's (or the missing) max luminance, and
+        // caps the frame-average luminance.
+        let meta = build_hdr_metadata(
+            &pq_desc,
+            &EdidHdrInfo::default().with_peak_luminance(Some(350.)),
+        );
+        assert_eq!(meta.max_display_mastering_luminance, 350);
+        assert_eq!(meta.max_cll, 350);
+        assert_eq!(meta.max_fall, 350);
+        let meta = build_hdr_metadata(&pq_desc, &edid.with_peak_luminance(Some(400.4)));
+        assert_eq!(meta.max_display_mastering_luminance, 400);
+        assert_eq!(meta.max_cll, 400);
+        assert_eq!(meta.max_fall, 400);
+        let meta = build_hdr_metadata(&pq_desc, &edid.with_peak_luminance(Some(1500.)));
+        assert_eq!(meta.max_cll, 1500);
         assert_eq!(meta.max_fall, 600);
 
         // Client data within the sink's capabilities is used as-is.
