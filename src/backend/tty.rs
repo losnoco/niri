@@ -397,6 +397,10 @@ struct Surface {
     edid_hdr: EdidHdrInfo,
     /// Valid range of the connector's `max bpc` property, if it has one.
     max_bpc_range: Option<RangeInclusive<u32>>,
+    /// Whether the compositor was created offering 10-bit scanout formats (see
+    /// [`wants_10bit_formats`]). The format list is fixed for the compositor's lifetime, so a
+    /// config change that flips this recreates the output.
+    wants_10bit_formats: bool,
     /// The last color state we tried to stage and the driver rejected. Tracked so a rejected
     /// state isn't re-tested every frame (each test is an atomic TEST_ONLY commit).
     failed_color_state: Option<ConnectorColorState>,
@@ -1583,18 +1587,10 @@ impl Tty {
             })
             .collect::<FormatSet>();
 
-        // Only offer 10-bit scanout formats on outputs that opted into HDR (and can do it).
-        // Requesting a 10-bit framebuffer unconditionally hangs the initial modeset on some
-        // drivers (notably nvidia), so SDR outputs stay 8-bit exactly as upstream.
-        //
-        // Diagnostic escape hatch: NIRI_HDR_FORCE_8BIT (or the disable-10bit-output debug flag)
-        // keeps an 8-bit framebuffer even on HDR outputs, while still emitting the HDR
-        // colorspace/metadata signalling. This isolates a driver that hangs on 10-bit scanout (set
-        // the var -> boots fine) from one that hangs on the HDR infoframe commit itself (still
-        // hangs). Remove once HDR on nvidia is understood.
-        let force_8bit = std::env::var_os("NIRI_HDR_FORCE_8BIT").is_some()
-            || self.config.borrow().debug.disable_10bit_output;
-        let mut using_10bit_formats = config.hdr.is_some() && hdr_supported && !force_8bit;
+        let disable_10bit_output = self.config.borrow().debug.disable_10bit_output;
+        let force_8bit = hdr_force_8bit(disable_10bit_output);
+        let wants_10bit_formats = wants_10bit_formats(&config, hdr_supported, disable_10bit_output);
+        let mut using_10bit_formats = wants_10bit_formats;
         let mut hdr_color_formats = Vec::new();
 
         if using_10bit_formats {
@@ -1898,6 +1894,7 @@ impl Tty {
             hdr_supported,
             edid_hdr,
             max_bpc_range,
+            wants_10bit_formats,
             failed_color_state: None,
             last_blend: None,
             compositor,
@@ -3116,6 +3113,23 @@ impl Tty {
                     continue;
                 };
 
+                // The scanout format list (8-bit vs 10-bit) is fixed when the compositor is
+                // created, so toggling HDR would otherwise leave an output that was set up as SDR
+                // rendering PQ into an 8-bit framebuffer. Recreate the output instead; entering or
+                // leaving HDR is a full modeset anyway.
+                let disable_10bit_output = self.config.borrow().debug.disable_10bit_output;
+                if wants_10bit_formats(&config, surface.hdr_supported, disable_10bit_output)
+                    != surface.wants_10bit_formats
+                {
+                    debug!(
+                        "output {:?}: hdr changed, recreating to switch scanout formats",
+                        surface.name.connector
+                    );
+                    to_disconnect.push((node, crtc));
+                    to_connect.push((node, connector.clone(), crtc, surface.name.clone()));
+                    continue;
+                }
+
                 let mut mode = None;
                 if let Some(modeline) = &config.modeline {
                     match calculate_drm_mode_from_modeline(modeline) {
@@ -4141,19 +4155,42 @@ impl ConnectorProperties {
     }
 }
 
-/// The `max bpc` to request for an output: the configured value, or 10 when HDR is enabled but no
-/// explicit value was given (HDR needs at least 10 bits per channel so the PQ signal isn't
-/// crushed). Clamped to the connector's supported range; `None` when the connector has no
-/// `max bpc` property at all.
+/// Diagnostic escape hatch: NIRI_HDR_FORCE_8BIT (or the disable-10bit-output debug flag) keeps an
+/// 8-bit framebuffer even on HDR outputs, while still emitting the HDR colorspace/metadata
+/// signalling. This isolates a driver that hangs on 10-bit scanout (set the var -> boots fine)
+/// from one that hangs on the HDR infoframe commit itself (still hangs). Remove once HDR on nvidia
+/// is understood.
+fn hdr_force_8bit(disable_10bit_output: bool) -> bool {
+    disable_10bit_output || std::env::var_os("NIRI_HDR_FORCE_8BIT").is_some()
+}
+
+/// Whether to offer 10-bit scanout formats for an output: only on outputs that opted into HDR
+/// (and can do it). Requesting a 10-bit framebuffer unconditionally hangs the initial modeset on
+/// some drivers (notably nvidia), so SDR outputs stay 8-bit exactly as upstream.
+fn wants_10bit_formats(
+    output: &niri_config::Output,
+    hdr_supported: bool,
+    disable_10bit_output: bool,
+) -> bool {
+    output.hdr.is_some() && hdr_supported && !hdr_force_8bit(disable_10bit_output)
+}
+
+/// The `max bpc` to request for an output. When HDR is enabled this is at least 10 (HDR needs at
+/// least 10 bits per channel so the PQ signal isn't crushed; `max bpc` is only a cap, so the
+/// driver still drops lower if the link can't carry it). Otherwise the configured value, if any.
+/// Clamped to the connector's supported range; `None` when the connector has no `max bpc`
+/// property at all.
 fn effective_max_bpc(
     output: &niri_config::Output,
     range: &Option<RangeInclusive<u32>>,
 ) -> Option<u32> {
     let range = range.as_ref()?;
-    let requested = output
-        .max_bpc
-        .map(|max_bpc| max_bpc.0 as u32)
-        .or_else(|| output.hdr.is_some().then_some(10))?;
+    let configured = output.max_bpc.map(|max_bpc| max_bpc.0 as u32);
+    let requested = if output.hdr.is_some() {
+        configured.map_or(10, |bpc| bpc.max(10))
+    } else {
+        configured?
+    };
     Some(requested.clamp(*range.start(), *range.end()))
 }
 
